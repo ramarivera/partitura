@@ -9,6 +9,35 @@ const repository = {
 } as RepositoryRecord;
 
 describe("GitHub Git broker", () => {
+  it("renews upstream credentials between Git requests without changing the session URL", async () => {
+    let token = "first-token";
+    const upstream = vi.fn(
+      async (_url: string | URL | Request, _init?: RequestInit) =>
+        new Response("pack"),
+    );
+    const broker = startGitHubGitBroker({
+      repository,
+      tokenForRequest: async () => token,
+      fetch: upstream,
+    });
+    try {
+      const url = `${broker.baseUrl}/info/refs?service=git-upload-pack`;
+      expect((await fetch(url)).status).toBe(200);
+      token = "renewed-token";
+      expect((await fetch(url)).status).toBe(200);
+      expect(
+        upstream.mock.calls.map(([, init]) =>
+          new Headers(init?.headers).get("authorization"),
+        ),
+      ).toEqual([
+        `Basic ${Buffer.from("x-access-token:first-token").toString("base64")}`,
+        `Basic ${Buffer.from("x-access-token:renewed-token").toString("base64")}`,
+      ]);
+    } finally {
+      broker.stop();
+    }
+  });
+
   it("binds smart HTTP to one repo and puts installation auth only upstream", async () => {
     const upstream = vi.fn(
       async (_url: string | URL | Request, _init?: RequestInit) =>

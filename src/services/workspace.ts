@@ -811,6 +811,8 @@ export const makeWorkspace = (input: {
   readonly githubApp: GitHubAppTokenService | undefined;
 }) =>
   Effect.gen(function* () {
+    const runtime = yield* Effect.context<never>();
+    const runPromise = Effect.runPromiseWith(runtime);
     const hostKey = createHash("sha256")
       .update(hostname())
       .digest("hex")
@@ -982,10 +984,10 @@ export const makeWorkspace = (input: {
         return undefined;
       const [owner, repositoryName] = candidate.repositoryFullName.split("/");
       if (!owner || !repositoryName) return undefined;
-      const token =
+      const acquireToken =
         input.githubApp === undefined
-          ? undefined
-          : yield* input.githubApp
+          ? Effect.succeed(undefined)
+          : input.githubApp
               .getInstallationToken(
                 owner,
                 repositoryName,
@@ -1004,11 +1006,14 @@ export const makeWorkspace = (input: {
                       ),
                 ),
               );
+      // Fail startup on denied credentials, then use the App service's expiring
+      // cache for each request so long runs can push after the first hour.
+      yield* acquireToken;
       return yield* Effect.try({
         try: () =>
           startGitHubGitBroker({
             repository,
-            ...(token === undefined ? {} : { token }),
+            tokenForRequest: (signal) => runPromise(acquireToken, { signal }),
             ...(bindHost === undefined ? {} : { bindHost }),
           }),
         catch: workspaceFailure(
