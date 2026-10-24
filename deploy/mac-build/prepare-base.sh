@@ -10,6 +10,7 @@ Usage: prepare-base.sh --source NAME --source-sha256 HASH --base NAME
   --tart PATH --tart-home PATH --runner PATH --qualifier PATH
   --guest-user NAME --mise-binary PATH --mise-version VERSION
   --mise-sha256 HASH --node-version VERSION --python-version VERSION
+  [--runtime-cache PATH --runtime-cache-sha256 HASH]
   [--dedicated-tart-home PATH --dedicated-account NAME]
   [--receipt PATH] [--apply]
 
@@ -32,7 +33,7 @@ check_path() {
     current=${current%/*}; [ -n "$current" ] || current=/
   done
 }
-source_name= source_sha= base_name= tart= tart_home= runner= qualifier= guest_user= mise_binary= mise_version= mise_sha= node_version= python_version= dedicated_tart_home= dedicated_account= receipt=/Library/Partitura/NativeBuild/qualification/partitura-native-base.json apply=0
+source_name= source_sha= base_name= tart= tart_home= runner= qualifier= guest_user= mise_binary= mise_version= mise_sha= node_version= python_version= dedicated_tart_home= dedicated_account= receipt=/Library/Partitura/NativeBuild/qualification/partitura-native-base.json runtime_cache= runtime_cache_sha= apply=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --source) source_name=${2-}; shift 2 ;;
@@ -48,6 +49,8 @@ while [ "$#" -gt 0 ]; do
     --mise-sha256) mise_sha=${2-}; shift 2 ;;
     --node-version) node_version=${2-}; shift 2 ;;
     --python-version) python_version=${2-}; shift 2 ;;
+    --runtime-cache) runtime_cache=${2-}; shift 2 ;;
+    --runtime-cache-sha256) runtime_cache_sha=${2-}; shift 2 ;;
     --dedicated-tart-home) dedicated_tart_home=${2-}; shift 2 ;;
     --dedicated-account) dedicated_account=${2-}; shift 2 ;;
     --receipt) receipt=${2-}; shift 2 ;;
@@ -80,6 +83,12 @@ actual_mise_sha=$(/usr/bin/shasum -a 256 "$mise_binary" | awk '{print $1}')
 [ "$actual_mise_sha" = "$mise_sha" ] || fail 'Mise binary differs from its pinned SHA-256'
 mise_arch=$(/usr/bin/file -b "$mise_binary")
 case "$mise_arch" in *'Mach-O 64-bit executable arm64'*) ;; *) fail 'Mise input must be an Apple silicon macOS executable' ;; esac
+
+cache_validator="$(cd "$(dirname "$0")" && pwd)/runtime_cache.py"
+if [ -n "$runtime_cache" ] || [ -n "$runtime_cache_sha" ]; then
+  check_path "$runtime_cache"
+  /usr/bin/python3 "$cache_validator" "$runtime_cache" "$runtime_cache_sha" "$node_version" "$python_version"
+fi
 
 source_vm="$tart_home/vms/$source_name"
 base_vm="$tart_home/vms/$base_name"
@@ -317,8 +326,14 @@ else
   /usr/bin/install -o "$user" -g staff -m 0644 "$config_tmp" "$config_path"
 fi
 /bin/rm -f "$config_tmp"
-/usr/bin/sudo -n -u "$user" /usr/bin/env HOME="/Users/$user" MISE_YES=1 MISE_JOBS=2 /usr/local/bin/mise install --yes --jobs 2 "node@$node_version" "python@$python_version"
 GUEST_MISE_SETUP
+if [ -n "$runtime_cache" ]; then
+  install -m 0600 "$runtime_cache" "$archive_dir/runtimes.tar"
+  /usr/bin/python3 "$cache_validator" "$archive_dir/runtimes.tar" "$runtime_cache_sha" "$node_version" "$python_version"
+  cat "$archive_dir/runtimes.tar" | "$tart" exec -i "$base_name" /usr/bin/sudo -n -u "$guest_user" /usr/bin/tar -xpf - -C "/Users/$guest_user/.local/share/mise"
+else
+  "$tart" exec "$base_name" /usr/bin/sudo -n -u "$guest_user" /usr/bin/env -i "HOME=/Users/$guest_user" "PATH=/usr/bin:/bin:/usr/sbin:/sbin" MISE_YES=1 MISE_JOBS=2 /usr/local/bin/mise install --yes --jobs 2 "node@$node_version" "python@$python_version"
+fi
 printf '%s\n' 'set -euo pipefail; /bin/chmod 0555 /Library/Partitura/NativeBuild' | \
   "$tart" exec -i "$base_name" /usr/bin/sudo -n /bin/bash -s
 printf '%s\n' 'set -euo pipefail; /usr/sbin/chown root:wheel /Library/Partitura/NativeBuild/run.sh /Library/Partitura/NativeBuild/qualify.sh /Library/Partitura/NativeBuild/mise; /bin/chmod 0555 /Library/Partitura/NativeBuild/run.sh /Library/Partitura/NativeBuild/qualify.sh /Library/Partitura/NativeBuild/mise; /usr/sbin/chown root:wheel /Library/Partitura/NativeBuild/toolchain.env; /bin/chmod 0444 /Library/Partitura/NativeBuild/toolchain.env' | \

@@ -100,6 +100,14 @@ The standalone sequence is:
    add `--apply`. It prepares and qualifies a clone, stops it, promotes it into
    the dedicated account's storage, and writes the destination hash and receipt.
    The source VM stays intact.
+   If guest downloads are unavailable, run `prepare-runtime-cache.sh MISE_BINARY
+   MISE_SHA256 NODE_VERSION PYTHON_VERSION NEW_OUTPUT_DIRECTORY` on the Mac host.
+   It uses an isolated Mise home and config and rejects discovered operator
+   configuration. The resulting archive contains only the two exact runtime
+   trees. Pass its path and printed SHA-256 to `prepare-base.sh` with
+   `--runtime-cache` and `--runtime-cache-sha256`. Preparation validates its hash,
+   paths, links and size, snapshots it privately, then extracts it as the
+   unprivileged guest account. Qualification still checks the installed runtimes.
 4. Copy the resulting base hash and receipt path into the private settings JSON.
    Set its authorized public key and `enabled` only for the approved installation.
    Run `python3 deploy/mac-build/host_setup.py --config PATH --check`. Exit 2
