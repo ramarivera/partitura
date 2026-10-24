@@ -1,8 +1,12 @@
 """Standalone host setup contract tests. Set TMPDIR to owned scratch storage."""
 import importlib.util
+import hashlib
+import json
+import os
 from pathlib import Path
 import subprocess
 import unittest
+import tempfile
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +17,34 @@ spec.loader.exec_module(host_setup)
 
 
 class NativeHostSetupTests(unittest.TestCase):
+    def test_root_launcher_snapshots_only_manifest_pinned_payloads(self):
+        loader = importlib.util.spec_from_file_location('native_installer', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            stage = Path(directory)
+            entries = {}
+            for target, name in launcher.STAGED_FILES.items():
+                payload = name.encode()
+                (stage / name).write_bytes(payload)
+                entries[target] = {'sha256': hashlib.sha256(payload).hexdigest(), 'mode': 0o444}
+            entries[launcher.TART_TARGET] = {'sha256': 'a'*64, 'mode': 0o555}
+            manifest = json.dumps({'schema': 1, 'files': entries}).encode()
+            (stage / 'managed-files.json').write_bytes(manifest)
+            pin = hashlib.sha256(manifest).hexdigest()
+            snapshot = launcher.verified_payloads(stage, pin, 'a'*64)
+            self.assertEqual(snapshot['broker.py'], b'broker.py')
+            (stage / 'broker.py').write_bytes(b'tampered')
+            self.assertEqual(snapshot['broker.py'], b'broker.py')
+            with self.assertRaisesRegex(ValueError, 'approved manifest'):
+                launcher.verified_payloads(stage, pin, 'a'*64)
+            with self.assertRaisesRegex(ValueError, 'approved pin'):
+                launcher.verified_payloads(stage, 'b'*64, 'a'*64)
+            (stage / 'broker.py').unlink()
+            (stage / 'broker.py').symlink_to(stage / 'config.json')
+            with self.assertRaises(OSError):
+                launcher.verified_payloads(stage, pin, 'a'*64)
+
     def test_standalone_cli_exposes_check_and_stage_host(self):
         result = subprocess.run(
             ["/usr/bin/python3", str(MODULE_PATH), "--help"],
@@ -83,6 +115,7 @@ class NativeHostSetupTests(unittest.TestCase):
         self.assertIn('sudo -n /usr/sbin/chown -R "$dedicated_account":staff "$dedicated_vm"', preparation)
         self.assertIn('"$receipt_base_path"', preparation)
         self.assertIn('base_sha=$(sudo -n -u "$dedicated_account"', preparation)
+        self.assertIn('[ "$base_sha" = "$qualified_sha" ] || fail', preparation)
         self.assertIn('sudo -n /usr/bin/python3 - "$dedicated_vm"', preparation)
 
 

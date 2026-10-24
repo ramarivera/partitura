@@ -356,6 +356,7 @@ if [ -n "$dedicated_vm" ]; then
   promotion_started=1
   sudo -n /usr/bin/ditto --rsrc "$base_vm" "$dedicated_vm"
   sudo -n /usr/sbin/chown -R "$dedicated_account":staff "$dedicated_vm"
+  qualified_sha=$base_sha
   base_sha=$(sudo -n -u "$dedicated_account" /usr/bin/python3 - "$dedicated_vm" <<'PY'
 import hashlib, os, stat, sys
 from pathlib import Path
@@ -384,6 +385,7 @@ for current, directories, files in os.walk(root, followlinks=False):
 print(digest.hexdigest())
 PY
   )
+  [ "$base_sha" = "$qualified_sha" ] || fail 'promoted base differs from the qualified clone'
 fi
 receipt_tmp="$archive_dir/qualification.json"
 /usr/bin/python3 - "$receipt_tmp" "$source_name" "$source_sha" "$base_name" "$receipt_base_path" "$base_sha" "$runner_sha" "$qualifier_sha" "$mise_sha" "$mise_version" "$node_version" "$python_version" "$qualification_output" <<'PY'

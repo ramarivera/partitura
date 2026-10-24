@@ -43,6 +43,33 @@ class CaptureWriter:
 
 
 class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_json_accepts_chunked_and_eof_delimited_bodies(self):
+        body = b'{"Config":{"Labels":{"partitura.session":"session-1"}}}'
+        responses = [
+            http_response("200 OK", body),
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + body,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + b"5;extension=yes\r\n" + body[:5] + b"\r\n"
+            + f"{len(body)-5:x}\r\n".encode() + body[5:] + b"\r\n0\r\nTrailer: done\r\n\r\n",
+        ]
+        for response in responses:
+            with self.subTest(response=response[:70]), tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
+                socket = str(Path(directory) / "engine.sock")
+                async def engine(reader, writer):
+                    await read_request(reader)
+                    writer.write(response)
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                server = await asyncio.start_unix_server(engine, path=socket)
+                try:
+                    with patch.object(broker, 'DOCKER_SOCKET', socket):
+                        result = await asyncio.wait_for(broker._docker_api_json('GET', '/containers/test/json'), 5)
+                    self.assertEqual(result, json.loads(body))
+                finally:
+                    server.close()
+                    await server.wait_closed()
+
     async def test_exec_rejects_worker_uid_mismatch_before_creating_exec(self):
         inspect = AsyncMock(
             return_value={

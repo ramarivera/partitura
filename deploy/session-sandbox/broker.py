@@ -151,10 +151,35 @@ async def _docker_api_json(
             break
         key, _, value = line.decode("latin1").partition(":")
         headers[key.lower()] = value.strip()
-    body_length = int(headers.get("content-length", "0"))
-    response = await reader.readexactly(body_length) if body_length else b""
-    writer.close()
-    await writer.wait_closed()
+    try:
+        limit = 8 * 1024 * 1024
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            response = bytearray()
+            while True:
+                size = int((await reader.readline()).split(b";", 1)[0].strip(), 16)
+                if size < 0 or len(response) + size > limit:
+                    raise ValueError("Docker response exceeds limit")
+                if size == 0:
+                    while await reader.readline() not in (b"\r\n", b""):
+                        pass
+                    break
+                response.extend(await reader.readexactly(size))
+                if await reader.readexactly(2) != b"\r\n":
+                    raise ValueError("invalid Docker response chunk")
+        elif "content-length" in headers:
+            body_length = int(headers["content-length"])
+            if not 0 <= body_length <= limit:
+                raise ValueError("Docker response exceeds limit")
+            response = await reader.readexactly(body_length)
+        else:
+            response = bytearray()
+            while chunk := await reader.read(65536):
+                response.extend(chunk)
+                if len(response) > limit:
+                    raise ValueError("Docker response exceeds limit")
+    finally:
+        writer.close()
+        await writer.wait_closed()
     if b" 2" not in status:
         raise RuntimeError("Docker API request failed")
     return json.loads(response) if response else {}

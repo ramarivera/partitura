@@ -230,6 +230,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     await utimes(record, now, now);
   };
   let pruneInFlight: Promise<void> | undefined;
+  let pruneFailure: unknown;
   const pruneTerminalJobs = (now = Date.now()) => {
     if (pruneInFlight) return pruneInFlight;
     const pruning = (async () => {
@@ -307,6 +308,14 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     );
     return pruning;
   };
+  const pruneBestEffort = async () => {
+    try {
+      await pruneTerminalJobs();
+      pruneFailure = undefined;
+    } catch (error) {
+      pruneFailure = error;
+    }
+  };
   // Durable ownership survives a gateway crash. Cancel old jobs before serving
   // new requests; never reassign another session's in-flight native build.
   for (const file of await readdir(config.scratchRoot)) {
@@ -325,7 +334,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       await save(job);
     }
   }
-  await pruneTerminalJobs();
+  await pruneBestEffort();
   return {
     start: async (request: NativeBuildRequest) => {
       if (
@@ -337,7 +346,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       ) {
         throw new Error("Invalid native build request");
       }
-      await pruneTerminalJobs();
+      await pruneBestEffort();
       if (
         reservedSessions.has(request.sessionId) ||
         [...active.keys()].some(
@@ -469,7 +478,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       return { ...job };
     },
     status: async (sessionId: string, jobId: string) => {
-      await pruneTerminalJobs();
+      await pruneBestEffort();
       return { ...ownedJob(sessionId, jobId) };
     },
     artifact: async (sessionId: string, jobId: string) => {
@@ -543,7 +552,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       }
     },
     cancel: async (sessionId: string, jobId: string) => {
-      await pruneTerminalJobs();
+      await pruneBestEffort();
       const job = ownedJob(sessionId, jobId);
       const pending = active.get(job.job);
       pending?.abort.abort();
@@ -566,6 +575,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
         }),
       );
       await pruneTerminalJobs();
+      if (pruneFailure !== undefined) throw pruneFailure;
     },
   };
 }

@@ -1,5 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  readFile,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect } from "effect";
@@ -41,6 +48,56 @@ if(command[0]==="run") {
 } else if(command[0]==="artifact") process.stdout.write(config.corrupt?"corrupted":"${payload}");
 else console.log(JSON.stringify({job:command[1],state:"cancellation-requested"}));
 `;
+
+it.live("keeps native requests usable when an orphan cannot be pruned", () =>
+  Effect.promise(async () => {
+    const fixture = await setup();
+    const client = await createNativeBuildClient({
+      ...fixture.config,
+      terminalRetentionMs: 60_000,
+    });
+    const orphan = join(
+      fixture.config.scratchRoot,
+      `${"f".repeat(32)}.tar.partial`,
+    );
+    try {
+      await mkdir(orphan);
+      await utimes(orphan, new Date(0), new Date(0));
+      const request = {
+        sessionId: "session-a",
+        workspacePath: fixture.workspace,
+        commit: fixture.commit,
+        pullRequest: 12,
+        action: "archive",
+      };
+      const first = await client.start(request);
+      expect((await settled(client, first.job)).state).toBe("succeeded");
+      await client.cancel("session-a", first.job);
+      expect((await client.status("session-a", first.job)).state).toBe(
+        "succeeded",
+      );
+      const next = await client.start({ ...request, sessionId: "session-b" });
+      expect((await settled(client, next.job, "session-b")).state).toBe(
+        "succeeded",
+      );
+      const trace = await readFile(fixture.trace, "utf8");
+      expect(trace).toContain(`cancel ${first.job}`);
+      await expect(client.close()).rejects.toThrow();
+    } finally {
+      await rm(orphan, { recursive: true, force: true });
+      // A successful request clears the saved housekeeping failure before close.
+      const next = await client.start({
+        sessionId: "cleanup",
+        workspacePath: fixture.workspace,
+        commit: fixture.commit,
+        pullRequest: 12,
+        action: "archive",
+      });
+      await settled(client, next.job, "cleanup");
+      await client.close();
+    }
+  }),
+);
 
 async function setup(rootName = "private") {
   const root = path(rootName);
@@ -92,9 +149,10 @@ async function setup(rootName = "private") {
 async function settled(
   client: Awaited<ReturnType<typeof createNativeBuildClient>>,
   job: string,
+  sessionId = "session-a",
 ) {
   for (let attempt = 0; attempt < 200; attempt++) {
-    const receipt = await client.status("session-a", job);
+    const receipt = await client.status(sessionId, job);
     if (["succeeded", "failed"].includes(receipt.state)) return receipt;
     await Bun.sleep(10);
   }

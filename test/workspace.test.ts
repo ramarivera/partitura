@@ -680,6 +680,23 @@ describe("Workspace", () => {
         expect(
           yield* readGitConfig("http.https://github.com/.extraheader", outer),
         ).toBeUndefined();
+        const broker = yield* Effect.acquireRelease(
+          workspace.openGitBroker(id, record),
+          (value) => Effect.sync(() => value?.stop()),
+        );
+        expect(broker).toBeDefined();
+        if (broker === undefined) return;
+        yield* workspace.configureGitBroker(id, inner, broker);
+        expect(
+          yield* readGitConfig(broker.gitConfigKey, outer),
+        ).toBeUndefined();
+        yield* fixtureIo("unsafe Git directory link", () =>
+          symlink(join(outer, ".git"), join(inner, ".git")),
+        );
+        yield* workspace.configureGitBroker(id, inner, broker);
+        expect(
+          yield* readGitConfig(broker.gitConfigKey, outer),
+        ).toBeUndefined();
       }),
   );
 

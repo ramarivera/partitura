@@ -933,8 +933,20 @@ export const makeWorkspace = (input: {
       target: string,
       sessionId: string,
     ): Effect.Effect<boolean, WorkspaceError> =>
-      runGitOutput(["rev-parse", "--git-dir"], target, sessionId).pipe(
-        Effect.as(true),
+      Effect.promise(() =>
+        lstat(join(target, ".git")).then(
+          (info) =>
+            !info.isSymbolicLink() && (info.isDirectory() || info.isFile()),
+          () => false,
+        ),
+      ).pipe(
+        Effect.flatMap((ownsGit) =>
+          ownsGit
+            ? runGitOutput(["rev-parse", "--git-dir"], target, sessionId).pipe(
+                Effect.as(true),
+              )
+            : Effect.succeed(false),
+        ),
         Effect.catchIf(
           (error) => error.message.includes("not a git repository"),
           () => Effect.succeed(false),
@@ -1122,7 +1134,8 @@ export const makeWorkspace = (input: {
         // into whatever repository encloses the target.
         const ownsGitDir = yield* Effect.promise(() =>
           lstat(join(target, ".git")).then(
-            () => true,
+            (info) =>
+              !info.isSymbolicLink() && (info.isDirectory() || info.isFile()),
             () => false,
           ),
         );

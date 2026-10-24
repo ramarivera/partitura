@@ -51,8 +51,8 @@ Don't share a project-specific base across unrelated repositories.
 
 The host needs an Apple silicon Mac supported by Tart, working SSH connectivity,
 Python 3, enough disk and memory, and a clean macOS base compatible with its Tart
-version. A macOS image and restricted SSH transport are required infrastructure;
-The guest needs selected Apple Command Line Tools or Xcode for Git, clang and
+version. A macOS image and restricted SSH transport are required infrastructure.
+The guest needs a selected Apple Command Line Tools or Xcode installation for Git, clang and
 make. A full Xcode installation and a particular SDK version are repository
 requirements, rather than Partitura requirements.
 
@@ -107,7 +107,9 @@ The standalone sequence is:
    nonzero exits identify a failed prerequisite.
 5. Run the same module with `--stage-host PRIVATE_STAGE_PATH`. Check its staged
    launcher with `python3 PRIVATE_STAGE_PATH/native_host.py --stage
-   PRIVATE_STAGE_PATH --account NAME --tart-sha256 HASH --check`. The approved
+   PRIVATE_STAGE_PATH --account NAME --tart-sha256 HASH
+   --manifest-sha256 MANIFEST_HASH --check`. Compute `MANIFEST_HASH` from the
+   staged `managed-files.json` before elevation. The approved
    root installation uses those same arguments with `--apply` instead of
    `--check` through the host's sudo route.
 6. Run the original `host_setup.py --config PATH --check` again. Require exit 0,

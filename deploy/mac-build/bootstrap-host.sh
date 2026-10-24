@@ -101,9 +101,16 @@ for path in "$runtime_root" "$tart_home"; do
   if [ -e "$path" ]; then
     [ -d "$path" ] && [ "$(/usr/bin/stat -f '%Su:%Sg:%Lp' "$path")" = "$account:staff:700" ] || { echo "existing path must already be owned by $account:staff mode 0700: $path" >&2; exit 1; }
   else
-    /bin/mkdir -p "$path"
-    /usr/sbin/chown "$account":staff "$path"
-    /bin/chmod 0700 "$path"
+    missing=()
+    current=$path
+    while [ ! -e "$current" ]; do
+      missing+=("$current")
+      current=${current%/*}; [ -n "$current" ] || current=/
+    done
+    for ((index=${#missing[@]}-1; index>=0; index--)); do
+      /bin/mkdir -m 0700 "${missing[$index]}"
+      /usr/sbin/chown "$account":staff "${missing[$index]}"
+    done
   fi
 done
 vms="$tart_home/vms"
