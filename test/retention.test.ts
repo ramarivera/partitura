@@ -217,6 +217,58 @@ describe("retention", () => {
   );
 
   it.live(
+    "keeps sandbox workspaces and identities fenced until teardown succeeds",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const workspace = join(root, "sandbox");
+        fs.mkdirSync(workspace, { recursive: true });
+        fs.writeFileSync(join(workspace, "retained"), "keep");
+        insertRun(db, "sandbox", "failed", workspace);
+        insertRun(db, "orphan", "failed");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('sandbox', 21001, 1), ('orphan', 21002, 1)",
+        ).run();
+        let unavailable = true;
+        const retention = makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          beforeRetireSession: async () => {
+            if (unavailable) throw new Error("sandbox still running");
+          },
+        });
+        expect((yield* retention.sweep(now)).workspaces).toBe(0);
+        expect(existsSync(join(workspace, "retained"))).toBe(true);
+        expect(
+          db
+            .query("SELECT state FROM workspace WHERE session_id='sandbox'")
+            .get(),
+        ).toEqual({ state: "deleting" });
+        expect(
+          db
+            .query("SELECT active FROM worker_identity ORDER BY session_id")
+            .all(),
+        ).toEqual([{ active: 1 }, { active: 1 }]);
+        unavailable = false;
+        expect((yield* retention.sweep(now)).workspaces).toBe(1);
+        expect(existsSync(workspace)).toBe(false);
+        expect(
+          db
+            .query(
+              "SELECT session_id, active FROM worker_identity ORDER BY session_id",
+            )
+            .all(),
+        ).toEqual([
+          { session_id: "orphan", active: 1 },
+          { session_id: "sandbox", active: 0 },
+        ]);
+      }).pipe(withDatabase),
+  );
+
+  it.live(
     "reclaims a terminal allocation left by a crash with no published workspace",
     () =>
       Effect.gen(function* () {

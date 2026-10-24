@@ -543,10 +543,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               sandboxRuntime
                 .destroy(sessionId)
                 .pipe(
-                  Effect.ignore,
-                  Effect.andThen(
+                  Effect.tap(
                     Effect.sync(() => sandboxHandles.delete(sessionId)),
                   ),
+                  Effect.ignore,
                 ),
             ),
           );
@@ -557,8 +557,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const destroySandbox = (sessionId: SessionId) =>
         Effect.gen(function* () {
           stopSandboxRelays(sessionId);
-          if (sandboxRuntime === undefined || !sandboxHandles.has(sessionId))
-            return;
+          if (sandboxRuntime === undefined) return;
           yield* sandboxRuntime.destroy(sessionId).pipe(
             Effect.mapError(
               () =>
@@ -1154,11 +1153,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   ["succeeded", "failed", "canceled"].includes(
                     current.value.state,
                   )
-                )
+                ) {
+                  // The broker checks durable Docker labels even after a gateway
+                  // restart. A failed destroy must leave this identity reserved.
+                  yield* destroySandbox(sessionId);
                   yield* workerIdentities.release(
                     sessionId,
                     config.workspaceRoot,
                   );
+                }
               }),
             );
             yield* Ref.update(workerSlots, (slots) => {
@@ -2771,6 +2774,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           const uid = yield* workerIdentities.acquire(
             run.sessionId,
             config.workspaceRoot,
+            { retireTerminal: config.workerSandboxMode !== "sysbox" },
           );
           let driver: AgentDriver;
           if (t3Config.connection._tag === "Remote") {
@@ -3040,6 +3044,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         const workerUid = yield* workerIdentities.acquire(
           run.sessionId,
           config.workspaceRoot,
+          { retireTerminal: config.workerSandboxMode !== "sysbox" },
         );
         yield* Effect.tryPromise({
           try: () => prepareWorkerWorkspace(cwd, workerUid),
@@ -3283,15 +3288,26 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               }),
           cwd,
           env: { ...environment, PI_CODING_AGENT_DIR: agentDir },
-          injectedEnv: workerModelEnvironment({
-            cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
-            cliproxyApiKey:
-              config.cliproxyApiKey === undefined
-                ? undefined
-                : Redacted.value(config.cliproxyApiKey),
-            claudeExecutable:
-              config.workerClaudeExecutable ?? "claude-cliproxy",
-          }),
+          injectedEnv: {
+            // These proxy values were created by this run's sandbox broker.
+            // Inherited gateway proxy settings stay outside workerEnvironment.
+            ...(sandbox === undefined
+              ? {}
+              : {
+                  HTTP_PROXY: sandbox.egressProxyUrl,
+                  HTTPS_PROXY: sandbox.egressProxyUrl,
+                  NO_PROXY: environment.NO_PROXY ?? "",
+                }),
+            ...workerModelEnvironment({
+              cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
+              cliproxyApiKey:
+                config.cliproxyApiKey === undefined
+                  ? undefined
+                  : Redacted.value(config.cliproxyApiKey),
+              claudeExecutable:
+                config.workerClaudeExecutable ?? "claude-cliproxy",
+            }),
+          },
           sessionId: run.sessionId,
           requestTimeoutMs: config.rpcRequestTimeoutMs ?? 30_000,
         });

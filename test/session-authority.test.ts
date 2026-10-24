@@ -1544,6 +1544,45 @@ describe("SessionAuthority team-access gate", () => {
     ),
   );
 
+  it.live(
+    "reserves a terminal uid when sandbox teardown is unavailable after restart",
+    () =>
+      withAuthority(
+        (db) =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            yield* InstallationRepo.use((repo) =>
+              repo.put(install(testOrganizationId)),
+            );
+            yield* RunRepo.use((repo) =>
+              repo.create({
+                sessionId: testSessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.some(testIssueId),
+              }),
+            );
+            db.query(
+              "INSERT INTO worker_identity(session_id, uid, active) VALUES (?, 21001, 1)",
+            ).run(testSessionId);
+            db.query(
+              "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
+            ).run(testSessionId);
+            yield* authority.processSession(testSessionId);
+            expect(
+              db
+                .query("SELECT active FROM worker_identity WHERE session_id=?")
+                .get(testSessionId),
+            ).toEqual({ active: 1 });
+          }),
+        {
+          config: [
+            ["WORKER_SANDBOX_MODE", "sysbox"],
+            ["SESSION_SANDBOX_BROKER_SOCKET", testPath("missing-broker.sock")],
+          ],
+        },
+      ),
+  );
+
   it.live("cancels when a known snapshot excludes the run's team", () =>
     withAuthority(() =>
       Effect.gen(function* () {

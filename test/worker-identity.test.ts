@@ -89,6 +89,35 @@ describe("worker identities", () => {
       }),
     );
   });
+  it("keeps a terminal sandbox identity reserved during allocation", async () => {
+    range("1");
+    await withIdentities((repo, db, root) =>
+      Effect.gen(function* () {
+        yield* repo.acquire("a");
+        db.query(
+          "UPDATE agent_run SET state='failed' WHERE session_id='a'",
+        ).run();
+        const result = yield* Effect.result(
+          repo.acquire("b", join(root, "workspaces"), {
+            retireTerminal: false,
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+        expect(
+          db
+            .query("SELECT active FROM worker_identity WHERE session_id='a'")
+            .get(),
+        ).toEqual({ active: 1 });
+        yield* repo.release("a", join(root, "workspaces"));
+        expect(
+          yield* repo.acquire("b", join(root, "workspaces"), {
+            retireTerminal: false,
+          }),
+        ).toBe("21001");
+      }),
+    );
+  });
+
   it("releases on end, reuses slots, and requires the original uid when resuming", async () => {
     range("1");
     await withIdentities((repo, db, root) =>

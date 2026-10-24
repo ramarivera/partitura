@@ -9,6 +9,7 @@ import {
 import { GatewayConfig } from "./config.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { makeWorkspaceRetention } from "./retention-workspaces.js";
+import { makeSessionSandboxRuntime } from "./session-sandbox.js";
 import { SqliteClient, tryDb } from "./store/sqlite-client.js";
 
 const positiveInteger = (name: string, fallback: number) =>
@@ -50,6 +51,7 @@ export const makeRetention = (input: {
   readonly policy: RetentionPolicy;
   readonly webhookReplayWindowMs: number;
   readonly removeWorkspace?: (path: string) => void | Promise<void>;
+  readonly beforeRetireSession?: (sessionId: string) => Promise<void>;
 }) => {
   const { db, policy } = input;
   const workspaceSweep = makeWorkspaceRetention({
@@ -58,6 +60,7 @@ export const makeRetention = (input: {
     workspaceTtlMs: policy.workspaceTtlMs,
     maxWorkspaces: MAX_WORKSPACES_PER_SWEEP,
     removeWorkspace: input.removeWorkspace,
+    beforeRetireSession: input.beforeRetireSession,
   });
   const sweep = (now: number) =>
     Effect.gen(function* () {
@@ -147,11 +150,22 @@ export class Retention extends Context.Service<Retention>()("Retention", {
     const policy = yield* Config.unwrap(retentionConfig);
     const { db } = yield* SqliteClient;
     const nix = yield* NixEnvironment;
+    const sandboxRuntime =
+      config.workerSandboxMode === "sysbox" &&
+      config.sessionSandboxBrokerSocketPath !== undefined
+        ? makeSessionSandboxRuntime(config.sessionSandboxBrokerSocketPath)
+        : undefined;
     const { sweep } = makeRetention({
       db,
       workspaceRoot: config.workspaceRoot,
       policy,
       webhookReplayWindowMs: config.webhookReplayWindowMs,
+      ...(sandboxRuntime === undefined
+        ? {}
+        : {
+            beforeRetireSession: (sessionId: string) =>
+              Effect.runPromise(sandboxRuntime.destroy(sessionId)),
+          }),
     });
     const sweepTick = Effect.gen(function* () {
       const result = yield* sweep(Date.now());

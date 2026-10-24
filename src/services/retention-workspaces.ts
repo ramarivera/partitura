@@ -21,6 +21,9 @@ export const makeWorkspaceRetention = (input: {
   readonly workspaceRoot: string;
   readonly workspaceTtlMs: number;
   readonly maxWorkspaces: number;
+  readonly beforeRetireSession?:
+    | ((sessionId: string) => Promise<void>)
+    | undefined;
   readonly removeWorkspace?:
     | ((path: string) => void | Promise<void>)
     | undefined;
@@ -212,6 +215,7 @@ export const makeWorkspaceRetention = (input: {
         for (const job of claimed.jobs) {
           const removed = yield* Effect.tryPromise({
             try: async () => {
+              await input.beforeRetireSession?.(job.sessionId);
               if (job.uid !== undefined) stopWorkerUidProcessesSync(job.uid);
               if (input.removeWorkspace === undefined)
                 await removeWorkerWorkspace(
@@ -274,7 +278,11 @@ export const makeWorkspaceRetention = (input: {
         AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?)
         AND NOT EXISTS (SELECT 1 FROM workspace w WHERE w.session_id=i.session_id AND w.state='deleting')`)
             .all(now);
-          for (const identity of retired) {
+          // Sandbox cleanup needs the durable workspace deletion fence above.
+          // Never recycle an orphan through the native process-only path.
+          for (const identity of input.beforeRetireSession === undefined
+            ? retired
+            : []) {
             if (root !== undefined)
               retireWorkerIdentitySync(
                 db,

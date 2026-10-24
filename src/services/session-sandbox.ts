@@ -62,9 +62,21 @@ export const sandboxEnvironment = (
     value === normalizedWorkspace || value.startsWith(`${normalizedWorkspace}/`)
       ? `/workspace${value.slice(normalizedWorkspace.length)}`
       : value;
-  return Object.fromEntries(
-    Object.entries(input).map(([key, value]) => [key, replaceWorkspace(value)]),
-  );
+  return {
+    ...Object.fromEntries(
+      Object.entries(input).map(([key, value]) => [
+        key,
+        replaceWorkspace(value),
+      ]),
+    ),
+    // Gateway Nix and node_modules paths aren't mounted into the sandbox.
+    // These directories belong to the image or this session's Mise volume.
+    PATH: "/mise/shims:/mise/bin:/usr/local/bin:/opt/claude/bin:/opt/codex/bin:/opt/t3:/usr/bin:/bin",
+    MISE_DATA_DIR: "/mise",
+    MISE_CACHE_DIR: "/mise/cache",
+    MISE_CONFIG_DIR: "/workspace/.omp-home/mise/config",
+    MISE_TRUSTED_CONFIG_PATHS: "/workspace",
+  };
 };
 
 export const sandboxWorkerLaunch = (
