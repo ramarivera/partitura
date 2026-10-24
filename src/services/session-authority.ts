@@ -2972,9 +2972,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     "T3 refused non-gateway workspace Git credentials or config includes",
                 }),
             });
-            // A daemon or provider left by an earlier attempt would own the
-            // T3 state directory; this uid belongs to this session only.
-            if (uid !== undefined)
+            // The broker retires isolated workers on recovery. A host UID sweep
+            // here could kill the VMM and SFTP helper it has just provisioned.
+            // Only native daemons need the gateway's process sweep.
+            if (uid !== undefined && sandbox === undefined)
               yield* Effect.try({
                 try: () => stopWorkerUidProcessesSync(Number(uid)),
                 catch: () =>

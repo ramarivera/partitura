@@ -18,7 +18,7 @@ ENV KBUILD_BUILD_USER=partitura KBUILD_BUILD_HOST=builder SOURCE_DATE_EPOCH=0
 RUN make x86_64_defconfig \
  && scripts/kconfig/merge_config.sh -m .config partitura.config \
  && make olddefconfig \
- && while IFS= read -r option; do case "$option" in CONFIG_*=y) grep -qx "$option" .config || { echo "Required kernel option missing: $option" >&2; exit 1; } ;; esac; done < partitura.config \
+ && while IFS= read -r option; do case "$option" in CONFIG_*=y) grep -qx "$option" .config || { echo "Required kernel option missing: $option" >&2; exit 1; } ;; CONFIG_*=n) if grep -Eq "^${option%=n}=[ym]$" .config; then echo "Disabled kernel option enabled: $option" >&2; exit 1; fi ;; esac; done < partitura.config \
  && make -j"${JOBS}" vmlinux \
  && install -d /artifacts \
  && cp vmlinux .config /artifacts/ \

@@ -378,6 +378,7 @@ timeout 120 /bin/sh -ec '
         self.assertTrue(details["node"].startswith("v24."))
         self.assertTrue(details["python"].startswith("Python 3.13."))
         self.assertRegex(details["mise"], r"^2026\.10\.15 linux-x64\b")
+        print("LIVE worker details: " + json.dumps(details, sort_keys=True), flush=True)
         if runtime == "firecracker":
             assert_guest_network(details)
             self.assertNotEqual(details["kernel"], os.uname().release)
