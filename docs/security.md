@@ -301,8 +301,10 @@ need safe in-place updates and auth-failure/reconnect coordination.
 process lifetime. The proxy keeps OMP's bearer stable while rotating upstream
 credentials. OMP's MCP refresh callback requires local refresh material and
 explicitly rejects its remote-broker refresh sentinel, so its model auth broker
-isn't a drop-in MCP renewal path here. This per-session bearer pattern overlaps with `sym-gmy.6`; hosting Linear
-tools for T3 remains separate work.
+isn't a drop-in MCP renewal path here. Launched T3 sessions receive the same
+gateway-owned Linear workspace tools as OMP through a session MCP server.
+GitHub PR creation also uses that server and stays bound to the run's
+repository. Cancellation fences mutating tools before dispatch.
 
 ## Encryption rotation
 

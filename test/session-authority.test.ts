@@ -17,6 +17,7 @@ import {
 } from "effect";
 import { TestClock } from "effect/testing";
 import * as fc from "fast-check";
+import { vi } from "vitest";
 import {
   DatabaseError,
   InterruptedRunNoActionableInputError,
@@ -2019,6 +2020,109 @@ describe("SessionAuthority deferred stop handling", () => {
   );
 });
 describe("SessionAuthority host-tool mutation gate", () => {
+  it.live(
+    "creates a repo-bound PR without Linear and refuses creation after stop",
+    () => {
+      const requests: Array<{ url: string; authorization: string | null }> = [];
+      const fetchMock = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async (url, init) => {
+          requests.push({
+            url: String(url),
+            authorization: new Headers(init?.headers).get("authorization"),
+          });
+          return new Response(
+            JSON.stringify([
+              {
+                number: 42,
+                html_url: "https://github.com/acme/widgets/pull/42",
+                head: { ref: "fix/issue", repo: { full_name: "acme/widgets" } },
+                base: { ref: "main", repo: { full_name: "acme/widgets" } },
+              },
+            ]),
+            { status: 200 },
+          );
+        });
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runs = yield* RunRepo;
+            const inputs = yield* RunInputRepo;
+            const repositories = yield* WorkspaceRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            const repositoryId =
+              Schema.decodeUnknownSync(WorkspaceId)("pr-repository");
+            yield* repositories.createRepository({
+              id: repositoryId,
+              organizationId: testOrganizationId,
+              url: "https://github.com/acme/widgets.git",
+              ref: "main",
+            });
+            yield* runs.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            yield* runs.update(testSessionId, {
+              state: "orphaned",
+              repositoryId: Option.some(repositoryId),
+              workspacePath: Option.some(testPath("pr-authority")),
+              ompSessionFile: Option.some(
+                testPath("pr-authority/session.jsonl"),
+              ),
+            });
+            yield* authority.processSession(testSessionId);
+            const listener = hostToolListener;
+            expect(listener).toBeDefined();
+            if (listener === undefined) return;
+            const call = {
+              id: "pr-call",
+              toolCallId: "pr-tool",
+              toolName: "github_create_pull_request",
+              arguments: {
+                head: "fix/issue",
+                base: "main",
+                title: "Fix issue",
+              },
+            };
+            const result = yield* listener(call);
+            expect(result.isError).not.toBe(true);
+            expect(result.details).toMatchObject({
+              url: "https://github.com/acme/widgets/pull/42",
+            });
+            expect(JSON.stringify(result)).not.toContain("ghs_pr_private");
+            expect(requests).toEqual([
+              {
+                url: "https://api.github.com/repos/acme/widgets/pulls?state=open&head=acme%3Afix%2Fissue&base=main",
+                authorization: "Bearer ghs_pr_private",
+              },
+            ]);
+            yield* inputs.applyStop(testSessionId);
+            const refused = yield* listener(call);
+            expect(refused.isError).toBe(true);
+            expect(requests).toHaveLength(1);
+          }),
+        {
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({
+                name: "partitura[bot]",
+                email: "partitura@example.test",
+              }),
+            getInstallationToken: (owner, name, org) => {
+              expect([owner, name, org]).toEqual([
+                "acme",
+                "widgets",
+                testOrganizationId,
+              ]);
+              return Effect.succeed("ghs_pr_private");
+            },
+          },
+        },
+      ).pipe(Effect.ensuring(Effect.sync(() => fetchMock.mockRestore())));
+    },
+  );
   it.live("refuses mutating host tools once the run is canceled", () =>
     withAuthority(
       () =>
@@ -2049,6 +2153,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
             "linear_create_comment",
             "linear_update_issue",
             "linear_add_external_url",
+            "github_create_pull_request",
           ]);
           expect(workerSpawnInputs).toHaveLength(1);
           const listener = hostToolListener;
@@ -3994,7 +4099,8 @@ describe("AgentDriver authority integration", () => {
               const prompt = JSON.stringify(
                 server.commandsOf("message.dispatch")[0],
               );
-              expect(prompt).toContain("GitHub REST API");
+              expect(prompt).toContain("github_create_pull_request");
+              expect(prompt).not.toContain("git config --get");
               expect(prompt).not.toContain("Org OMP contract");
               expect(prompt).not.toContain("linear_get_issue");
               expect(prompt).not.toContain("rromp_report_deviation");

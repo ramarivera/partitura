@@ -106,10 +106,9 @@ transport encryption. This opt-in does not verify the endpoint's network.
 
 ### Git and pull requests
 
-Launched T3 agents use the same credential path as OMP workers: the GitHub
-App installation token scoped to the run's repository, persisted as
-`http.https://github.com/.extraheader` in the workspace's mode-0600 Git config
-and re-minted on resume. It expires after an hour and never reaches the T3 API.
+Launched T3 agents and OMP workers use a repository-scoped Git HTTP broker.
+The workspace holds a revocable session URL, while GitHub App installation
+tokens stay in the gateway and refresh through the App service's expiring cache.
 Workspace preparation also sets repo-local `user.name` and `user.email` for both
 drivers, including reused checkouts. The GitHub App slug comes from `GET /app`;
 `GET /users/<slug>[bot]` supplies the bot user ID, which differs from the App ID.
@@ -120,9 +119,10 @@ If the App slug itself can't be read, preparation logs a warning and preserves
 any existing identity. Git config writes run as the workspace owner and never
 change global configuration.
 
-The T3 worker contract tells the agent to push a branch, open the PR through the
-GitHub REST API with that credential, and include the PR URL in its final
-response, which the authority links to the Linear session. The GitHub App
+The worker pushes a branch, calls `github_create_pull_request` with its head,
+base and title, then includes the PR URL in its final response. The gateway
+binds PR creation to the run's repository and links the result to Linear.
+The GitHub App
 installation needs Contents and Pull requests write access on the repository.
 Both modes refuse retained non-gateway Git credentials and config includes
 before opening T3. Launch mode checks as the session uid and allows only the

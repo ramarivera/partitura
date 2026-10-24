@@ -7,6 +7,7 @@ export const LINEAR_WORKER_CONTRACT = `Linear integration:
 - Gateway-owned Linear tools are available: linear_get_issue(issueId) reads any issue visible to this installation; linear_create_comment(body) posts a comment to this run's issue; linear_update_issue(stateId?, delegateId?) updates this run's issue; linear_add_external_url(label, url) appends a URL to this run's agent session.
 - Use linear_get_issue to inspect issue state/details, linear_create_comment for user-facing issue updates, linear_update_issue when changing workflow state or delegation, and linear_add_external_url for durable artifact links.
 - Call linear_add_external_url immediately when you open or update a pull request, using label "Pull request" and the PR URL.
+- Git uses a session-scoped broker. Push your branch normally, then use github_create_pull_request(head, base, title, body?, draft?) to open the PR. GitHub installation credentials stay in the gateway.
 - Call rromp_report_deviation as soon as you take a shortcut, depart from the original request, change a material assumption, or make a consequential implementation decision. The report becomes a visible Linear issue comment.
 - Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
 - If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
@@ -16,10 +17,11 @@ const T3_CONTRACT_HEADER = `Linear integration:
 const T3_CONTRACT_FOOTER = `- Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
 - If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
 
-/** T3 Code agents have no OMP extensions or inline Linear host tools. */
+/** T3 Code agents receive gateway tools through their session MCP server. */
 export const T3_WORKER_CONTRACT = `${T3_CONTRACT_HEADER}
-- Work in the repository checkout that is your working directory. Git is preconfigured with a short-lived credential scoped to this repository: commit on a new branch and push it with \`git push -u origin <branch>\`.
-- Open the pull request with the GitHub REST API (POST https://api.github.com/repos/<owner>/<repo>/pulls). Authenticate with the same short-lived credential Git uses: \`git config --get http.https://github.com/.extraheader\` holds it as HTTP Basic auth for the user x-access-token. Never commit it or write it to files.
+- Work in the repository checkout that is your working directory. Git is preconfigured with a session-scoped broker: commit on a new branch and push it with \`git push -u origin <branch>\`.
+- Use the gateway's github_create_pull_request tool with head, base, title and optional body/draft to open the PR. GitHub installation credentials stay in the gateway.
+- Use linear_workspace_read(operation, input) and linear_workspace_write(operation, input, id?) for the fixed workspace operations advertised by the gateway MCP server. Use native_build_* tools when present for native Mac builds.
 - Include the pull request URL in your final response; the gateway links it to the Linear issue.
 ${T3_CONTRACT_FOOTER}`;
 

@@ -61,6 +61,10 @@ import {
 } from "./agent-settings.js";
 import { GatewayConfig, type T3LaunchConfig } from "./config.js";
 import { GitHubApp } from "./github-app.js";
+import {
+  createGitHubPullRequest,
+  githubCreatePullRequestToolDefinition,
+} from "./github-workspace-tools.js";
 import { LinearGateway, type LinearIssue } from "./linear-gateway.js";
 import { startLinearMcpServer } from "./linear-mcp-server.js";
 import {
@@ -1863,6 +1867,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         ];
         const definitions: ReadonlyArray<RpcHostToolDefinition> = [
           ...linearDefinitions,
+          githubCreatePullRequestToolDefinition,
           ...(config.nativeBuild === undefined
             ? []
             : ([
@@ -1941,6 +1946,83 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             const fail = (message: string) =>
               textResult(message, undefined, true);
             const raw = request.arguments;
+            if (request.toolName === "github_create_pull_request") {
+              return yield* withSessionMutationGate(
+                run.sessionId,
+                Effect.gen(function* () {
+                  const current = yield* runRepo.get(run.sessionId);
+                  if (Option.isNone(current))
+                    return fail("Run no longer exists");
+                  const latest = current.value;
+                  if (
+                    latest.desiredState === "canceled" ||
+                    ["succeeded", "failed", "canceled"].includes(latest.state)
+                  )
+                    return fail(
+                      "Run is finished; pull request creation is refused",
+                    );
+                  if (Option.isNone(latest.repositoryId))
+                    return fail("Run has no configured repository");
+                  const repository = yield* workspaceRepo.getRepository(
+                    latest.organizationId,
+                    latest.repositoryId.value,
+                  );
+                  if (
+                    Option.isNone(repository) ||
+                    Option.isNone(githubAppOption)
+                  )
+                    return fail(
+                      "GitHub repository credentials are unavailable",
+                    );
+                  const github = githubAppOption.value;
+                  const result = yield* Effect.tryPromise({
+                    try: (signal) =>
+                      createGitHubPullRequest(
+                        {
+                          repository: repository.value,
+                          getToken: (boundRepository) => {
+                            const candidate =
+                              parseRepositorySuggestionCandidate(
+                                boundRepository.url,
+                              );
+                            const [owner, name] =
+                              candidate?.repositoryFullName.split("/") ?? [];
+                            if (owner === undefined || name === undefined)
+                              return Promise.reject(
+                                new RpcProtocolError({
+                                  method: "github_create_pull_request",
+                                  message: "Invalid repository",
+                                }),
+                              );
+                            return runPromise(
+                              github.getInstallationToken(
+                                owner,
+                                name,
+                                latest.organizationId,
+                              ),
+                              { signal },
+                            );
+                          },
+                          signal,
+                        },
+                        raw,
+                      ),
+                    catch: () =>
+                      new RpcProtocolError({
+                        method: "github_create_pull_request",
+                        message: "Unable to create GitHub pull request",
+                      }),
+                  });
+                  return textResult(JSON.stringify(result), result);
+                }).pipe(
+                  Effect.catch(() =>
+                    Effect.succeed(
+                      fail("Unable to create GitHub pull request"),
+                    ),
+                  ),
+                ),
+              );
+            }
             if (request.toolName.startsWith("native_build_")) {
               if (config.nativeBuild === undefined)
                 return fail("Native build tools are disabled");
