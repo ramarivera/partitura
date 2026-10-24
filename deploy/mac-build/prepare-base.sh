@@ -148,6 +148,10 @@ fi
 if [ "$(id -u)" -eq 0 ]; then fail 'run as an administrator account, not root'; fi
 export TART_HOME="$tart_home"
 export TART_NO_AUTO_PRUNE=1
+scratch_root="$HOME/dev/agentic-scratchpads/partitura/native-base-preparation"
+mkdir -p -m 0700 "$scratch_root"
+check_path "$scratch_root"
+[ "$(stat -f '%u:%Lp' "$scratch_root")" = "$(id -u):700" ] || fail 'scratch directory must be owned by the current user mode 0700'
 running=0
 completed=0
 receipt_write_started=0
@@ -218,11 +222,13 @@ for name in ("config.json", "disk.img", "nvram.bin"):
     finally:
         os.close(descriptor)
 PY
-"$tart" run "$base_name" --no-graphics --no-audio --no-usb-accessories --no-clipboard >/dev/null 2>&1 &
+boot_log=$(mktemp "$scratch_root/tart-boot.XXXXXX")
+"$tart" run "$base_name" --no-graphics --no-audio --no-usb-accessories --no-clipboard >"$boot_log" 2>&1 &
 tart_run_pid=$!
 running=1
 ready=0
 for _ in $(seq 1 120); do
+  kill -0 "$tart_run_pid" 2>/dev/null || { cat "$boot_log" >&2; fail 'Tart exited before the guest agent became ready'; }
   if "$tart" exec "$base_name" /usr/bin/true >/dev/null 2>&1; then ready=1; break; fi
   sleep 2
 done
@@ -230,10 +236,6 @@ done
 
 # Install files through Tart's stdin transport. The guest is never given a host
 # directory mount, even during preparation.
-scratch_root="$HOME/dev/agentic-scratchpads/partitura/native-base-preparation"
-mkdir -p -m 0700 "$scratch_root"
-check_path "$scratch_root"
-[ "$(stat -f '%u:%Lp' "$scratch_root")" = "$(id -u):700" ] || fail 'scratch directory must be owned by the current user mode 0700'
 archive_dir=$(mktemp -d "$scratch_root/partitura-native-base.XXXXXX")
 chmod 0700 "$archive_dir"
 install -m 0600 "$runner" "$archive_dir/run.sh"
