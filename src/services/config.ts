@@ -118,6 +118,10 @@ export interface GatewayConfigShape {
   /** Dedicated Partitura client key, passed only into worker environments. */
   readonly cliproxyApiKey?: Redacted.Redacted<string> | undefined;
   readonly workerDefaultModel?: string | undefined;
+  /** Org/repository-bound scoped identities. Never inherit a gateway age key. */
+  readonly workerRepositoryAgeKeys?: Redacted.Redacted<
+    Readonly<Record<string, Readonly<Record<string, string>>>>
+  >;
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
   readonly workerExtensionPaths?: ReadonlyArray<string>;
   readonly workerClaudeExecutable?: string;
@@ -872,6 +876,56 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       const linearClientSecret = yield* requiredValue("LINEAR_CLIENT_SECRET");
       const linearWebhookSecret = yield* requiredValue("LINEAR_WEBHOOK_SECRET");
       const tokenEncryptionKey = yield* requiredValue("TOKEN_ENCRYPTION_KEY");
+      const rawRepositoryAgeKeys = yield* optionalValue(
+        "WORKER_REPOSITORY_AGE_KEYS_JSON",
+      );
+      const workerRepositoryAgeKeys = yield* Effect.try({
+        try: () => {
+          const value: unknown = JSON.parse(rawRepositoryAgeKeys ?? "{}");
+          if (
+            typeof value !== "object" ||
+            value === null ||
+            Array.isArray(value) ||
+            Buffer.byteLength(rawRepositoryAgeKeys ?? "{}") > 2 * 1024 * 1024
+          )
+            throw new Error("invalid map");
+          const result: Record<string, Record<string, string>> = Object.create(
+            null,
+          );
+          for (const [organizationId, repositories] of Object.entries(value)) {
+            if (
+              !/^[A-Za-z0-9_-]{1,128}$/u.test(organizationId) ||
+              typeof repositories !== "object" ||
+              repositories === null ||
+              Array.isArray(repositories)
+            )
+              throw new Error("invalid binding");
+            const bindings: Record<string, string> = Object.create(null);
+            for (const [repositoryId, identity] of Object.entries(
+              repositories,
+            )) {
+              if (
+                !/^[A-Za-z0-9_-]{1,128}$/u.test(repositoryId) ||
+                typeof identity !== "string" ||
+                identity.trim().length === 0 ||
+                Buffer.byteLength(identity) > 256 * 1024 ||
+                identity.includes("\0")
+              )
+                throw new Error("invalid identity");
+              bindings[repositoryId] = identity;
+            }
+            result[organizationId] = bindings;
+          }
+          return Redacted.make(result);
+        },
+        catch: () =>
+          new Config.ConfigError(
+            new ConfigProvider.SourceError({
+              message:
+                "WORKER_REPOSITORY_AGE_KEYS_JSON must bind organization and repository IDs to bounded scoped age identities",
+            }),
+          ),
+      });
       const githubAppId = yield* optionalValue("GITHUB_APP_ID");
       const githubAppPrivateKey = yield* optionalValue(
         "GITHUB_APP_PRIVATE_KEY",
@@ -951,6 +1005,7 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
               },
             }),
         ...routing,
+        workerRepositoryAgeKeys,
         allowedOrganizationIds,
         gatewayAdminOrganizationIds,
         githubAppAllowedOwners,

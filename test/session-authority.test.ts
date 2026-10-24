@@ -1,4 +1,11 @@
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@effect/vitest";
@@ -2019,6 +2026,95 @@ describe("SessionAuthority deferred stop handling", () => {
       ),
   );
 });
+describe("SessionAuthority repository age identities", () => {
+  it.live(
+    "materializes only the run's org/repository key and passes a private file pointer",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runs = yield* RunRepo;
+            const repositories = yield* WorkspaceRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            for (const [index, repositoryName] of [
+              "bound-repo",
+              "unbound-repo",
+            ].entries()) {
+              const repositoryId =
+                Schema.decodeUnknownSync(WorkspaceId)(repositoryName);
+              const sessionId = Schema.decodeUnknownSync(SessionId)(
+                `age-session-${index}`,
+              );
+              const cwd = testPath(`age-workspace-${index}`);
+              yield* repositories.createRepository({
+                id: repositoryId,
+                organizationId: testOrganizationId,
+                url: "https://github.com/fixture/scoped.git",
+                ref: "main",
+              });
+              yield* runs.create({
+                sessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.none(),
+              });
+              yield* runs.update(sessionId, {
+                state: "orphaned",
+                repositoryId: Option.some(repositoryId),
+                workspacePath: Option.some(cwd),
+                ompSessionFile: Option.some(join(cwd, "session.jsonl")),
+              });
+              yield* authority.processSession(sessionId);
+              const environment = workerSpawnInputs[index]?.env;
+              expect(environment).toBeDefined();
+              if (index === 0) {
+                const path = join(
+                  cwd,
+                  ".omp-home",
+                  ".config",
+                  "sops",
+                  "age",
+                  "keys.txt",
+                );
+                expect(environment?.FNOX_AGE_KEY_FILE).toBe(path);
+                expect(
+                  yield* Effect.promise(() => readFile(path, "utf8")),
+                ).toBe("scoped-fixture-key");
+                const metadata = yield* Effect.promise(() => stat(path));
+                expect(metadata.mode & 0o777).toBe(0o400);
+                expect(metadata.uid).toBe(process.getuid?.());
+                yield* (yield* RunInputRepo).applyStop(sessionId);
+                yield* authority.processSession(sessionId);
+                yield* Effect.promise(async () => {
+                  await expect(readFile(path)).rejects.toMatchObject({
+                    code: "ENOENT",
+                  });
+                });
+              } else
+                expect(environment).not.toHaveProperty("FNOX_AGE_KEY_FILE");
+              expect(JSON.stringify(workerSpawnInputs[index])).not.toContain(
+                "scoped-fixture-key",
+              );
+              expect(JSON.stringify(workerSpawnInputs[index])).not.toContain(
+                "foreign-org-key",
+              );
+            }
+          }),
+        {
+          config: [
+            [
+              "WORKER_REPOSITORY_AGE_KEYS_JSON",
+              JSON.stringify({
+                [testOrganizationId]: { "bound-repo": "scoped-fixture-key" },
+                "foreign-org": { "unbound-repo": "foreign-org-key" },
+              }),
+            ],
+          ],
+        },
+      ),
+  );
+});
+
 describe("SessionAuthority host-tool mutation gate", () => {
   it.live(
     "creates a repo-bound PR without Linear and refuses creation after stop",

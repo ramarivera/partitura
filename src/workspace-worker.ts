@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   rename,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -122,6 +123,17 @@ switch (action) {
     break;
   }
   case "age-identity": {
+    if (
+      typeof input === "object" &&
+      input !== null &&
+      "identity" in input &&
+      input.identity === null
+    ) {
+      await rm(join(cwd, ".omp-home", ".config", "sops", "age", "keys.txt"), {
+        force: true,
+      });
+      break;
+    }
     if (
       typeof input !== "object" ||
       input === null ||

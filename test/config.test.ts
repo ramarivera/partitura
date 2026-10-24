@@ -62,6 +62,33 @@ afterEach(async () => {
 const testPath = testPaths();
 
 describe("GatewayConfig", () => {
+  test("loads scoped age bindings as redacted configuration and hides invalid contents", async () => {
+    const keys = { "org-one": { "repo-one": "scoped-test-identity" } };
+    const configured = await Effect.runPromise(
+      configResult(
+        valuesWith([["WORKER_REPOSITORY_AGE_KEYS_JSON", JSON.stringify(keys)]]),
+      ),
+    );
+    expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured)) {
+      expect(configured.success.workerRepositoryAgeKeys).toBeDefined();
+      const bound = configured.success.workerRepositoryAgeKeys;
+      if (bound !== undefined) {
+        expect(Redacted.value(bound)).toEqual(keys);
+        expect(JSON.stringify(bound)).not.toContain("scoped-test-identity");
+      }
+    }
+    const invalid = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["WORKER_REPOSITORY_AGE_KEYS_JSON", '{"secret-invalid-content":[]}'],
+        ]),
+      ),
+    );
+    expect(Result.isFailure(invalid)).toBe(true);
+    expect(JSON.stringify(invalid)).not.toContain("secret-invalid-content");
+  });
+
   test("requires the allowlisted broker when sandbox mode is enabled", async () => {
     const missingBroker = await Effect.runPromise(
       configResult(valuesWith([["WORKER_SANDBOX_MODE", "sysbox"]])),

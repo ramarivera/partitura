@@ -91,7 +91,7 @@ export const sessionWorkerEnvironment = (
   cwd: string,
   input: Record<string, string | undefined>,
 ): Record<string, string> => ({
-  ...workerEnvironment(input),
+  ...workerEnvironment({ ...input, FNOX_AGE_KEY_FILE: undefined }),
   BUN_INSTALL_CACHE_DIR: join(cwd, ".omp-home", ".cache", "bun", "install"),
   BUN_RUNTIME_TRANSPILER_CACHE_PATH: join(
     cwd,

@@ -194,6 +194,25 @@ gateway's process environment and files. Use Docker for this boundary. Per-sessi
 uids isolate discretionary filesystem access; workers still share the container's
 network, kernel and global process visibility. This isn't a network sandbox.
 
+## Repository age identities
+
+`WORKER_REPOSITORY_AGE_KEYS_JSON_FILE` points to a gateway-only secret whose JSON
+maps organization IDs to repository IDs to scoped age identity text. Keep that
+map encrypted in fnox source. It must contain project agent identities, never
+toolbox, operator, release or production identities. The gateway selects only
+the durable run's organization/repository binding, then sends that identity on
+stdin to its workspace helper under the worker UID. Both OMP and launched T3
+receive only `FNOX_AGE_KEY_FILE`, pointing to a mode-0400 file beneath their
+private home. Neither the identity nor the map goes into argv or worker env.
+
+New sessions discard inherited gateway `FNOX_AGE_KEY_FILE` pointers. A launch
+without a configured binding removes a previous materialized identity, and
+terminal cleanup removes the file too. A cleanup failure emits a sanitized
+warning; workspace retention remains responsible for final deletion. File
+removal doesn't revoke copies an authorized worker already read. Keep the
+identity's decryptable secrets limited to that project's agent scope and verify
+positive and negative decryption cases before enabling a live grant.
+
 ## Launched T3 daemons
 
 With `T3_MODE=launch` each T3 session gets its own `t3 serve` started by the

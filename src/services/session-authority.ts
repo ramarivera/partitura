@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   Cause,
@@ -761,7 +762,24 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           onSome: (path) =>
             Effect.andThen(
               workspace.clearGitHubExtraHeader(run.sessionId, path),
-              removeMcpAgentDb(path),
+              Effect.andThen(
+                removeMcpAgentDb(path),
+                Effect.tryPromise({
+                  try: () =>
+                    workspaceProcess(path, "age-identity", { identity: null }),
+                  catch: () =>
+                    new RpcSpawnError({
+                      message: "Could not remove scoped age identity",
+                    }),
+                }).pipe(
+                  Effect.asVoid,
+                  Effect.catch(() =>
+                    Effect.logWarning(
+                      "worker.age_identity_cleanup_failed",
+                    ).pipe(Effect.annotateLogs({ sessionId: run.sessionId })),
+                  ),
+                ),
+              ),
             ),
         });
       const ensureIssueLifecycle = (
@@ -2492,6 +2510,37 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         },
       );
 
+      const applyRepositoryAgeIdentity = Effect.fn(
+        "SessionAuthority.applyRepositoryAgeIdentity",
+      )(function* (
+        run: AgentRun,
+        cwd: string,
+        environment: Record<string, string>,
+      ) {
+        delete environment.FNOX_AGE_KEY_FILE;
+        const keys =
+          config.workerRepositoryAgeKeys === undefined
+            ? undefined
+            : Redacted.value(config.workerRepositoryAgeKeys);
+        const identity = Option.isSome(run.repositoryId)
+          ? keys?.[run.organizationId]?.[run.repositoryId.value]
+          : undefined;
+        const path = yield* Effect.tryPromise({
+          try: () =>
+            workspaceProcess(cwd, "age-identity", {
+              identity: identity ?? null,
+            }),
+          catch: () =>
+            new RpcSpawnError({
+              message: "Could not prepare scoped repository age identity",
+            }),
+        });
+        if (identity !== undefined) {
+          environment.FNOX_AGE_KEY_FILE = path;
+          environment.HOME = join(cwd, ".omp-home");
+        }
+      });
+
       /** Repository Nix PATH and, on resume, a fresh repo-scoped Git credential. */
       const applyRepositoryEnvironment = Effect.fn(
         "SessionAuthority.applyRepositoryEnvironment",
@@ -2789,6 +2838,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             });
             // Always a private HOME: the daemon's state must never be shared.
             const environment = sessionWorkerEnvironment(cwd, process.env);
+            yield* applyRepositoryAgeIdentity(run, cwd, environment);
             const sandbox = yield* provisionSandbox(run.sessionId, cwd, uid);
             if (sandbox !== undefined) {
               environment.HTTP_PROXY = sandbox.egressProxyUrl;
@@ -3002,6 +3052,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           workerUid === undefined
             ? workerEnvironment(process.env)
             : sessionWorkerEnvironment(cwd, process.env);
+        yield* applyRepositoryAgeIdentity(run, cwd, environment);
         const sandbox = yield* provisionSandbox(run.sessionId, cwd, workerUid);
         if (sandbox !== undefined) {
           environment.HTTP_PROXY = sandbox.egressProxyUrl;

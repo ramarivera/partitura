@@ -8,6 +8,7 @@ import {
   mkdtemp,
   open,
   readdir,
+  readFile,
   realpath,
   rm,
   stat,
@@ -67,6 +68,7 @@ import {
 import {
   prepareWorkerWorkspace,
   prepareWorkerWorkspaceSync,
+  sessionWorkerEnvironment,
   workerEnvironment,
   workerIdentityCommand,
   workerMcpCredential,
@@ -409,6 +411,26 @@ process.exit(0);`;
       ]),
     );
     expect(() => workerIdentityCommand(["omp"], "0")).toThrow();
+  });
+
+  it("revokes a materialized age identity when the next launch has no binding", async () => {
+    const dir = await temporary();
+    const keyPath = await workspaceProcess(dir, "age-identity", {
+      identity: "scoped-fixture-key",
+    });
+    expect(await readFile(keyPath, "utf8")).toBe("scoped-fixture-key");
+    await workspaceProcess(dir, "age-identity", { identity: null });
+    await expect(readFile(keyPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("drops the gateway age-key pointer from new session environments", () => {
+    const env = sessionWorkerEnvironment("/workspace", {
+      PATH: "/bin",
+      FNOX_AGE_KEY_FILE: "/private/gateway-age.key",
+      FNOX_AGE_KEY: "gateway-secret",
+    });
+    expect(env).not.toHaveProperty("FNOX_AGE_KEY_FILE");
+    expect(env).not.toHaveProperty("FNOX_AGE_KEY");
   });
 
   it("passes prepared package paths without inherited Nix store configuration", () => {
