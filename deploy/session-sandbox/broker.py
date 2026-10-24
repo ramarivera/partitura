@@ -183,12 +183,16 @@ def _network(session: str) -> str:
 
 
 def _remove_owned(kind: str, name: str, session: str, attempt: int = 0) -> None:
-    inspected = subprocess.run(
-        [DOCKER, kind, "inspect", name],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        inspected = subprocess.run(
+            [DOCKER, kind, "inspect", name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Docker {kind} ownership check timed out; retry teardown") from None
     if inspected.returncode != 0:
         diagnostic = f"{inspected.stdout}\n{inspected.stderr}".lower()
         if "no such" in diagnostic or "not found" in diagnostic:
@@ -201,12 +205,18 @@ def _remove_owned(kind: str, name: str, session: str, attempt: int = 0) -> None:
     if not isinstance(labels, dict) or labels.get("partitura.session") != session:
         raise ValueError(f"Docker {kind} session label does not match")
     action = {"container": "rm", "network": "network rm", "volume": "volume rm"}[kind]
-    result = subprocess.run(
-        [DOCKER, *action.split(), "-f", name] if kind == "container" else [DOCKER, *action.split(), name],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [DOCKER, *action.split(), "-f", name] if kind == "container" else [DOCKER, *action.split(), name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        # Docker may continue an asynchronous removal after its CLI exits. Keep
+        # the lifecycle record so the next teardown rechecks exact ownership.
+        raise RuntimeError(f"Docker {kind} removal timed out; retry teardown") from None
     if result.returncode != 0:
         diagnostic = f"{result.stdout}\n{result.stderr}".lower()
         transient = "tried to kill container" in diagnostic or "removal of container" in diagnostic and "in progress" in diagnostic
@@ -444,6 +454,19 @@ def _runtime(request: dict[str, Any]) -> str:
     return runtime
 
 
+def _gateway_routing() -> tuple[str, str]:
+    if GATEWAY_ADDRESS or GATEWAY_RELAY_ADDRESS or GATEWAY_INTERFACE:
+        if not GATEWAY_ADDRESS or not GATEWAY_RELAY_ADDRESS or not GATEWAY_INTERFACE:
+            raise ValueError("native gateway routing requires address, relay address and interface")
+        gateway_ip, bridge_ip = GATEWAY_ADDRESS, GATEWAY_RELAY_ADDRESS
+    else:
+        gateway_ip = _run(["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_NETWORK_CONTAINER])
+        bridge_ip = _run(["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", GATEWAY_NETWORK])
+    if not all(ipaddress.ip_address(value).version == 4 for value in (gateway_ip, bridge_ip)):
+        raise ValueError("gateway relay requires IPv4 addresses")
+    return gateway_ip, bridge_ip
+
+
 def provision(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
     runtime = _runtime(request)
@@ -456,7 +479,7 @@ def provision(request: dict[str, Any]) -> dict[str, Any]:
             vm.provision(session, uid, workspace)
             vm.start_workspace(session)
             return {"runtime": runtime, "container": _container(session), "workspace": "/workspace",
-                    "workerAddress": "127.0.0.1", "gatewayAddress": "127.0.0.1", "relayAddress": "127.0.0.1"}
+                    "workerAddress": "127.0.0.1", "gatewayAddress": _gateway_routing()[0], "relayAddress": "127.0.0.1"}
         vm.save(session, {"sessionId": session, "runtime": runtime, "workerUid": uid,
                           "workspaceHost": str(workspace)})
         result = _sysbox_provision(request)
@@ -488,7 +511,7 @@ def recover(request: dict[str, Any]) -> dict[str, Any]:
         vm.start(session)
         vm.start_workspace(session)
         return {"runtime": runtime, "exists": True, "running": True, "container": _container(session),
-                "workspace": "/workspace", "workerAddress": "127.0.0.1", "gatewayAddress": "127.0.0.1", "relayAddress": "127.0.0.1"}
+                "workspace": "/workspace", "workerAddress": "127.0.0.1", "gatewayAddress": _gateway_routing()[0], "relayAddress": "127.0.0.1"}
 
 
 def destroy(request: dict[str, Any]) -> dict[str, Any]:
@@ -955,15 +978,7 @@ async def _vm_relay(reader, writer, request, record):
     target, port = request.get("target"), request.get("targetPort")
     if target not in ("gateway", "worker") or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError("relay target or port is invalid")
-    if GATEWAY_ADDRESS or GATEWAY_RELAY_ADDRESS or GATEWAY_INTERFACE:
-        if not GATEWAY_ADDRESS or not GATEWAY_RELAY_ADDRESS or not GATEWAY_INTERFACE:
-            raise ValueError("native gateway routing requires address, relay address and interface")
-        gateway_ip, bridge_ip = GATEWAY_ADDRESS, GATEWAY_RELAY_ADDRESS
-    else:
-        gateway_ip = _run(["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_NETWORK_CONTAINER])
-        bridge_ip = _run(["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", GATEWAY_NETWORK])
-    if not all(ipaddress.ip_address(value).version == 4 for value in (gateway_ip, bridge_ip)):
-        raise ValueError("gateway relay requires IPv4 addresses")
+    gateway_ip, bridge_ip = _gateway_routing()
     active: set[asyncio.Task[Any]] = set()
     guest_writer = None
     unix_path = None

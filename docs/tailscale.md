@@ -12,6 +12,60 @@ Serve overlay terminates tailnet HTTPS on port 443 and proxies to localhost:3000
 No host ports are published. Gateway admin authentication and webhook signature
 checks still apply.
 
+## Session runtime prerequisites
+
+The gateway defaults to `WORKER_SANDBOX_MODE=firecracker`. Before starting this
+stack, install the [session broker and Firecracker artifacts](../deploy/session-sandbox/README.md)
+on the Docker host. Set these optional values in this directory's `.env` to
+select the runtime or a different host socket directory:
+
+```dotenv
+WORKER_SANDBOX_MODE=firecracker
+SESSION_SANDBOX_BROKER_DIR=/run/partitura-sandbox
+SESSION_SANDBOX_BROKER_SOCKET=/run/partitura-sandbox/broker.sock
+```
+
+`SESSION_SANDBOX_BROKER_DIR` is the host directory. Compose mounts it read-only
+at `/run/partitura-sandbox` in the gateway. `SESSION_SANDBOX_BROKER_SOCKET` is the
+socket path inside that container, so keep it under this mounted directory.
+The mount covers the directory so a systemd socket restart doesn't leave the
+gateway pointing at an old socket inode. The directory must already exist;
+Compose refuses to create it. Keep it root-owned with mode 0750 and the socket
+root:root with mode 0660, matching the supplied socket unit. Only the root
+gateway receives this mount; the Tailscale sidecar and workers don't receive it.
+
+Configure `/etc/partitura-sandbox/broker.env` on the host with
+`PARTITURA_WORKSPACE_ROOT=/app/workspaces` and
+`PARTITURA_WORKSPACE_HOST_ROOT` set to the actual host mountpoint of this stack's
+`partitura-tailnet_gateway-workspaces` volume. Find it with
+`docker volume inspect partitura-tailnet_gateway-workspaces --format '{{.Mountpoint}}'`
+after the volume exists. If you override the Compose project name, use that
+project's volume name. The broker maps the gateway's logical workspace paths
+into this host directory. `/app/workspaces` itself isn't the host mountpoint.
+Set the broker's exact HTTPS egress allowlist and qualify Firecracker's KVM,
+guest artifacts and restricted SFTP runtime before dispatching sessions.
+
+Both isolated backends need the gateway's Docker network identity for relays.
+For the default project name, configure the host broker with
+`PARTITURA_GATEWAY_CONTAINER=partitura-tailnet-gateway-1`,
+`PARTITURA_GATEWAY_NETWORK_CONTAINER=partitura-tailnet-tailscale-1`, and
+`PARTITURA_GATEWAY_NETWORK=partitura-tailnet_default`. The network owner is the
+Tailscale container because the gateway shares its namespace. If you change
+the project name, service names or network configuration, use their actual
+Docker names. Keep the gateway outside session networks and configure any
+required scoped host firewall exceptions through the broker's documented setup.
+
+Set `WORKER_SANDBOX_MODE=sysbox` explicitly for the Docker-based backend.
+Install and qualify Sysbox and its pinned worker image as described in the
+broker guide. It uses the same socket and host workspace mapping as Firecracker.
+
+For local development with gateway-owned worker processes, set
+`WORKER_SANDBOX_MODE=native` explicitly. It doesn't use the broker. The common
+Compose mount still requires an existing root-owned directory; a native-only
+host can supply an empty mode-0750 directory through
+`SESSION_SANDBOX_BROKER_DIR`. An unavailable isolated runtime fails the session;
+the gateway doesn't switch to native execution.
+
 ## Important webhook limitation
 
 Tailscale Serve is private to your tailnet. Linear's hosted webhook sender and
@@ -244,7 +298,9 @@ docker compose -f deploy/tailscale/compose.yaml -f deploy/tailscale/compose.serv
 
 For a logged-out runtime probe, use an isolated scratch Compose override with an
 internal Docker network, fresh volumes, an empty auth-key file, dummy gateway
-credentials and `PUBLIC_URL=http://localhost:3000`. Temporarily use
+credentials and `PUBLIC_URL=http://localhost:3000`. Set
+`WORKER_SANDBOX_MODE=native` for this UID-isolation probe and supply an empty,
+root-owned broker mount directory as described above. Temporarily use
 `condition: service_started` for the gateway and omit Serve. Assert `NeedsLogin`,
 an unhealthy sidecar, equal `/proc/self/ns/net` links, a responding gateway health
 endpoint through sidecar localhost, a root gateway with the six-capability policy,

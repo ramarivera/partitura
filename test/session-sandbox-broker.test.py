@@ -298,6 +298,18 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][1:], ["rm", "-f", "partitura-session-session-2"])
         self.assertEqual(len(calls), 2)
 
+    def test_docker_teardown_cli_timeouts_are_bounded_and_report_retry(self):
+        owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}}]), stderr="")
+        timeout = subprocess.TimeoutExpired(["docker"], 30)
+        for results, phase, expected_calls in (([timeout], "ownership check", 1), ([owned, timeout], "removal", 2)):
+            with self.subTest(phase=phase), patch.object(broker.subprocess, "run", side_effect=results) as run:
+                with self.assertRaisesRegex(RuntimeError, phase + " timed out; retry teardown"):
+                    broker._remove_owned("container", "partitura-session-session-2", "session-2")
+                self.assertEqual(run.call_count, expected_calls)
+                self.assertEqual(run.call_args_list[0].kwargs["timeout"], 10)
+                if expected_calls == 2:
+                    self.assertEqual(run.call_args_list[1].kwargs["timeout"], 30)
+
     def test_destroy_rechecks_ownership_before_retrying_async_container_kill(self):
         owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}}]), stderr="")
         killing = SimpleNamespace(returncode=1, stdout="", stderr="tried to kill container, but did not receive an exit event")

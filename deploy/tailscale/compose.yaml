@@ -74,6 +74,8 @@ services:
       DATABASE_PATH: /app/data/gateway.sqlite
       WORKSPACE_ROOT: /app/workspaces
       NIX_ROOTS_DIR: /app/nix-roots
+      WORKER_SANDBOX_MODE: ${WORKER_SANDBOX_MODE:-firecracker}
+      SESSION_SANDBOX_BROKER_SOCKET: ${SESSION_SANDBOX_BROKER_SOCKET:-/run/partitura-sandbox/broker.sock}
     secrets:
       - linear_client_id
       - linear_client_secret
@@ -88,6 +90,14 @@ services:
       - gateway-logs:/app/logs
       - gateway-nix:/nix
       - gateway-nix-roots:/app/nix-roots
+      # Mount the root-owned directory so systemd can recreate its socket.
+      # Refuse a missing host directory instead of creating it with loose modes.
+      - type: bind
+        source: ${SESSION_SANDBOX_BROKER_DIR:-/run/partitura-sandbox}
+        target: /run/partitura-sandbox
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: [CMD, bun, -e, "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s

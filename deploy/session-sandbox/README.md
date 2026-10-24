@@ -67,6 +67,13 @@ runs SSHFS with `allow_other`, `default_permissions`, `uid`/`gid` mapping,
 `nodev` and `nosuid`. Workspace programs can execute. Session readiness requires
 the mount, not just a successful control-agent ping.
 
+An immutable host Python helper enters the numeric session identity before
+executing the VMM or SFTP server. It permanently sets all user/group IDs,
+clears every capability set and enables `no_new_privs`. This avoids depending
+on systemd accepting a UID without a host account. OpenSSH's `getpwuid` lookup
+uses a synthetic passwd/group pair inside that session's private SFTP jail.
+Those files never change host accounts and leave with the same session lifecycle.
+
 Host-to-guest connections use Firecracker's Unix vsock socket handshake
 `CONNECT 52` followed by newline. The agent then accepts one newline-terminated
 JSON request containing the token. `exec` validates the session uid, canonical

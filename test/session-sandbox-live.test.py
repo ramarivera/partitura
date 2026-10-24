@@ -29,6 +29,20 @@ BASE_ENV = {
     "T3CODE_NO_BROWSER": "true", "T3CODE_TELEMETRY_ENABLED": "false",
     "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
 }
+GATEWAY_BIND_SERVER = """
+const p=JSON.parse(await Bun.stdin.text());
+let timer;
+const server=Bun.serve({hostname:p.host,port:0,fetch(request){
+  const path=new URL(request.url).pathname;
+  if(path==='/stop/'+p.marker){
+    setTimeout(()=>{clearTimeout(timer);server.stop(true);process.exit(0)},20);
+    return new Response('stopping');
+  }
+  return path==='/'+p.marker?new Response(p.marker):new Response('missing',{status:404});
+}});
+timer=setTimeout(()=>{server.stop(true);process.exit(1)},90000);
+console.log(JSON.stringify({address:p.host,port:server.port}));
+"""
 
 
 async def close(writer):
@@ -99,7 +113,25 @@ async def read_exec(reader):
         target.extend(await reader.readexactly(length))
 
 
+def assert_guest_network(details):
+    if set(details["net"]) != {"lo", "docker0"} or not details["dockerBridge"]:
+        raise AssertionError("guest must have only loopback and the internal Docker bridge")
+    if details["ipv4DefaultRoutes"] or details["ipv6DefaultRoutes"]:
+        raise AssertionError("guest must not have an external default route")
+
+
 class SandboxWireTests(unittest.IsolatedAsyncioTestCase):
+    def test_guest_network_accepts_internal_bridge_and_rejects_external_routes(self):
+        details = {"net": ["docker0", "lo"], "dockerBridge": True,
+                   "ipv4DefaultRoutes": [], "ipv6DefaultRoutes": []}
+        assert_guest_network(details)
+        for difference in ({"net": ["lo", "docker0", "eth0"]},
+                           {"net": ["lo"]}, {"dockerBridge": False},
+                           {"ipv4DefaultRoutes": [{"gateway": "192.0.2.1"}]},
+                           {"ipv6DefaultRoutes": [{"gateway": "2001:db8::1"}]}):
+            with self.subTest(difference=difference), self.assertRaises(AssertionError):
+                assert_guest_network(details | difference)
+
     async def test_exec_frames_keep_control_open_until_exit(self):
         observed = []
 
@@ -179,6 +211,7 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
         self.docker = os.environ.get("PARTITURA_SANDBOX_LIVE_DOCKER", "/usr/bin/docker")
         self.wire = Wire(os.environ.get("PARTITURA_SANDBOX_LIVE_SOCKET", "/run/partitura-sandbox/broker.sock"))
         self.sessions, self.leases, self.owners, self.workspaces = [], [], [], []
+        self.provisioned = {}
         self.firewall_before = set((await self.run_host(["/usr/bin/iptables", "-w", "5", "-S", "INPUT"])).splitlines())
         self.assertTrue(self.host_root.is_dir())
         self.assertFalse(self.host_root.is_symlink())
@@ -235,8 +268,8 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 0, f"worker command failed: {argv[0]}: {stderr.decode(errors='replace')[-2000:]}")
         return stdout.decode()
 
-    async def python(self, session, uid, code, timeout=120):
-        return await self.execute(session, uid, ["python3", "-c", code], timeout=timeout)
+    async def python(self, session, uid, code, timeout=120, env=None):
+        return await self.execute(session, uid, ["python3", "-c", code], env=env, timeout=timeout)
 
     async def lease(self, session, uid, operation, **fields):
         result, writer = await self.wire.lease(self.request(session, uid, operation, **fields))
@@ -253,6 +286,9 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
         workspace = self.host_root / session
         workspace.mkdir(mode=0o700)
         os.chown(workspace, uid, uid)
+        home = workspace / ".omp-home"
+        home.mkdir(mode=0o700)
+        os.chown(home, uid, uid)
         self.workspaces.append(workspace)
         self.sessions.append(session)  # Register cleanup before the first request.
         print(f"LIVE owned session {session}, UID {uid}", flush=True)
@@ -260,12 +296,14 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
         result = await self.wire.control(self.request(session, uid, "provision", workspacePath=str(self.logical_root / session), **fields))
         self.assertEqual(result["runtime"], runtime)
         self.assertEqual(result["workspace"], "/workspace")
+        self.provisioned[session] = result
         return session, workspace
 
     async def assert_absent(self, session):
         digest = hashlib.sha256(session.encode()).hexdigest()[:24]
         self.assertFalse((self.state_root / (digest + ".json")).exists())
         self.assertFalse((self.state_root / (digest + ".machine.json")).exists())
+        self.assertFalse((self.state_root / (digest + ".sftp-root")).exists())
         self.assertFalse((self.vm_root / digest).exists())
         units = await self.run_host(["/usr/bin/systemctl", "list-units", "--all", "--no-legend", "--plain", "partitura-vm-" + digest + "*", "partitura-workspace-" + digest + "*", "partitura-sftp-" + digest + "*"])
         self.assertEqual(units.strip(), "", "owned transient systemd units remain")
@@ -303,27 +341,51 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
         print(f"LIVE {runtime}: provisioning two isolated sessions", flush=True)
         session, workspace = await self.create_session(runtime, self.uid)
         peer, peer_workspace = await self.create_session(runtime, self.peer_uid)
+        # Match gateway startup ordering: tool startup can itself need the
+        # approved HTTPS proxy, including Mise's version update check.
+        proxy = await self.lease(session, self.uid, "egress")
+        env = {"HTTP_PROXY": f"http://{proxy['address']}:{proxy['port']}", "HTTPS_PROXY": f"http://{proxy['address']}:{proxy['port']}", "NO_PROXY": "localhost,127.0.0.1,::1"}
         (peer_workspace / "private-marker").write_text("peer-private")
         os.chown(peer_workspace / "private-marker", self.peer_uid, self.peer_uid)
         os.chmod(peer_workspace / "private-marker", 0o600)
+        # Wait for dockerd before inspecting interfaces. Its internal bridge is
+        # expected, while any VMM NIC or external default route is forbidden.
+        await self.execute(session, self.uid, ["/bin/sh", "-ec", """
+mkdir -p /workspace/.omp-home
+git init -q
+mise exec -- node --version
+mise exec -- python --version
+timeout 120 /bin/sh -ec '
+  while ! timeout 2 docker info >/dev/null 2>&1; do
+    if [ -f /run/docker.pid ]; then
+      read -r docker_pid </run/docker.pid
+      case "$docker_pid" in
+        ""|*[!0-9]*) echo "nested Docker has an invalid pidfile" >&2; exit 1 ;;
+      esac
+      if [ ! -d "/proc/$docker_pid" ]; then
+        echo "nested Docker exited before becoming ready" >&2
+        exit 1
+      fi
+    fi
+    sleep 1
+  done
+' || { echo "nested Docker failed to become ready within 120 seconds" >&2; exit 1; }
+"""], env=env, timeout=135)
         # Boot, nonroot identity, independent kernel/network, and actual tools.
         details = json.loads(await self.python(session, self.uid,
-            "import json,os,pathlib,subprocess; print(json.dumps({'uid':os.getuid(),'kernel':os.uname().release,'net':os.listdir('/sys/class/net'),'node':subprocess.check_output(['node','--version'],text=True).strip(),'python':subprocess.check_output(['python3','--version'],text=True).strip(),'mise':subprocess.check_output(['mise','--version'],text=True).strip()}))"))
+            "import json,os,pathlib,subprocess; print(json.dumps({'uid':os.getuid(),'kernel':os.uname().release,'net':os.listdir('/sys/class/net'),'dockerBridge':pathlib.Path('/sys/class/net/docker0/bridge').is_dir(),'ipv4DefaultRoutes':json.loads(subprocess.check_output(['ip','-j','-4','route','show','default'],text=True)),'ipv6DefaultRoutes':json.loads(subprocess.check_output(['ip','-j','-6','route','show','default'],text=True)) if pathlib.Path('/proc/net/ipv6_route').exists() else [],'node':subprocess.check_output(['node','--version'],text=True).strip(),'python':subprocess.check_output(['python3','--version'],text=True).strip(),'mise':subprocess.check_output(['mise','--version'],text=True).strip()}))", env=env))
         self.assertEqual(details["uid"], self.uid)
         self.assertTrue(details["node"].startswith("v24."))
         self.assertTrue(details["python"].startswith("Python 3.13."))
         self.assertIn("mise", details["mise"])
         if runtime == "firecracker":
-            self.assertEqual(details["net"], ["lo"])
+            assert_guest_network(details)
             self.assertNotEqual(details["kernel"], os.uname().release)
-        await self.execute(session, self.uid, ["/bin/sh", "-ec", "mkdir -p /workspace/.omp-home; git init -q; mise exec -- node --version; mise exec -- python --version; docker info >/dev/null"])
         # Actual stdin/stdout/stderr framing and nonzero status.
         code, stdout, stderr = await self.wire.execute(self.exec_request(session, self.uid, ["python3", "-c", "import sys; print(sys.stdin.read(),end=''); print('stderr-marker',file=sys.stderr); sys.exit(23)"]), b"stdin-marker")
         self.assertEqual((code, stdout, stderr), (23, b"stdin-marker", b"stderr-marker\n"))
         await self.live_workspace(session, workspace)
         await self.isolation(session, peer, workspace, peer_workspace, runtime)
-        proxy = await self.lease(session, self.uid, "egress")
-        env = {"HTTP_PROXY": f"http://{proxy['address']}:{proxy['port']}", "HTTPS_PROXY": f"http://{proxy['address']}:{proxy['port']}", "NO_PROXY": "localhost,127.0.0.1,::1"}
         await self.execute(session, self.uid, ["curl", "--fail", "--silent", "--show-error", "--max-time", "30", "https://registry.npmjs.org/-/ping"], env)
         code, _, stderr = await self.wire.execute(self.exec_request(session, self.uid, ["curl", "--fail", "--silent", "--show-error", "--max-time", "10", "https://partitura-acceptance-denied.invalid/"], env))
         self.assertNotEqual(code, 0)
@@ -413,6 +475,7 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
                 await close(writer)
 
     async def relays_and_t3(self, session, peer, env):
+        await self.gateway_bound_listener(session, env)
         gateway_relay = await self.lease(session, self.uid, "relay", target="gateway", targetPort=self.gateway_port)
         root = f"http://{gateway_relay['address']}:{gateway_relay['port']}"
         self.assertEqual((await self.execute(session, self.uid, ["curl", "--noproxy", "*", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", "--max-time", "10", root + "/health"], env)).strip(), "200")
@@ -455,6 +518,42 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
                 except (AssertionError, json.JSONDecodeError):
                     await asyncio.sleep(0.2)
         self.assertIn(denied["status"], (401, 403))
+
+    async def gateway_bound_listener(self, session, env):
+        # Real Git/MCP listeners bind the address returned by provision. A
+        # fixture bound there must be reachable over the broker relay too.
+        marker = secrets.token_hex(16)
+        process = await asyncio.create_subprocess_exec(
+            self.docker, "exec", "-i", self.gateway, "bun", "-e", GATEWAY_BIND_SERVER,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        endpoint = None
+        try:
+            process.stdin.write(json.dumps({"host": self.provisioned[session]["gatewayAddress"], "marker": marker}).encode())
+            await process.stdin.drain()
+            process.stdin.close()
+            endpoint = json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
+            relay = await self.lease(session, self.uid, "relay", target="gateway", targetPort=endpoint["port"])
+            url = f"http://{relay['address']}:{relay['port']}/{marker}"
+            reply = await self.execute(session, self.uid, ["curl", "--noproxy", "*", "--fail", "--silent", "--show-error", "--max-time", "10", url], env=env)
+            self.assertEqual(reply, marker, "provision gatewayAddress is unreachable by gateway relay")
+        finally:
+            if endpoint is not None:
+                try:
+                    stopped = await self.gateway_fetch(endpoint, "/stop/" + marker)
+                    self.assertEqual(stopped["status"], 200)
+                finally:
+                    try:
+                        _, stderr = await asyncio.wait_for(process.communicate(), 5)
+                    except TimeoutError:
+                        process.kill()
+                        await process.wait()
+                        self.fail("gateway bind fixture did not stop; its safety timeout is 90 seconds")
+                    self.assertEqual(process.returncode, 0, f"gateway bind fixture failed: {stderr.decode(errors='replace')[-1000:]}")
+            else:
+                process.kill()
+                await process.wait()
 
     async def cancellation(self, session, workspace):
         code = "import subprocess,time; from pathlib import Path; subprocess.Popen(['python3','-c',\"import time; from pathlib import Path; p=Path('/workspace/cancel-child');\\nwhile True: p.write_text(str(time.monotonic_ns())); time.sleep(.05)\"]); p=Path('/workspace/cancel-parent')\nwhile True: p.write_text(str(time.monotonic_ns())); time.sleep(.05)"

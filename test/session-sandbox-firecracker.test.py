@@ -1,12 +1,13 @@
 """Firecracker lifecycle ownership and real Unix/vsock stream contract tests."""
 import asyncio
+import errno
 import importlib.util
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, Mock
 
 SOURCE = Path(__file__).resolve().parents[1] / "deploy/session-sandbox/broker.py"
 spec = importlib.util.spec_from_file_location("firecracker_broker", SOURCE)
@@ -83,16 +84,104 @@ class FirecrackerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(vm, "run") as run, patch.object(vm.subprocess, "run"):
             vm.start("test-session")
         args = run.call_args.args[0]
-        for required in ("--property=User=1001", "--property=Group=1001", "--property=SupplementaryGroups=kvm", "--property=CapabilityBoundingSet=", "--property=DeviceAllow=/dev/kvm rw", "--property=PrivateNetwork=yes", "--property=MemoryMax=4352M", "--property=CPUQuota=200%", "--property=TasksMax=128", "--property=RestrictAddressFamilies=AF_UNIX"):
+        for required in ("--property=CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP", "--property=DeviceAllow=/dev/kvm rw", "--property=PrivateNetwork=yes", "--property=MemoryMax=4352M", "--property=CPUQuota=200%", "--property=TasksMax=128", "--property=RestrictAddressFamilies=AF_UNIX"):
             self.assertIn(required, args)
         self.assertNotIn("--network", args)
-        self.assertEqual(args[-1], "/run/partitura-vm-machine.json")
+        self.assertEqual(args[-3:], [str(SOURCE.parent / "firecracker.py"), "--vmm-exec", "test-session"])
+        self.assertIn("-I", args)
+        self.assertIn("-S", args)
+        self.assertFalse(any(arg.startswith("--property=User=") or arg.startswith("--property=Group=") for arg in args))
 
     def test_sftp_server_has_exact_mount_and_no_host_privileges(self):
         args = vm.sftp_command(self.record, "partitura-sftp-test.service")
-        for required in ("--property=RootDirectory=" + vm.SFTP_ROOT, "--property=BindPaths=/host/session:/workspace", "--property=User=1001", "--property=Group=1001", "--property=PrivateDevices=yes", "--property=CapabilityBoundingSet=", "--property=NoNewPrivileges=yes", "--property=PrivateNetwork=yes", "--property=ProtectSystem=strict", "--property=ReadWritePaths=/workspace", "--property=RestrictAddressFamilies=AF_UNIX"):
+        for required in ("--property=BindPaths=/host/session:" + str(vm.sftp_jail("test-session")) + "/workspace", "--property=PrivateDevices=yes", "--property=CapabilityBoundingSet=CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP", "--property=NoNewPrivileges=yes", "--property=PrivateNetwork=yes", "--property=ProtectSystem=strict", "--property=ReadWritePaths=" + str(vm.sftp_jail("test-session")) + "/workspace", "--property=RestrictAddressFamilies=AF_UNIX"):
             self.assertIn(required, args)
-        self.assertEqual(args[-6:], [vm.SFTP_BINARY, "-e", "-d", "/workspace", "-u", "0077"])
+        self.assertEqual(args[-3:], [str(SOURCE.parent / "firecracker.py"), "--sftp-exec", "test-session"])
+        self.assertFalse(any(arg.startswith("--property=User=") or arg.startswith("--property=RootDirectory=") for arg in args))
+
+    def test_sftp_private_nss_identity_does_not_change_host_or_base_jail(self):
+        base = self.root / "sftp-base"
+        (base / "workspace").mkdir(parents=True)
+        (base / "server").write_text("immutable executable")
+        vm.save("test-session", self.record)
+        with patch.object(vm, "SFTP_ROOT", str(base)):
+            vm.prepare_sftp_jail("test-session")
+        jail = vm.sftp_jail("test-session")
+        self.assertIn("partitura:x:1001:1001:", (jail / "etc/passwd").read_text())
+        self.assertEqual((jail / "etc/group").read_text(), "partitura:x:1001:\n")
+        self.assertEqual((jail / "server").stat().st_ino, (base / "server").stat().st_ino)
+        self.assertFalse((base / "etc").exists())
+
+    def test_sftp_jail_rejects_symlink_and_existing_base_account_configuration(self):
+        base = self.root / "sftp-base"
+        (base / "workspace").mkdir(parents=True)
+        vm.save("test-session", self.record)
+        jail = vm.sftp_jail("test-session")
+        jail.symlink_to(base, target_is_directory=True)
+        with patch.object(vm, "SFTP_ROOT", str(base)):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                vm.prepare_sftp_jail("test-session")
+        jail.unlink()
+        (base / "etc").mkdir()
+        (base / "etc/passwd").write_text("operator:x:1000:1000::/home/operator:/bin/sh\n")
+        with patch.object(vm, "SFTP_ROOT", str(base)):
+            with self.assertRaisesRegex(ValueError, "must not contain account configuration"):
+                vm.prepare_sftp_jail("test-session")
+        self.assertTrue((base / "etc/passwd").read_text().startswith("operator:"))
+
+    def test_sysbox_timeout_preserves_runtime_owner_for_retry(self):
+        vm.save("test-session", {**self.record, "runtime": "sysbox"})
+        with patch.object(broker, "_sysbox_destroy", side_effect=RuntimeError("removal timed out; retry teardown")):
+            with self.assertRaisesRegex(RuntimeError, "retry teardown"):
+                broker.destroy(self.request)
+        self.assertEqual(vm.load("test-session")["runtime"], "sysbox")
+
+    def test_account_free_drop_removes_all_capability_sets_and_saved_ids(self):
+        calls = []
+        def prctl(option, arg=0, arg2=0):
+            calls.append((option, arg, arg2))
+            if option in (23, 24) and arg > 40:
+                raise OSError(errno.EINVAL, "unsupported capability")
+            return 1 if option == 39 else 0
+        libc = Mock()
+        libc.capset.return_value = 0
+        libc.capget.return_value = 0
+        with patch.object(vm, "_prctl", side_effect=prctl), patch.object(vm, "LIBC", libc), patch.object(vm.os, "setgroups") as groups, patch.object(vm.os, "setresgid") as gid, patch.object(vm.os, "setresuid") as uid, patch.object(vm.os, "getresuid", return_value=(1064,) * 3), patch.object(vm.os, "getresgid", return_value=(1064,) * 3), patch.object(vm.os, "getgroups", return_value=[992]):
+            vm.drop_privileges(1064, [992])
+        groups.assert_called_once_with([992])
+        gid.assert_called_once_with(1064, 1064, 1064)
+        uid.assert_called_once_with(1064, 1064, 1064)
+        self.assertIn((38, 1, 0), calls)
+        self.assertEqual([arg for option, arg, _ in calls if option == 24], list(range(42)))
+        self.assertEqual([arg2 for option, arg, arg2 in calls if option == 47 and arg == 1], list(range(41)))
+        libc.capset.assert_called_once()
+        libc.capget.assert_called_once()
+
+    def test_sftp_chroots_then_drops_credentials_before_fixed_exec(self):
+        vm.save("test-session", self.record)
+        calls = []
+        with patch.object(vm.os, "chroot", side_effect=lambda path: calls.append(("chroot", path))), patch.object(vm.os, "chdir", side_effect=lambda path: calls.append(("chdir", path))), patch.object(vm, "drop_privileges", side_effect=lambda uid, groups: calls.append(("drop", uid, groups))), patch.object(vm.os, "execve", side_effect=lambda *args: calls.append(("exec", args))):
+            vm.exec_owned("test-session", "sftp")
+        self.assertEqual(calls[:3], [("chroot", vm.sftp_jail("test-session")), ("chdir", "/"), ("drop", 1001, [])])
+        self.assertEqual(calls[3][1], (vm.SFTP_BINARY, [vm.SFTP_BINARY, "-e", "-d", "/workspace", "-u", "0077"], {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}))
+
+    def test_capability_drop_failure_never_executes_untrusted_process(self):
+        vm.save("test-session", self.record)
+        with patch.object(vm.os, "chroot"), patch.object(vm.os, "chdir"), patch.object(vm, "drop_privileges", side_effect=PermissionError("capability drop failed")), patch.object(vm.os, "execve") as execute:
+            with self.assertRaisesRegex(PermissionError, "capability drop failed"):
+                vm.exec_owned("test-session", "sftp")
+            execute.assert_not_called()
+
+    def test_firecracker_handle_uses_gateway_reachable_bind_address(self):
+        with patch.object(broker, "_workspace", return_value=Path("/host/session")), patch.object(vm, "provision"), patch.object(vm, "start_workspace"), patch.object(broker, "_gateway_routing", return_value=("172.18.0.4", "172.18.0.1")):
+            result = broker.provision(self.request)
+        self.assertEqual(result["gatewayAddress"], "172.18.0.4")
+        self.assertEqual(result["workerAddress"], "127.0.0.1")
+        self.assertEqual(result["relayAddress"], "127.0.0.1")
+        vm.save("test-session", self.record)
+        with patch.object(broker, "_workspace", return_value=Path("/host/session")), patch.object(vm, "start"), patch.object(vm, "start_workspace"), patch.object(broker.subprocess, "run"), patch.object(broker, "_gateway_routing", return_value=("172.18.0.4", "172.18.0.1")):
+            recovered = broker.recover(self.request)
+        self.assertEqual(recovered["gatewayAddress"], "172.18.0.4")
 
     def test_recovery_rejects_guest_owned_symlink_disks(self):
         vm.save("test-session", self.record)

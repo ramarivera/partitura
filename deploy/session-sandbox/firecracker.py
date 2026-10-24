@@ -6,6 +6,8 @@ with session UIDs, private networking, bounded resources and access to KVM only.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -168,19 +170,20 @@ def start(session: str) -> None:
     # single stable owner for stop/recovery. No network device is configured.
     subprocess.run(["/usr/bin/systemctl", "reset-failed", unit(session)], capture_output=True, timeout=10)
     run(["/usr/bin/systemd-run", "--quiet", "--collect", "--service-type=exec", "--unit", unit(session),
-         "--property=User=" + load(session)["workerUid"], "--property=Group=" + load(session)["workerUid"],
-         "--property=SupplementaryGroups=kvm", "--property=BindPaths=" + str(directory) + ":/run/partitura-vm",
+         "--property=BindPaths=" + str(directory) + ":/run/partitura-vm",
          "--property=ReadWritePaths=/run/partitura-vm",
          "--property=BindReadOnlyPaths=" + str(STATE_ROOT / (key(session) + ".machine.json")) + ":/run/partitura-vm-machine.json", "--property=UMask=0077", "--property=PrivateNetwork=yes",
          "--property=PrivateTmp=yes", "--property=ProtectSystem=strict", "--property=ProtectHome=yes",
-         "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=", "--property=DevicePolicy=closed",
+         "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP", "--property=DevicePolicy=closed",
          "--property=DeviceAllow=/dev/kvm rw", "--property=RestrictAddressFamilies=AF_UNIX",
          "--property=ProtectProc=invisible", "--property=ProcSubset=pid",
-         "--property=InaccessiblePaths=/var/lib/partitura-sandbox /root /home",
+         "--property=InaccessiblePaths=/root /home",
          "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
          "--property=TasksMax=128", "--property=MemoryMax=" + str(MEMORY_MIB + 256) + "M",
          "--property=CPUQuota=" + str(VCPUS * 100) + "%", "--property=TimeoutStopSec=15s",
-         BINARY, "--no-api", "--config-file", "/run/partitura-vm-machine.json"])
+         "--setenv=PARTITURA_SANDBOX_STATE_ROOT=" + str(STATE_ROOT),
+         "--setenv=PARTITURA_FIRECRACKER_BINARY=" + BINARY,
+         "/usr/bin/python3", "-I", "-S", str(Path(__file__).resolve()), "--vmm-exec", session])
 
 
 def destroy(session: str) -> None:
@@ -199,6 +202,9 @@ def destroy(session: str) -> None:
         raise ValueError("Firecracker state directory must not be a symlink")
     if directory.exists():
         shutil.rmtree(directory)
+    jail = sftp_jail(session)
+    if jail.exists():
+        shutil.rmtree(jail)
     (STATE_ROOT / (key(session) + ".machine.json")).unlink(missing_ok=True)
     state_path(session).unlink(missing_ok=True)
 
@@ -248,6 +254,45 @@ SFTP_BINARY = os.environ.get("PARTITURA_FIRECRACKER_SFTP_BINARY", "/usr/lib/ssh/
 WORKSPACE_PORT = 1080
 
 
+def sftp_jail(session: str) -> Path:
+    return STATE_ROOT / (key(session) + ".sftp-root")
+
+
+def share_sftp_file(source: str, destination: str) -> str:
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        shutil.copy2(source, destination)
+    return destination
+
+
+def prepare_sftp_jail(session: str) -> None:
+    record = load(session)
+    if record is None or record["runtime"] != "firecracker":
+        raise ValueError("workspace session is not owned")
+    uid = int(record["workerUid"])
+    jail = sftp_jail(session)
+    if jail.is_symlink():
+        raise ValueError("SFTP session jail must not be a symlink")
+    if jail.exists():
+        shutil.rmtree(jail)
+    # The immutable binary/library files can be shared by hardlink. Namespace
+    # mounts expose this root read-only and only /workspace is writable.
+    if (Path(SFTP_ROOT) / "etc").exists():
+        raise ValueError("SFTP base jail must not contain account configuration")
+    shutil.copytree(SFTP_ROOT, jail, copy_function=share_sftp_file)
+    etc = jail / "etc"
+    etc.mkdir(mode=0o755, exist_ok=True)
+    # OpenSSH requires getpwuid even for a keyless, stdio-only SFTP server.
+    # This private NSS record never changes host accounts or SSH settings.
+    (etc / "passwd").write_text(f"partitura:x:{uid}:{uid}:Partitura session:/workspace:/sbin/nologin\n")
+    (etc / "group").write_text(f"partitura:x:{uid}:\n")
+    os.chmod(etc / "passwd", 0o644)
+    os.chmod(etc / "group", 0o644)
+
+
 def start_workspace(session: str) -> None:
     root = Path(SFTP_ROOT)
     if not root.is_dir() or root.is_symlink() or root.stat().st_uid != 0 or root.stat().st_mode & 0o022:
@@ -257,6 +302,7 @@ def start_workspace(session: str) -> None:
             raise ValueError("SFTP root contains unsafe files")
     if not (root / SFTP_BINARY.lstrip("/")).is_file() or not (root / "workspace").is_dir():
         raise ValueError("SFTP root requires its server binary and workspace mountpoint")
+    prepare_sftp_jail(session)
     run(["/usr/bin/systemd-run", "--quiet", "--collect", "--service-type=exec",
          "--unit", "partitura-workspace-" + key(session) + ".service",
          "--property=BindsTo=" + unit(session), "--property=After=" + unit(session),
@@ -284,20 +330,24 @@ async def pipe(reader, writer) -> None:
 
 
 def sftp_command(record: dict[str, Any], service: str) -> list[str]:
-    session, uid = record["sessionId"], record["workerUid"]
+    session = record["sessionId"]
+    jail = str(sftp_jail(session))
     return [
         "/usr/bin/systemd-run", "--quiet", "--pipe", "--wait", "--collect",
         "--service-type=exec", "--unit", service,
         "--property=BindsTo=" + "partitura-workspace-" + key(session) + ".service",
         "--property=After=" + "partitura-workspace-" + key(session) + ".service",
-        "--property=RootDirectory=" + SFTP_ROOT,
-        "--property=BindPaths=" + record["workspaceHost"] + ":/workspace",
-        "--property=User=" + uid, "--property=Group=" + uid,
+        "--property=BindPaths=" + record["workspaceHost"] + ":" + jail + "/workspace",
         "--property=PrivateNetwork=yes", "--property=PrivateDevices=yes",
-        "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=",
-        "--property=ProtectSystem=strict", "--property=ReadWritePaths=/workspace",
+        "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP",
+        "--property=ProtectSystem=strict", "--property=ProtectHome=yes",
+        "--property=ReadWritePaths=" + jail + "/workspace",
         "--property=RestrictAddressFamilies=AF_UNIX", "--property=TasksMax=64",
-        "--property=MemoryMax=128M", SFTP_BINARY, "-e", "-d", "/workspace", "-u", "0077",
+        "--property=MemoryMax=128M",
+        "--setenv=PARTITURA_SANDBOX_STATE_ROOT=" + str(STATE_ROOT),
+        "--setenv=PARTITURA_FIRECRACKER_SFTP_ROOT=" + SFTP_ROOT,
+        "--setenv=PARTITURA_FIRECRACKER_SFTP_BINARY=" + SFTP_BINARY,
+        "/usr/bin/python3", "-I", "-S", str(Path(__file__).resolve()), "--sftp-exec", session,
     ]
 
 
@@ -344,10 +394,99 @@ async def workspace_server(session: str) -> None:
         await server.serve_forever()
 
 
+class CapHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+
+class CapData(ctypes.Structure):
+    _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32),
+                ("inheritable", ctypes.c_uint32)]
+
+
+LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def _prctl(option: int, arg: int = 0, arg2: int = 0) -> int:
+    result = LIBC.prctl(option, arg, arg2, 0, 0)
+    if result == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return result
+
+
+def drop_privileges(uid: int, groups: list[int]) -> None:
+    """Irreversibly remove helper privileges before entering any untrusted code."""
+    if uid <= 0 or uid > 99999 or uid in (65534, 65535):
+        raise ValueError("sandbox uid must be non-root and fit the reserved range")
+    _prctl(38, 1)  # PR_SET_NO_NEW_PRIVS
+    _prctl(8, 0)  # PR_SET_KEEPCAPS
+    _prctl(47, 4)  # PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL
+    # Bounding drops do not alter current SETUID/SETGID capabilities, so all
+    # capability bits can be removed before the permanent credential transition.
+    for capability in range(64):
+        try:
+            _prctl(24, capability)  # PR_CAPBSET_DROP
+        except OSError as error:
+            if error.errno == errno.EINVAL:
+                break
+            raise
+    os.setgroups(groups)
+    os.setresgid(uid, uid, uid)
+    os.setresuid(uid, uid, uid)
+    header = CapHeader(0x20080522, 0)  # _LINUX_CAPABILITY_VERSION_3
+    data = (CapData * 2)()
+    if LIBC.capset(ctypes.byref(header), data) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, "cannot clear sandbox capability sets")
+    if LIBC.capget(ctypes.byref(header), data) != 0:
+        raise RuntimeError("cannot verify sandbox capability sets")
+    if any(word.effective or word.permitted or word.inheritable for word in data):
+        raise RuntimeError("sandbox retained capabilities")
+    for capability in range(64):
+        try:
+            if _prctl(23, capability) != 0:  # PR_CAPBSET_READ
+                raise RuntimeError("sandbox retained a bounding capability")
+            if _prctl(47, 1, capability) != 0:  # PR_CAP_AMBIENT_IS_SET
+                raise RuntimeError("sandbox retained an ambient capability")
+        except OSError as error:
+            if error.errno == errno.EINVAL:
+                break
+            raise
+    if os.getresuid() != (uid, uid, uid) or os.getresgid() != (uid, uid, uid):
+        raise RuntimeError("sandbox retained privileged credentials")
+    if sorted(os.getgroups()) != sorted(groups) or _prctl(39) != 1:
+        raise RuntimeError("sandbox credential restrictions did not hold")
+
+
+def exec_owned(session: str, kind: str) -> None:
+    record = load(session)
+    if record is None or record["runtime"] != "firecracker":
+        raise ValueError("sandbox session is not owned")
+    uid = int(record["workerUid"])
+    if kind == "vmm":
+        kvm = os.stat("/dev/kvm")
+        if not stat.S_ISCHR(kvm.st_mode):
+            raise ValueError("KVM must be a character device")
+        groups = [kvm.st_gid]
+        command = [BINARY, "--no-api", "--config-file", "/run/partitura-vm-machine.json"]
+    elif kind == "sftp":
+        os.chroot(sftp_jail(session))
+        os.chdir("/")
+        groups = []
+        command = [SFTP_BINARY, "-e", "-d", "/workspace", "-u", "0077"]
+    else:
+        raise ValueError("unsupported sandbox helper")
+    drop_privileges(uid, groups)
+    # A fixed clean environment also excludes inherited loader/interpreter hooks.
+    os.execve(command[0], command, {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--workspace-server":
         # Session identifiers are never used as filesystem components or argv
         # options; lookup uses a digest and verifies the record's exact identity.
         asyncio.run(workspace_server(sys.argv[2]))
+    elif len(sys.argv) == 3 and sys.argv[1] in ("--vmm-exec", "--sftp-exec"):
+        exec_owned(sys.argv[2], sys.argv[1][2:-5])
     else:
         raise SystemExit("unsupported Firecracker helper arguments")

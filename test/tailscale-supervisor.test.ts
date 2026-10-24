@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { Effect, Schema } from "effect";
 import {
   type GatewayEndpointState,
   updateGatewayEndpoint,
@@ -114,6 +114,68 @@ describe("Tailscale gateway supervisor", () => {
           if (supervisor.exitCode === null) supervisor.kill("SIGKILL");
           server.stop(true);
         }
+      }),
+  );
+});
+
+describe("Tailscale sandbox wiring", () => {
+  it.live(
+    "forwards runtime selection and mounts the broker directory without creating it",
+    () =>
+      Effect.promise(async () => {
+        const compose = Schema.decodeUnknownSync(
+          Schema.Struct({
+            services: Schema.Struct({
+              gateway: Schema.Struct({
+                environment: Schema.Record(Schema.String, Schema.String),
+                volumes: Schema.Array(
+                  Schema.Union([
+                    Schema.String,
+                    Schema.Struct({
+                      type: Schema.String,
+                      source: Schema.String,
+                      target: Schema.String,
+                      read_only: Schema.Boolean,
+                      bind: Schema.Struct({ create_host_path: Schema.Boolean }),
+                    }),
+                  ]),
+                ),
+              }),
+              tailscale: Schema.Struct({
+                volumes: Schema.Array(Schema.String),
+              }),
+            }),
+          }),
+        )(
+          Bun.YAML.parse(
+            await Bun.file(
+              new URL("../deploy/tailscale/compose.yaml", import.meta.url),
+            ).text(),
+          ),
+        );
+        const gateway = compose.services.gateway;
+        expect(gateway.environment.WORKER_SANDBOX_MODE).toBe(
+          `\${WORKER_SANDBOX_MODE:-firecracker}`,
+        );
+        expect(gateway.environment.SESSION_SANDBOX_BROKER_SOCKET).toBe(
+          `\${SESSION_SANDBOX_BROKER_SOCKET:-/run/partitura-sandbox/broker.sock}`,
+        );
+        expect(
+          gateway.volumes.filter((volume) => typeof volume !== "string"),
+        ).toEqual([
+          {
+            type: "bind",
+            source: `\${SESSION_SANDBOX_BROKER_DIR:-/run/partitura-sandbox}`,
+            target: "/run/partitura-sandbox",
+            read_only: true,
+            bind: { create_host_path: false },
+          },
+        ]);
+        expect(
+          compose.services.tailscale.volumes.some((volume) =>
+            volume.includes("partitura-sandbox"),
+          ),
+        ).toBe(false);
       }),
   );
 });

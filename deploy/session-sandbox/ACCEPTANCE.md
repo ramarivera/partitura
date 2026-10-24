@@ -1,7 +1,7 @@
 # Live sandbox acceptance
 
 `test/session-sandbox-live.test.py` talks to the installed Unix broker socket.
-It doesn't import broker implementation code. Its three local wire tests run
+It doesn't import broker implementation code. Its four local fixture tests run
 without host privileges or network access. The two live tests require explicit
 opt-in and root on the sandbox host. They exercise Firecracker with the runtime
 field omitted, then explicit Sysbox, using the same lifecycle protocol.
@@ -64,15 +64,22 @@ Each runtime must pass all of these checks:
 - Broker exec sends actual stdin, stdout, stderr and exit status. Wrong worker
   identities fail for exec, relay, egress and recovery. The Firecracker guest
   rejects another session's control token, uses a different kernel from the
-  host and has only its loopback network device.
+  host and has exactly loopback and the internal Docker bridge. The bridge must
+  be a Linux bridge, and neither IPv4 nor IPv6 may have an external default route.
 - Node 24, Python 3.13 and Mise execute as the session UID. Nested Docker runs
   an image, builds a Dockerfile containing a `RUN` step and runs the result.
+  Readiness retries are bounded to 120 seconds, with each Docker info request
+  limited to two seconds. A dead daemon recorded in its pidfile fails the check.
 - A worker remains active while a host write becomes visible inside the guest,
   and its reply becomes visible on the host with the session's ownership.
 - The allowed npm HTTPS endpoint works, a disallowed hostname returns proxy
-  403 and direct external TCP access fails.
+  403 and direct external TCP access fails. The proxy opens before tooling
+  starts, matching gateway startup, so Mise can use the approved network route.
 - A gateway-bound relay reaches the real gateway health endpoint and gets 401
-  at an unauthenticated admin endpoint. A worker-bound relay reaches a real T3
+  at an unauthenticated admin endpoint. It also reaches a disposable listener
+  bound to the exact `gatewayAddress` returned by provision, matching Git/MCP
+  listener binding. This listener serves only a random test marker and stops
+  explicitly, with a 90 second safety timeout. A worker-bound relay reaches a real T3
   server, validates protocol 2, denies a missing bearer, accepts its own bearer
   and denies that bearer at a second session's T3 server.
 - Disconnecting exec stops parent and child heartbeats. Recovery retires an
