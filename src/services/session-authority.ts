@@ -42,7 +42,6 @@ import {
 import type { AgentDriver } from "../drivers/driver.js";
 import { rpcAssistantText } from "../drivers/events.js";
 import { makeOmpDriver } from "../drivers/omp/driver.js";
-import { selectDriver } from "../drivers/selection.js";
 import {
   makeT3Driver,
   remoteT3Endpoint,
@@ -55,6 +54,11 @@ import {
   T3PortPool,
 } from "../drivers/t3/launcher.js";
 import { openDriverWorker } from "../drivers/worker-adapter.js";
+import {
+  DEFAULT_AGENT_SETTINGS,
+  type EffectiveRunSettings,
+  resolveRunSettings,
+} from "./agent-settings.js";
 import { GatewayConfig, type T3LaunchConfig } from "./config.js";
 import { GitHubApp } from "./github-app.js";
 import { LinearGateway, type LinearIssue } from "./linear-gateway.js";
@@ -85,6 +89,7 @@ import type {
 } from "./rpc-worker.js";
 import { RpcWorker } from "./rpc-worker.js";
 import {
+  AgentSettingsRepo,
   InstallationRepo,
   McpServerRepo,
   PromptTemplateRepo,
@@ -136,6 +141,40 @@ interface WorkerState {
 }
 
 const CANCEL_GATE_TIMEOUT_MS = 30_000;
+
+const ompApprovalMode = (
+  mode: EffectiveRunSettings["runtimeMode"],
+): "always-ask" | "write" | "yolo" => {
+  switch (mode) {
+    case "approval-required":
+      return "always-ask";
+    case "full-access":
+      return "yolo";
+    case "auto-accept-edits":
+    case "auto":
+      return "write";
+  }
+};
+
+const t3SelectionWithEffort = (
+  selection: {
+    readonly instanceId: string;
+    readonly model: string;
+    readonly options?:
+      | ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>
+      | undefined;
+  },
+  effort: string | null,
+) => {
+  if (effort === null) return selection;
+  const options = (selection.options ?? []).filter(
+    (option) => option.id !== "reasoningEffort",
+  );
+  return {
+    ...selection,
+    options: [...options, { id: "reasoningEffort", value: effort }],
+  };
+};
 
 const failureMessage = <E>(cause: Cause.Cause<E>): string => {
   const failure = Cause.findErrorOption(cause);
@@ -391,6 +430,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const promptTemplateRepo = yield* PromptTemplateRepo;
       const installationRepo = yield* InstallationRepo;
       const runEventRepo = yield* RunEventRepo;
+      const agentSettingsRepo = yield* Effect.serviceOption(AgentSettingsRepo);
       const workspaceRepo = yield* WorkspaceRepo;
       const projector = yield* ActivityProjector;
       const rpc = yield* RpcWorker;
@@ -2047,14 +2087,21 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           return yield* Effect.fail(error);
         }
         const saved = yield* workspaceRepo.getDriverSession(run.sessionId);
+        let snapshot = Option.isSome(agentSettingsRepo)
+          ? yield* agentSettingsRepo.value.getSnapshot(run.sessionId)
+          : Option.none();
         const latestInput = yield* runInputRepo.latestActionableInput(
           run.sessionId,
         );
         let labels = Option.isSome(latestInput)
           ? inputContext(latestInput.value.payload).issueLabels
           : [];
+        let projectLabels = Option.isSome(latestInput)
+          ? inputContext(latestInput.value.payload).projectLabels
+          : [];
         if (issueSnapshot !== undefined && Option.isSome(issueSnapshot)) {
           labels = issueSnapshot.value.labels;
+          projectLabels = issueSnapshot.value.projectLabels;
         }
         if (
           issueSnapshot === undefined &&
@@ -2062,12 +2109,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           Option.isSome(run.issueId) &&
           Option.isSome(linearOption)
         ) {
-          labels = yield* linearOption.value
+          const currentIssue = yield* linearOption.value
             .getIssue({ sessionId: run.sessionId, issueId: run.issueId.value })
-            .pipe(
-              Effect.map((issue) => issue.labels),
-              Effect.catch(() => Effect.succeed(labels)),
-            );
+            .pipe(Effect.option);
+          if (Option.isSome(currentIssue)) {
+            labels = currentIssue.value.labels;
+            projectLabels = currentIssue.value.projectLabels;
+          }
         }
         const repository = Option.isSome(run.repositoryId)
           ? yield* workspaceRepo.getRepository(
@@ -2075,18 +2123,108 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               run.repositoryId.value,
             )
           : Option.none();
-        const kind = Option.isSome(saved)
-          ? saved.value.driver
-          : yield* selectDriver(
-              Option.isSome(repository)
-                ? (repository.value.defaultDriver ?? "omp")
-                : "omp",
-              labels,
-            ).pipe(
-              Effect.mapError(
-                (error) => new RpcSpawnError({ message: error.message }),
-              ),
-            );
+        if (Option.isNone(snapshot)) {
+          const organizationSettings = Option.isSome(agentSettingsRepo)
+            ? yield* agentSettingsRepo.value.get(run.organizationId)
+            : DEFAULT_AGENT_SETTINGS;
+          const t3Config = config.t3Driver;
+          const legacySessionLabels = Option.isSome(saved);
+          const effectiveSettings = legacySessionLabels
+            ? {
+                ...organizationSettings,
+                defaults: {
+                  ...organizationSettings.defaults,
+                  driver: saved.value.driver,
+                },
+              }
+            : organizationSettings;
+          const settingsIssueLabels = legacySessionLabels
+            ? labels.filter(
+                (label) =>
+                  !label.startsWith(organizationSettings.labelPrefixes.driver),
+              )
+            : labels;
+          const settingsProjectLabels = legacySessionLabels
+            ? projectLabels.filter(
+                (label) =>
+                  !label.startsWith(organizationSettings.labelPrefixes.driver),
+              )
+            : projectLabels;
+          const resolved = resolveRunSettings({
+            settings: effectiveSettings,
+            issueLabels: settingsIssueLabels,
+            projectLabels: settingsProjectLabels,
+            environment: {
+              driver: Option.isSome(saved)
+                ? saved.value.driver
+                : Option.isSome(repository)
+                  ? (repository.value.defaultDriver ?? "omp")
+                  : "omp",
+              ompModel: config.workerDefaultModel ?? null,
+              t3Model:
+                t3Config === undefined
+                  ? null
+                  : {
+                      instanceId: t3Config.providerInstanceId,
+                      model: t3Config.model,
+                      ...(t3Config.modelOptions.length === 0
+                        ? {}
+                        : { options: t3Config.modelOptions }),
+                    },
+              effort: null,
+              mode: t3Config?.runtimeMode ?? "auto",
+            },
+          });
+          const frozen = legacySessionLabels
+            ? {
+                ...resolved,
+                driver: saved.value.driver,
+                sources: {
+                  ...resolved.sources,
+                  driver: "environment" as const,
+                },
+              }
+            : resolved;
+          snapshot = Option.some(
+            Option.isSome(agentSettingsRepo)
+              ? yield* agentSettingsRepo.value.saveSnapshot(
+                  run.sessionId,
+                  run.organizationId,
+                  frozen,
+                )
+              : {
+                  sessionId: run.sessionId,
+                  organizationId: run.organizationId,
+                  settings: frozen,
+                  createdAt: 0,
+                },
+          );
+          if (
+            resolved.warnings.length > 0 &&
+            Option.isSome(run.issueId) &&
+            Option.isSome(linearOption)
+          ) {
+            const body = `Partitura ignored run setting label(s): ${resolved.warnings.join(" ")} The run will use the next valid settings tier.`;
+            yield* linearOption.value
+              .createIssueComment({ sessionId: run.sessionId, body })
+              .pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning(
+                    "run_settings.label_warning_comment_failed",
+                  ).pipe(
+                    Effect.annotateLogs({
+                      sessionId: run.sessionId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
+          }
+        }
+        const effective = Option.getOrThrow(snapshot).settings;
+        const kind = effective.driver;
         if (kind === "t3") {
           const t3Config = config.t3Driver;
           if (t3Config === undefined)
@@ -2127,12 +2265,28 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               config.gitTimeoutMs ?? 120_000,
             );
             // A shared daemon gets no GitHub, Linear or upstream MCP tokens.
-            driver = makeT3Driver(
-              t3DriverOptionsFromConfig(
+            driver = makeT3Driver({
+              ...t3DriverOptionsFromConfig(
                 t3Config,
                 remoteT3Endpoint(t3Config.connection),
               ),
-            );
+              modelSelection: t3SelectionWithEffort(
+                effective.t3Model === null
+                  ? t3DriverOptionsFromConfig(
+                      t3Config,
+                      remoteT3Endpoint(t3Config.connection),
+                    ).modelSelection
+                  : {
+                      instanceId: effective.t3Model.instanceId,
+                      model: effective.t3Model.model,
+                      ...(effective.t3Model.options === undefined
+                        ? {}
+                        : { options: effective.t3Model.options }),
+                    },
+                effective.effort,
+              ),
+              runtimeMode: effective.runtimeMode,
+            });
           } else {
             const launch = t3Config.connection;
             if (config.cliproxyApiBaseUrl === undefined)
@@ -2181,10 +2335,24 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     message: "Stale T3 processes for this session did not exit",
                   }),
               });
-            const modelSelection = {
-              instanceId: t3Config.providerInstanceId,
-              model: t3Config.model,
-            };
+            const modelSelection = t3SelectionWithEffort(
+              effective.t3Model === null
+                ? {
+                    instanceId: t3Config.providerInstanceId,
+                    model: t3Config.model,
+                    ...(t3Config.modelOptions.length === 0
+                      ? {}
+                      : { options: t3Config.modelOptions }),
+                  }
+                : {
+                    instanceId: effective.t3Model.instanceId,
+                    model: effective.t3Model.model,
+                    ...(effective.t3Model.options === undefined
+                      ? {}
+                      : { options: effective.t3Model.options }),
+                  },
+              effective.effort,
+            );
             const modelEnvironment = workerModelEnvironment({
               cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
               cliproxyApiKey:
@@ -2213,7 +2381,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   cwd,
                   cliproxyApiBaseUrl,
                   launch,
-                  runtimeMode: t3Config.runtimeMode,
+                  runtimeMode: effective.runtimeMode,
                   defaultModel: modelSelection,
                 }),
                 writeSettings: (settings) =>
@@ -2221,13 +2389,30 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     () => undefined,
                   ),
               }),
-              (endpoint) => t3DriverOptionsFromConfig(t3Config, endpoint),
+              (endpoint) => ({
+                ...t3DriverOptionsFromConfig(t3Config, endpoint),
+                modelSelection: t3SelectionWithEffort(
+                  effective.t3Model === null
+                    ? t3DriverOptionsFromConfig(t3Config, endpoint)
+                        .modelSelection
+                    : {
+                        instanceId: effective.t3Model.instanceId,
+                        model: effective.t3Model.model,
+                        ...(effective.t3Model.options === undefined
+                          ? {}
+                          : { options: effective.t3Model.options }),
+                      },
+                  effective.effort,
+                ),
+                runtimeMode: effective.runtimeMode,
+              }),
             );
           }
           const worker = yield* openDriverWorker(driver, {
             sessionKey: run.sessionId,
             title: `Linear ${Option.getOrElse(run.issueId, () => run.sessionId)}`,
             workspace: { _tag: "Directory", path: cwd },
+            runtimeMode: effective.runtimeMode,
             ...(Option.isSome(saved) ? { resume: { ref: saved.value } } : {}),
           }).pipe(Effect.provideService(Scope.Scope, scope));
           yield* Effect.gen(function* () {
@@ -2266,10 +2451,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         }
         command.push(
           ...workerModelArguments(
-            config.workerDefaultModel,
+            effective.ompModel ?? undefined,
             Option.isSome(run.ompSessionFile),
           ),
         );
+        if (effective.effort !== null)
+          command.push("--thinking", effective.effort);
+        command.push("--approval-mode", ompApprovalMode(effective.runtimeMode));
 
         const workerUid = yield* workerIdentities.acquire(
           run.sessionId,
@@ -2492,6 +2680,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             sessionKey: run.sessionId,
             title: `Linear ${run.sessionId}`,
             workspace: { _tag: "Directory", path: cwd },
+            runtimeMode: effective.runtimeMode,
           },
           worker,
         ).pipe(

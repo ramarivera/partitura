@@ -974,6 +974,7 @@ describe("admin run-event pagination", () => {
           "lastActivityAt",
           "run",
           "sessionId",
+          "settings",
           "state",
         ]);
         const detail = yield* Schema.decodeUnknownEffect(detailSchema)(body);

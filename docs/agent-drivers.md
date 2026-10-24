@@ -14,10 +14,11 @@ field; omitting it on update preserves the value.
 
 For each new run, the authority reads the repository record and the issue's
 current Linear labels. `driver:t3` or `driver:omp` overrides the default. Matching
-ignores case and surrounding whitespace. Conflicting overrides fail the run
-attempt instead of depending on label order. No gateway restart is required.
-A persisted session ref keeps its driver across retries and follow-up turns;
-changing labels doesn't migrate an existing conversation between runtimes.
+ignores case and surrounding whitespace. Conflicting overrides warn on the
+Linear issue and fall through to organization defaults or the repository's
+default driver. No gateway restart is required. A persisted session ref keeps
+its driver across retries and follow-up turns; changing labels doesn't migrate
+an existing conversation between runtimes.
 
 ## Repository routing
 
@@ -175,3 +176,29 @@ The API needs only `orchestration:read` and `orchestration:operate` scopes.
 The in-process T3 tests prove gateway behavior against the pinned contract,
 and the launcher tests run a real child process through the lifecycle. They
 don't establish the deployed Linear-session-to-PR acceptance target.
+## Per-run settings
+
+Each new run resolves its driver, model alias, effort, and runtime mode from
+issue labels, project labels, organization settings, then the existing runtime
+configuration. The effective values and sources are stored in `run_settings`
+before a worker starts, so retries and gateway recovery reuse the same choice.
+Organization edits and label changes affect later runs without restarting the
+gateway.
+
+The admin console's Run settings panel stores organization-scoped defaults,
+label prefixes, and model aliases. An OMP alias names a curated `provider/model`
+from the worker profile. A T3 alias names a configured provider instance and
+model, with typed option values. Labels only select a configured alias; they
+can't supply provider options or credentials. The full-access label toggle is
+enabled by default.
+
+OMP 18.8.6 receives `--model` and `--thinking` for the selected model and effort.
+Its approval modes map to the CLI's supported `--approval-mode` values:
+`approval-required` uses `always-ask`, `auto` and `auto-accept-edits` use
+`write`, and `full-access` uses `yolo`. The worker uid and workspace security
+boundaries still apply. T3 receives the selected `ModelSelection` and runtime
+mode through its normal session start request and, for a launched daemon, its
+per-session settings file.
+
+Unknown labels and multiple values for the same setting generate a Linear issue
+comment and fall through to the next settings tier. They don't stop the run.

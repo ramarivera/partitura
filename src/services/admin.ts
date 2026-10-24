@@ -69,6 +69,7 @@ import {
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
+  AgentSettingsRepo,
   ExecutorInstanceRepo,
   InstallationRepo,
   McpServerRepo,
@@ -165,6 +166,7 @@ export interface AdminDeps {
   };
   readonly workspaceRepo: WorkspaceRepo["Service"];
   readonly promptTemplateRepo: PromptTemplateRepo["Service"];
+  readonly agentSettingsRepo?: AgentSettingsRepo["Service"];
   readonly mcpServerRepo: McpServerRepo["Service"];
   readonly mcpOAuth: McpOAuth["Service"];
   readonly workspace: WorkspaceShape;
@@ -1121,7 +1123,16 @@ export const createAdminHandle = (deps: AdminDeps) =>
           pageOptions.cursor === undefined || hasIssueEvent(events)
             ? events
             : yield* deps.runEventRepo.list(sessionId, { limit: 100 });
-        const model = runDetailModel(run, events, issueEvents);
+        const runSettings =
+          deps.agentSettingsRepo === undefined
+            ? Option.none()
+            : yield* deps.agentSettingsRepo.getSnapshot(sessionId);
+        const model = {
+          ...runDetailModel(run, events, issueEvents),
+          settings: Option.isSome(runSettings)
+            ? runSettings.value.settings
+            : null,
+        };
 
         const rawToken = findCookieValue(request, ADMIN_COOKIE);
         const adminSession =
@@ -1352,6 +1363,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const executorInstance = yield* deps.executorInstanceRepo.get(
           session.organizationId,
         );
+        const agentSettings =
+          deps.agentSettingsRepo === undefined
+            ? null
+            : yield* deps.agentSettingsRepo.get(session.organizationId);
         const reconcilerStatus = yield* deps.reconciler.status();
         return Option.some(
           json({
@@ -1367,6 +1382,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
               onNone: () => null,
               onSome: toApiExecutorInstance,
             }),
+            agentSettings,
             csrfToken: deriveCsrfToken(session.rawToken),
             mcpServers: mcpServers.map((server) =>
               toApiMcpServer(
@@ -1385,6 +1401,30 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
       }
 
+      if (
+        url.pathname === "/api/admin/agent-settings" &&
+        request.method === "PUT"
+      ) {
+        const session = yield* requireMutation(request);
+        if (deps.agentSettingsRepo === undefined)
+          return Option.some(text("Agent settings unavailable", 500));
+        const payload = yield* parseJsonBody(request);
+        const settings = yield* deps.agentSettingsRepo
+          .upsert(session.organizationId, payload)
+          .pipe(
+            Effect.catchTag("@Gateway/DatabaseError", (error) =>
+              Effect.fail(
+                new AdminError({ message: error.message, status: 400 }),
+              ),
+            ),
+            Effect.catchTag("@Gateway/RowDecodeError", (error) =>
+              Effect.fail(
+                new AdminError({ message: error.message, status: 400 }),
+              ),
+            ),
+          );
+        return Option.some(json({ settings }));
+      }
       if (
         url.pathname === "/api/admin/prompt-templates" &&
         request.method === "GET"
@@ -2288,6 +2328,7 @@ export class Admin extends Context.Service<Admin>()("Admin", {
     const mcpServerRepo = yield* McpServerRepo;
     const mcpOAuth = yield* McpOAuth;
     const promptTemplateRepo = yield* PromptTemplateRepo;
+    const agentSettingsRepo = yield* AgentSettingsRepo;
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
     const nixEnvironment = yield* NixEnvironment;
@@ -2305,6 +2346,7 @@ export class Admin extends Context.Service<Admin>()("Admin", {
       linearGateway,
       workspaceRepo,
       promptTemplateRepo,
+      agentSettingsRepo,
       mcpServerRepo,
       workspace,
       mcpOAuth,
@@ -2328,6 +2370,7 @@ export class Admin extends Context.Service<Admin>()("Admin", {
       LinearGateway.layer,
       WorkspaceRepo.layer,
       PromptTemplateRepo.layer,
+      AgentSettingsRepo.layer,
       McpServerRepo.layer,
       McpOAuth.layer,
       Workspace.layer,

@@ -1,4 +1,5 @@
 export { AdminSessionRepo } from "./admin-session-repo.js";
+export { AgentSettingsRepo } from "./agent-settings-repo.js";
 export { DeliveryRepo } from "./delivery-repo.js";
 export { ExecutorInstanceRepo } from "./executor-instance-repo.js";
 export { InstallationRepo } from "./installation-repo.js";
