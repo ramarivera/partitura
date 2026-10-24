@@ -488,17 +488,19 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             return yield* new RpcSpawnError({
               message: "Sysbox mode requires a per-session worker uid range",
             });
-          const recovered = yield* sandboxRuntime.recover(sessionId, cwd).pipe(
-            Effect.mapError(
-              () =>
-                new RpcSpawnError({
-                  message: "Could not recover the per-session sandbox",
-                }),
-            ),
-          );
+          const recovered = yield* sandboxRuntime
+            .recover(sessionId, cwd, workerUid)
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new RpcSpawnError({
+                    message: "Could not recover the per-session sandbox",
+                  }),
+              ),
+            );
           const handle =
             recovered.handle ??
-            (yield* sandboxRuntime.provision(sessionId, cwd).pipe(
+            (yield* sandboxRuntime.provision(sessionId, cwd, workerUid).pipe(
               Effect.mapError(
                 () =>
                   new RpcSpawnError({
@@ -1927,6 +1929,8 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               const job = raw.job;
               const nativeOperation = Effect.promise(async () => {
                 try {
+                  if (workspacePath === undefined)
+                    return fail("Native build workspace is unavailable");
                   const client = await getNativeBuildClient();
                   switch (request.toolName) {
                     case "native_build_start": {
@@ -1997,11 +2001,34 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               });
               if (
                 request.toolName === "native_build_start" ||
+                request.toolName === "native_build_artifact" ||
                 request.toolName === "native_build_cancel"
               )
                 return yield* withSessionMutationGate(
                   run.sessionId,
-                  nativeOperation,
+                  Effect.gen(function* () {
+                    const latest = yield* runRepo.get(run.sessionId).pipe(
+                      Effect.map((value) => ({ ok: true as const, value })),
+                      Effect.catch(() =>
+                        Effect.succeed({
+                          ok: false as const,
+                          result: fail("Unable to read run state"),
+                        }),
+                      ),
+                    );
+                    if (!latest.ok) return latest.result;
+                    if (Option.isNone(latest.value))
+                      return fail("Run no longer exists");
+                    const current = latest.value.value;
+                    if (
+                      current.desiredState === "canceled" ||
+                      ["canceled", "failed", "succeeded"].includes(
+                        current.state,
+                      )
+                    )
+                      return fail("Run has stopped");
+                    return yield* nativeOperation;
+                  }),
                 );
               return yield* nativeOperation;
             }
@@ -2641,6 +2668,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             const linearTools = linearHostToolsForRun(run, cwd, uid);
             const linearMcp = startLinearMcpServer({
               tools: linearTools.definitions,
+              ...(sandbox === undefined
+                ? {}
+                : { hostname: sandbox.handle.gatewayAddress }),
               call: ({ toolName, arguments: toolArguments }) => {
                 const toolCallId = randomUUID();
                 return runPromise(
@@ -2654,6 +2684,19 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               },
             });
             mcpProxies.set(run.sessionId, linearMcp.stop);
+            let linearMcpSettings = linearMcp;
+            if (sandbox !== undefined) {
+              const endpoint = new URL(linearMcp.url);
+              const relay = yield* openSandboxRelay(
+                run.sessionId,
+                "gateway",
+                Number(endpoint.port),
+              );
+              linearMcpSettings = {
+                ...linearMcp,
+                url: new URL(endpoint.pathname, relay.baseUrl).toString(),
+              };
+            }
             // Preparation may outlive a lease. Fence again before creating a process.
             yield* updateRun(run.sessionId, {});
             driver = launchedT3Driver(
@@ -2675,7 +2718,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   launch,
                   runtimeMode: t3Config.runtimeMode,
                   defaultModel: modelSelection,
-                  linearMcp,
+                  linearMcp: linearMcpSettings,
                 }),
                 writeSettings: (settings) =>
                   workspaceProcess(cwd, "t3-config", settings).then(

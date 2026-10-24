@@ -1948,6 +1948,75 @@ describe("SessionAuthority deferred stop handling", () => {
   );
 });
 describe("SessionAuthority host-tool mutation gate", () => {
+  it.live("refuses native build mutations after stop", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some(testPath("native-build-mutation-gate")),
+            ompSessionFile: Option.some(
+              testPath("native-build-mutation-gate/session.jsonl"),
+            ),
+          });
+          yield* authority.processSession(testSessionId);
+
+          expect(registeredHostTools.map((tool) => tool.name)).toEqual(
+            expect.arrayContaining([
+              "native_build_start",
+              "native_build_status",
+              "native_build_artifact",
+              "native_build_cancel",
+            ]),
+          );
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
+
+          yield* runInputRepo.applyStop(testSessionId);
+          for (const toolName of [
+            "native_build_start",
+            "native_build_artifact",
+            "native_build_cancel",
+          ] as const) {
+            const result = yield* listener({
+              id: `call-${toolName}`,
+              toolCallId: `tool-${toolName}`,
+              toolName,
+              arguments:
+                toolName === "native_build_start"
+                  ? {
+                      commit: "a".repeat(40),
+                      pullRequest: 7,
+                      action: "archive",
+                    }
+                  : { job: "b".repeat(32) },
+            });
+            expect(result.isError).toBe(true);
+            expect(result.content).toMatchObject([
+              { type: "text", text: "Run has stopped" },
+            ]);
+          }
+        }),
+      {
+        config: [
+          ["NATIVE_BUILD_SSH_CONFIG_FILE", testPath("native/ssh_config")],
+          ["NATIVE_BUILD_SCRATCH_ROOT", testPath("native/scratch")],
+        ],
+      },
+    ),
+  );
+
   it.live("refuses mutating host tools once the run is canceled", () =>
     withAuthority(
       () =>
