@@ -11,11 +11,13 @@ from pathlib import Path
 import re
 import signal
 import socket
+import stat
 
 PORT = 52
 MAX_REQUEST = 1024 * 1024
 MAX_FRAME = 4 * 1024 * 1024
 WORKSPACE = Path("/workspace")
+DOCKER_SOCKET = Path("/run/docker.sock")
 ENV_KEYS = frozenset("""PATH HOME LANG LANGUAGE LC_ALL LC_CTYPE TERM COLORTERM TMPDIR
 XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME BUN_INSTALL_CACHE_DIR
 BUN_RUNTIME_TRANSPILER_CACHE_PATH PI_CODING_AGENT_DIR PI_PACKAGE_DIR
@@ -166,6 +168,14 @@ class Agent:
                 raise ValueError("unauthorized")
             operation = request.get("operation")
             if operation == "ping":
+                # worker-init chmods this private socket only after docker info
+                # succeeds. Recovery must wait for the worker's access too.
+                try:
+                    info = DOCKER_SOCKET.lstat()
+                except FileNotFoundError:
+                    raise ValueError("nested Docker is not ready") from None
+                if not stat.S_ISSOCK(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o666:
+                    raise ValueError("nested Docker is not ready")
                 await send_json(writer, {"ok": True})
             elif operation == "shutdown":
                 await send_json(writer, {"ok": True})

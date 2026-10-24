@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import socket
 from pathlib import Path
 import tempfile
 import unittest
@@ -24,6 +25,12 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
             os.chown(self.workspace, self.uid, self.uid)
         self.workspace_patch = patch.object(guest, "WORKSPACE", self.workspace)
         self.workspace_patch.start()
+        self.docker_path = self.workspace / "docker.sock"
+        self.docker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.docker_socket.bind(str(self.docker_path))
+        self.docker_path.chmod(0o666)
+        self.docker_patch = patch.object(guest, "DOCKER_SOCKET", self.docker_path)
+        self.docker_patch.start()
         self.agent = guest.Agent(TOKEN, self.uid)
         self.server = await asyncio.start_server(self.agent.handle, "127.0.0.1", 0)
         self.address = self.server.sockets[0].getsockname()
@@ -32,6 +39,8 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
         self.server.close()
         await self.server.wait_closed()
         self.workspace_patch.stop()
+        self.docker_patch.stop()
+        self.docker_socket.close()
         self.temp.cleanup()
 
     async def connect(self, request):
@@ -44,6 +53,23 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
         for token, expected in [(TOKEN, True), ("b" * 64, False), ("é" * 64, False)]:
             reader, writer = await self.connect({"operation": "ping", "token": token})
             self.assertEqual(json.loads(await reader.readline())["ok"], expected)
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_ping_waits_for_worker_docker_socket_access(self):
+        for mode, expected in ((0o600, False), (0o660, False), (0o666, True)):
+            self.docker_path.chmod(mode)
+            reader, writer = await self.connect({"operation": "ping"})
+            self.assertEqual(json.loads(await reader.readline())["ok"], expected)
+            writer.close()
+            await writer.wait_closed()
+        self.docker_path.unlink()
+        for regular_file in (False, True):
+            if regular_file:
+                self.docker_path.write_text("not a socket")
+                self.docker_path.chmod(0o666)
+            reader, writer = await self.connect({"operation": "ping"})
+            self.assertFalse(json.loads(await reader.readline())["ok"])
             writer.close()
             await writer.wait_closed()
 
