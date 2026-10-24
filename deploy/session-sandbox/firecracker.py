@@ -291,6 +291,10 @@ def prepare_sftp_jail(session: str) -> None:
     (etc / "group").write_text(f"partitura:x:{uid}:\n")
     os.chmod(etc / "passwd", 0o644)
     os.chmod(etc / "group", 0o644)
+    # OpenSSH opens /dev/null before serving even in stdio mode. systemd binds
+    # its private null device here; no host device tree enters the jail.
+    (jail / "dev").mkdir(mode=0o755)
+    (jail / "dev/null").touch(mode=0o600)
 
 
 def start_workspace(session: str) -> None:
@@ -338,6 +342,7 @@ def sftp_command(record: dict[str, Any], service: str) -> list[str]:
         "--property=BindsTo=" + "partitura-workspace-" + key(session) + ".service",
         "--property=After=" + "partitura-workspace-" + key(session) + ".service",
         "--property=BindPaths=" + record["workspaceHost"] + ":" + jail + "/workspace",
+        "--property=BindReadOnlyPaths=/dev/null:" + jail + "/dev/null",
         "--property=PrivateNetwork=yes", "--property=PrivateDevices=yes",
         "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP",
         "--property=ProtectSystem=strict", "--property=ProtectHome=yes",

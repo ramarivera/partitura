@@ -97,6 +97,7 @@ class FirecrackerTests(unittest.IsolatedAsyncioTestCase):
         for required in ("--property=BindPaths=/host/session:" + str(vm.sftp_jail("test-session")) + "/workspace", "--property=PrivateDevices=yes", "--property=CapabilityBoundingSet=CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP", "--property=NoNewPrivileges=yes", "--property=PrivateNetwork=yes", "--property=ProtectSystem=strict", "--property=ReadWritePaths=" + str(vm.sftp_jail("test-session")) + "/workspace", "--property=RestrictAddressFamilies=AF_UNIX"):
             self.assertIn(required, args)
         self.assertEqual(args[-3:], [str(SOURCE.parent / "firecracker.py"), "--sftp-exec", "test-session"])
+        self.assertIn("--property=BindReadOnlyPaths=/dev/null:" + str(vm.sftp_jail("test-session")) + "/dev/null", args)
         self.assertFalse(any(arg.startswith("--property=User=") or arg.startswith("--property=RootDirectory=") for arg in args))
 
     def test_sftp_private_nss_identity_does_not_change_host_or_base_jail(self):
