@@ -179,6 +179,37 @@ describe("T3 launcher pure parts", () => {
       'base_url = "https://cliproxyapi.example.test/v1"',
     );
     expect(rendered.codexConfig).toContain('env_key = "CLIPROXYAPI_API_KEY"');
+    expect(rendered.claudeConfig).toEqual({ mcpServers: {} });
+  });
+
+  it("adds the session Linear MCP endpoint to both provider homes", () => {
+    const rendered = renderT3LaunchSettings({
+      cwd: "/app/workspaces/s1",
+      cliproxyApiBaseUrl: "https://cliproxyapi.example.test",
+      launch: launchConfig("t3"),
+      runtimeMode: "auto",
+      defaultModel: { instanceId: "codex-cliproxy", model: "gpt-6-sol" },
+      linearMcp: {
+        url: "http://127.0.0.1:43210/mcp",
+        authorizationHeader: "Bearer session-linear-secret",
+      },
+    });
+    expect(rendered.codexConfig).toContain("[mcp_servers.linear]");
+    expect(rendered.codexConfig).toContain(
+      'url = "http://127.0.0.1:43210/mcp"',
+    );
+    expect(rendered.codexConfig).toContain(
+      'http_headers = { Authorization = "Bearer session-linear-secret" }',
+    );
+    expect(rendered.claudeConfig).toEqual({
+      mcpServers: {
+        linear: {
+          type: "http",
+          url: "http://127.0.0.1:43210/mcp",
+          headers: { Authorization: "Bearer session-linear-secret" },
+        },
+      },
+    });
   });
 });
 

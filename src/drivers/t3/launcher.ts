@@ -50,6 +50,10 @@ export const renderT3LaunchSettings = (input: {
   readonly launch: T3LaunchConfig;
   readonly runtimeMode: string;
   readonly defaultModel: ModelSelection;
+  readonly linearMcp?: {
+    readonly url: string;
+    readonly authorizationHeader: string;
+  };
 }) => {
   const paths = t3SessionPaths(input.cwd);
   const settings = {
@@ -103,6 +107,14 @@ export const renderT3LaunchSettings = (input: {
     `model_reasoning_effort = ${tomlString(input.launch.codexReasoningEffort)}`,
     'approval_policy = "never"',
     'sandbox_mode = "danger-full-access"',
+    ...(input.linearMcp === undefined
+      ? []
+      : [
+          "",
+          "[mcp_servers.linear]",
+          `url = ${tomlString(input.linearMcp.url)}`,
+          `http_headers = { Authorization = ${tomlString(input.linearMcp.authorizationHeader)} }`,
+        ]),
     "",
     "[model_providers.cliproxyapi]",
     'name = "CLIProxyAPI"',
@@ -111,7 +123,19 @@ export const renderT3LaunchSettings = (input: {
     'env_key = "CLIPROXYAPI_API_KEY"',
     "",
   ].join("\n");
-  return { settings, codexConfig };
+  const claudeConfig = {
+    mcpServers:
+      input.linearMcp === undefined
+        ? {}
+        : {
+            linear: {
+              type: "http",
+              url: input.linearMcp.url,
+              headers: { Authorization: input.linearMcp.authorizationHeader },
+            },
+          },
+  };
+  return { settings, codexConfig, claudeConfig };
 };
 
 export type T3LaunchSettings = ReturnType<typeof renderT3LaunchSettings>;

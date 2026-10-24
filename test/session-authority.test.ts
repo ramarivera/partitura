@@ -1187,6 +1187,7 @@ const toolCommentCalls: Array<{
   readonly sessionId: string;
   readonly body: string;
 }> = [];
+const workspaceWriteCalls: Array<{ readonly operation: string }> = [];
 let commentEnteredSignal: Deferred.Deferred<void> | undefined;
 let commentRelease: Deferred.Deferred<void> | undefined;
 const mockToolsGateway = LinearGateway.of({
@@ -1233,6 +1234,12 @@ const mockToolsGateway = LinearGateway.of({
         });
   },
   updateIssue: () => Effect.void,
+  workspaceRead: () => Effect.succeed({}),
+  workspaceWrite: (input: { readonly operation: string }) =>
+    Effect.sync(() => {
+      workspaceWriteCalls.push(input);
+      return { ok: true };
+    }),
   addSessionExternalUrls: (input: {
     readonly sessionId: string;
     readonly urls: ReadonlyArray<{
@@ -1310,6 +1317,7 @@ const withAuthority = <A, E>(
       nixPrepareBlock = undefined;
       projectorTerminals.length = 0;
       toolCommentCalls.length = 0;
+      workspaceWriteCalls.length = 0;
       orderEvents.length = 0;
       commentEnteredSignal = undefined;
       commentRelease = undefined;
@@ -2032,6 +2040,8 @@ describe("SessionAuthority host-tool mutation gate", () => {
 
           yield* authority.processSession(testSessionId);
           expect(registeredHostTools.map((tool) => tool.name)).toEqual([
+            "linear_workspace_read",
+            "linear_workspace_write",
             "linear_get_issue",
             "linear_create_comment",
             "linear_update_issue",
@@ -2051,6 +2061,18 @@ describe("SessionAuthority host-tool mutation gate", () => {
           expect(allowed.isError).not.toBe(true);
           expect(toolCommentCalls).toHaveLength(1);
 
+          const allowedWorkspaceWrite = yield* listener({
+            id: "call-allowed-write",
+            toolCallId: "tool-workspace-denied",
+            toolName: "linear_workspace_write",
+            arguments: {
+              operation: "create_issue",
+              input: { teamId: "team-1", title: "should not be created" },
+            },
+          });
+          expect(allowedWorkspaceWrite.isError).not.toBe(true);
+          expect(workspaceWriteCalls).toHaveLength(1);
+
           // Stop dominance: desired_state flips to canceled, then the
           // in-gate re-read must refuse further mutations.
           yield* runInputRepo.applyStop(testSessionId);
@@ -2062,6 +2084,17 @@ describe("SessionAuthority host-tool mutation gate", () => {
           });
           expect(refused.isError).toBe(true);
           expect(toolCommentCalls).toHaveLength(1);
+          const deniedWorkspaceWrite = yield* listener({
+            id: "call-denied-write",
+            toolCallId: "tool-workspace-denied",
+            toolName: "linear_workspace_write",
+            arguments: {
+              operation: "create_issue",
+              input: { teamId: "team-1", title: "should not be created" },
+            },
+          });
+          expect(deniedWorkspaceWrite.isError).toBe(true);
+          expect(workspaceWriteCalls).toHaveLength(1);
 
           // Read tools still work after cancellation.
           const read = yield* listener({
@@ -3917,14 +3950,16 @@ describe("AgentDriver authority integration", () => {
               expect(ref.locator.origin).toBe(`http://127.0.0.1:${portBase}`);
               expect(workerSpawnInputs).toHaveLength(0);
               expect([...server.projects.values()][0]?.workspaceRoot).toBe(cwd);
-              // Same repo-scoped, re-minted credential OMP workers get. It
-              // stays in the session's Git config and never crosses the API.
+              // GitHub credentials stay in the gateway during checkout and
+              // never persist in the worker's repository config or cross T3.
               const minted = Buffer.from("x-access-token:ghs_launch").toString(
                 "base64",
               );
-              expect(
-                yield* Effect.promise(() => readFile(configPath, "utf8")),
-              ).toContain(`AUTHORIZATION: basic ${minted}`);
+              const workspaceGitConfig = yield* Effect.promise(() =>
+                readFile(configPath, "utf8"),
+              );
+              expect(workspaceGitConfig).not.toContain("AUTHORIZATION");
+              expect(workspaceGitConfig).not.toContain("ghs_launch");
               expect(JSON.stringify(server.requests)).not.toContain(minted);
               expect(JSON.stringify(server.requests)).not.toContain(
                 "ghs_launch",

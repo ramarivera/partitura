@@ -1,7 +1,7 @@
 import type * as LinearSdk from "@linear/sdk";
 import { TestClock } from "effect/testing";
 import * as fc from "fast-check";
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
 import { suitePaths } from "./fixtures/paths.js";
 
 const suitePath = suitePaths();
@@ -378,8 +378,114 @@ const activityBody = (content: unknown): string | undefined => {
 };
 
 beforeEach(() => sdkState.reset());
+afterEach(() => vi.unstubAllGlobals());
 
 describe("LinearGateway parity", () => {
+  it("runs fixed workspace reads and writes with the installation token", async () => {
+    const request = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        Response.json({ data: { result: { id: "created-1" } } }),
+    );
+    vi.stubGlobal("fetch", request);
+    const gateway = await getGateway();
+    const result = await Effect.runPromise(
+      gateway
+        .workspaceRead({
+          sessionId,
+          operation: "get_issue",
+          input: { id: "issue-1" },
+        })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    expect(result).toEqual({ result: { id: "created-1" } });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0]?.[0]).toBe("https://api.linear.app/graphql");
+    expect(
+      new Headers(request.mock.calls[0]?.[1]?.headers).get("authorization"),
+    ).toBe("Bearer access-token");
+    const readBody = JSON.parse(String(request.mock.calls[0]?.[1]?.body)) as {
+      readonly query: string;
+      readonly variables: Record<string, unknown>;
+    };
+    expect(readBody.query).toContain("issue(id: $id)");
+    expect(readBody.variables).toEqual({ id: "issue-1" });
+
+    await expect(
+      Effect.runPromise(
+        gateway
+          .workspaceRead({
+            sessionId,
+            operation: "arbitrary_graphql",
+            input: {},
+          })
+          .pipe(Effect.provide(gatewayLayer)),
+      ),
+    ).rejects.toThrow("operation is not an allowed Linear workspace read");
+    await expect(
+      Effect.runPromise(
+        gateway
+          .workspaceRead({
+            sessionId,
+            operation: "get_issue",
+            input: { id: "issue-1", query: "mutation { ... }" },
+          })
+          .pipe(Effect.provide(gatewayLayer)),
+      ),
+    ).rejects.toThrow("input field 'query' is not allowed");
+    expect(request).toHaveBeenCalledTimes(1);
+
+    await Effect.runPromise(
+      gateway
+        .workspaceWrite({
+          sessionId,
+          operation: "create_issue",
+          input: { teamId: "team-1", title: "A task" },
+        })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    const writeBody = JSON.parse(String(request.mock.calls[1]?.[1]?.body)) as {
+      readonly query: string;
+      readonly variables: Record<string, unknown>;
+    };
+    expect(writeBody.query).toContain("issueCreate");
+    expect(writeBody.variables).toEqual({
+      input: { teamId: "team-1", title: "A task" },
+    });
+  });
+
+  it("rejects oversized workspace read responses and write fields", async () => {
+    const request = vi.fn(
+      async () => new Response("x".repeat(1_048_577), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", request);
+    const gateway = await getGateway();
+    await expect(
+      Effect.runPromise(
+        gateway
+          .workspaceRead({
+            sessionId,
+            operation: "list_issues",
+            input: { first: 1 },
+          })
+          .pipe(Effect.provide(gatewayLayer)),
+      ),
+    ).rejects.toThrow();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    await expect(
+      Effect.runPromise(
+        gateway
+          .workspaceWrite({
+            sessionId,
+            operation: "create_issue",
+            input: { teamId: "team-1", delete: true },
+          })
+          .pipe(Effect.provide(gatewayLayer)),
+      ),
+    ).rejects.toThrow("not allowed");
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("paginates activities and preserves unknown content typenames", async () => {
     sdkState.state.activityPages.push(
       {

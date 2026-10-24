@@ -120,7 +120,7 @@ switch (action) {
   }
   case "t3-config": {
     // Paths come from the workspace, never the payload. Rewritten every launch.
-    const { settings, codexConfig } = input as T3LaunchSettings;
+    const { settings, codexConfig, claudeConfig } = input as T3LaunchSettings;
     if (typeof codexConfig !== "string" || typeof settings !== "object")
       throw new Error("Expected T3 settings");
     const paths = t3SessionPaths(cwd);
@@ -136,6 +136,10 @@ switch (action) {
       `${JSON.stringify(settings, null, 2)}\n`,
     );
     await replace(join(paths.codexHome, "config.toml"), codexConfig);
+    await replace(
+      join(paths.claudeHome, ".claude.json"),
+      `${JSON.stringify(claudeConfig, null, 2)}\n`,
+    );
     break;
   }
   default:
