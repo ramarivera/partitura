@@ -5,6 +5,8 @@ import {
   type AgentSettings,
   DEFAULT_AGENT_SETTINGS,
   type EffectiveRunSettings,
+  EffectiveRunSettingsSchema,
+  RunSettingsSourcesSchema,
   validateAgentSettings,
 } from "../agent-settings.js";
 import { decodeRow, SqliteClient, tryDb } from "./sqlite-client.js";
@@ -24,8 +26,8 @@ const AgentSettingsRecord = Schema.Struct({
 const RunSettingsRecord = Schema.Struct({
   sessionId: SessionId,
   organizationId: OrganizationId,
-  settings: Schema.Unknown,
-  sources: Schema.Unknown,
+  settings: EffectiveRunSettingsSchema,
+  sources: RunSettingsSourcesSchema,
   createdAt: Schema.Number,
 });
 
@@ -101,6 +103,7 @@ export class AgentSettingsRepo extends Context.Service<AgentSettingsRepo>()(
 
       const getSnapshot = Effect.fn("AgentSettingsRepo.getSnapshot")(function* (
         sessionId: string,
+        organizationId: string,
       ): Effect.fn.Return<
         Option.Option<RunSettingsSnapshot>,
         DatabaseError | RowDecodeError
@@ -143,13 +146,27 @@ export class AgentSettingsRepo extends Context.Service<AgentSettingsRepo>()(
           },
           "RunSettings",
         );
+        if (decoded.organizationId !== organizationId)
+          return yield* Effect.fail(
+            new DatabaseError({
+              message: "Stored run settings organization does not match run",
+            }),
+          );
+        if (
+          decoded.settings.sources.driver !== decoded.sources.driver ||
+          decoded.settings.sources.model !== decoded.sources.model ||
+          decoded.settings.sources.effort !== decoded.sources.effort ||
+          decoded.settings.sources.mode !== decoded.sources.mode
+        )
+          return yield* Effect.fail(
+            new DatabaseError({
+              message: "Stored run settings sources do not match settings",
+            }),
+          );
         return Option.some({
           sessionId: decoded.sessionId,
           organizationId: decoded.organizationId,
-          settings: {
-            ...(decoded.settings as EffectiveRunSettings),
-            sources: decoded.sources as EffectiveRunSettings["sources"],
-          },
+          settings: decoded.settings,
           createdAt: decoded.createdAt,
         });
       });
@@ -190,7 +207,7 @@ export class AgentSettingsRepo extends Context.Service<AgentSettingsRepo>()(
                 ),
             "AgentSettingsRepo.saveSnapshot",
           );
-          const saved = yield* getSnapshot(sessionId);
+          const saved = yield* getSnapshot(sessionId, organizationId);
           if (Option.isNone(saved))
             return yield* Effect.fail(
               new DatabaseError({

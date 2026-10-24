@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyEffortToT3Selection,
   DEFAULT_AGENT_SETTINGS,
   resolveRunSettings,
   validateAgentSettings,
@@ -33,6 +34,35 @@ const base = validateAgentSettings({
 });
 
 describe("per-run settings resolution", () => {
+  it.each([
+    ["claude-cliproxy", "effort"],
+    ["codex-cliproxy", "reasoningEffort"],
+  ] as const)(
+    "maps T3 effort to the %s option descriptor",
+    (instanceId, optionId) => {
+      expect(
+        applyEffortToT3Selection(
+          {
+            instanceId,
+            model: "model-id",
+            options: [
+              { id: "fastMode", value: true },
+              { id: "reasoningEffort", value: "low" },
+            ],
+          },
+          "high",
+        ),
+      ).toEqual({
+        instanceId,
+        model: "model-id",
+        options: [
+          { id: "fastMode", value: true },
+          { id: optionId, value: "high" },
+        ],
+      });
+    },
+  );
+
   it("resolves each setting by issue, project, admin, then environment precedence", () => {
     const result = resolveRunSettings({
       settings: base,

@@ -26,10 +26,15 @@ import {
   csrfHash,
   deriveCsrfToken,
 } from "../src/services/admin.js";
+import {
+  DEFAULT_AGENT_SETTINGS,
+  validateAgentSettings,
+} from "../src/services/agent-settings.js";
 import type { GatewayConfigShape } from "../src/services/config.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import {
   AdminSessionRepo,
+  AgentSettingsRepo,
   InstallationRepo,
   McpServerRepo,
   RunEventRepo,
@@ -54,6 +59,7 @@ const repositoryId = Schema.decodeUnknownSync(WorkspaceId)("repo-main");
 const teamId = Schema.decodeUnknownSync(TeamId)("team-main");
 const projectId = Schema.decodeUnknownSync(ProjectId)("project-main");
 const config: GatewayConfigShape = {
+  allowedOrganizationIds: new Set([organizationId]),
   gatewayAdminOrganizationIds: new Set([organizationId]),
   githubAppId: undefined,
   githubAppPrivateKey: undefined,
@@ -93,6 +99,13 @@ const deps: AdminDeps = {
       ),
     create: unreachable,
     deleteAdminSession: unreachable,
+  }),
+  agentSettingsRepo: AgentSettingsRepo.of({
+    get: () => Effect.succeed(DEFAULT_AGENT_SETTINGS),
+    upsert: (_organizationId, settings) =>
+      Effect.succeed(validateAgentSettings(settings)),
+    getSnapshot: () => Effect.succeed(Option.none()),
+    saveSnapshot: unreachable,
   }),
   installationRepo: InstallationRepo.of({
     put: unreachable,
@@ -227,6 +240,103 @@ const run = async (requestValue: Request): Promise<Response> => {
 };
 
 describe("service Admin request validation", () => {
+  const putAgentSettings = (
+    handleValue: typeof handle,
+    input: {
+      readonly body?: unknown;
+      readonly cookie?: string;
+      readonly csrf?: string;
+      readonly origin?: string;
+    } = {},
+  ) =>
+    handleValue(
+      new Request(new URL("/api/admin/agent-settings", config.publicUrl), {
+        method: "PUT",
+        headers: {
+          ...(input.cookie === undefined
+            ? { Cookie: `omp_gateway_admin=${token}` }
+            : { Cookie: input.cookie }),
+          ...(input.origin === undefined
+            ? { Origin: config.publicUrl.toString() }
+            : { Origin: input.origin }),
+          ...(input.csrf === undefined
+            ? { "X-CSRF-Token": deriveCsrfToken(token) }
+            : { "X-CSRF-Token": input.csrf }),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(input.body ?? { defaults: { driver: "t3" } }),
+      }),
+    );
+
+  it("protects organization settings with session, origin, and CSRF checks", async () => {
+    let upsertOrganization: string | undefined;
+    const settingsHandle = createAdminHandle({
+      ...deps,
+      agentSettingsRepo: AgentSettingsRepo.of({
+        ...deps.agentSettingsRepo,
+        upsert: (organization, settings) => {
+          upsertOrganization = organization;
+          return Effect.succeed(validateAgentSettings(settings));
+        },
+      }),
+    });
+    const noSession = await Effect.runPromise(
+      putAgentSettings(settingsHandle, { cookie: "" }),
+    );
+    expect(Option.getOrElse(noSession, () => null)?.status).toBe(401);
+
+    const wrongCsrf = await Effect.runPromise(
+      putAgentSettings(settingsHandle, { csrf: "wrong" }),
+    );
+    expect(Option.getOrElse(wrongCsrf, () => null)?.status).toBe(403);
+
+    const wrongOrganization = OrganizationId.make(
+      "22222222-2222-4222-8222-222222222222",
+    );
+    const foreignHandle = createAdminHandle({
+      ...deps,
+      adminSessionRepo: AdminSessionRepo.of({
+        ...deps.adminSessionRepo,
+        get: () =>
+          Effect.succeed(
+            Option.some({
+              organizationId: wrongOrganization,
+              csrfTokenHash: csrfHash(deriveCsrfToken(token)),
+            }),
+          ),
+      }),
+    });
+    const foreign = await Effect.runPromise(putAgentSettings(foreignHandle));
+    expect(Option.getOrElse(foreign, () => null)?.status).toBe(401);
+    expect(upsertOrganization).toBeUndefined();
+
+    const allowed = await Effect.runPromise(putAgentSettings(settingsHandle));
+    expect(Option.getOrElse(allowed, () => null)?.status).toBe(200);
+    expect(upsertOrganization).toBe(organizationId);
+  });
+
+  it("separates settings validation failures from persistence failures", async () => {
+    const invalid = await Effect.runPromise(
+      putAgentSettings(handle, {
+        body: { modelAliases: { unsafe: { omp: "../../provider/model" } } },
+      }),
+    );
+    expect(Option.getOrElse(invalid, () => null)?.status).toBe(400);
+
+    const failingHandle = createAdminHandle({
+      ...deps,
+      agentSettingsRepo: AgentSettingsRepo.of({
+        ...deps.agentSettingsRepo,
+        upsert: () =>
+          Effect.fail(new DatabaseError({ message: "database unavailable" })),
+      }),
+    });
+    const failedWrite = await Effect.runPromise(
+      putAgentSettings(failingHandle),
+    );
+    expect(Option.getOrElse(failedWrite, () => null)?.status).toBe(500);
+  });
+
   it("returns 400 for malformed optional repository arrays", async () => {
     for (const field of ["teamIds", "projectIds", "labels"]) {
       const response = await run(

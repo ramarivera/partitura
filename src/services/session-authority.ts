@@ -55,7 +55,7 @@ import {
 } from "../drivers/t3/launcher.js";
 import { openDriverWorker } from "../drivers/worker-adapter.js";
 import {
-  DEFAULT_AGENT_SETTINGS,
+  applyEffortToT3Selection,
   type EffectiveRunSettings,
   resolveRunSettings,
 } from "./agent-settings.js";
@@ -154,26 +154,6 @@ const ompApprovalMode = (
     case "auto":
       return "write";
   }
-};
-
-const t3SelectionWithEffort = (
-  selection: {
-    readonly instanceId: string;
-    readonly model: string;
-    readonly options?:
-      | ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>
-      | undefined;
-  },
-  effort: string | null,
-) => {
-  if (effort === null) return selection;
-  const options = (selection.options ?? []).filter(
-    (option) => option.id !== "reasoningEffort",
-  );
-  return {
-    ...selection,
-    options: [...options, { id: "reasoningEffort", value: effort }],
-  };
 };
 
 const failureMessage = <E>(cause: Cause.Cause<E>): string => {
@@ -430,7 +410,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const promptTemplateRepo = yield* PromptTemplateRepo;
       const installationRepo = yield* InstallationRepo;
       const runEventRepo = yield* RunEventRepo;
-      const agentSettingsRepo = yield* Effect.serviceOption(AgentSettingsRepo);
+      const agentSettingsRepo = yield* AgentSettingsRepo;
       const workspaceRepo = yield* WorkspaceRepo;
       const projector = yield* ActivityProjector;
       const rpc = yield* RpcWorker;
@@ -2087,9 +2067,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           return yield* Effect.fail(error);
         }
         const saved = yield* workspaceRepo.getDriverSession(run.sessionId);
-        let snapshot = Option.isSome(agentSettingsRepo)
-          ? yield* agentSettingsRepo.value.getSnapshot(run.sessionId)
-          : Option.none();
+        let snapshot = yield* agentSettingsRepo.getSnapshot(
+          run.sessionId,
+          run.organizationId,
+        );
         const latestInput = yield* runInputRepo.latestActionableInput(
           run.sessionId,
         );
@@ -2124,9 +2105,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             )
           : Option.none();
         if (Option.isNone(snapshot)) {
-          const organizationSettings = Option.isSome(agentSettingsRepo)
-            ? yield* agentSettingsRepo.value.get(run.organizationId)
-            : DEFAULT_AGENT_SETTINGS;
+          const organizationSettings = yield* agentSettingsRepo.get(
+            run.organizationId,
+          );
           const t3Config = config.t3Driver;
           const legacySessionLabels = Option.isSome(saved);
           const effectiveSettings = legacySessionLabels
@@ -2186,18 +2167,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               }
             : resolved;
           snapshot = Option.some(
-            Option.isSome(agentSettingsRepo)
-              ? yield* agentSettingsRepo.value.saveSnapshot(
-                  run.sessionId,
-                  run.organizationId,
-                  frozen,
-                )
-              : {
-                  sessionId: run.sessionId,
-                  organizationId: run.organizationId,
-                  settings: frozen,
-                  createdAt: 0,
-                },
+            yield* agentSettingsRepo.saveSnapshot(
+              run.sessionId,
+              run.organizationId,
+              frozen,
+            ),
           );
           if (
             resolved.warnings.length > 0 &&
@@ -2270,7 +2244,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 t3Config,
                 remoteT3Endpoint(t3Config.connection),
               ),
-              modelSelection: t3SelectionWithEffort(
+              modelSelection: applyEffortToT3Selection(
                 effective.t3Model === null
                   ? t3DriverOptionsFromConfig(
                       t3Config,
@@ -2335,7 +2309,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     message: "Stale T3 processes for this session did not exit",
                   }),
               });
-            const modelSelection = t3SelectionWithEffort(
+            const modelSelection = applyEffortToT3Selection(
               effective.t3Model === null
                 ? {
                     instanceId: t3Config.providerInstanceId,
@@ -2391,7 +2365,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               }),
               (endpoint) => ({
                 ...t3DriverOptionsFromConfig(t3Config, endpoint),
-                modelSelection: t3SelectionWithEffort(
+                modelSelection: applyEffortToT3Selection(
                   effective.t3Model === null
                     ? t3DriverOptionsFromConfig(t3Config, endpoint)
                         .modelSelection
@@ -3504,6 +3478,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       RunRepo.layer,
       LinearGateway.layer,
       WorkspaceRepo.layer,
+      AgentSettingsRepo.layer,
       GatewayConfig.layer,
       GitHubApp.layer,
       RpcWorker.layer,

@@ -151,12 +151,20 @@ describe("T3 launcher pure parts", () => {
       cliproxyApiBaseUrl: "https://cliproxyapi.example.test/",
       launch: launchConfig("t3"),
       runtimeMode: "auto",
-      defaultModel: { instanceId: "codex-cliproxy", model: "gpt-6-sol" },
+      defaultModel: {
+        instanceId: "codex-cliproxy",
+        model: "gpt-6-sol",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
     });
     const text = JSON.stringify(rendered);
     expect(text).not.toContain("proxy-client-key");
     expect(text).not.toMatch(/ANTHROPIC_(?:AUTH_TOKEN|API_KEY)|apiKey/u);
     const instances = rendered.settings.providerInstances;
+    expect(rendered.settings.defaultModelSelection).toEqual({
+      instanceId: "codex-cliproxy",
+      model: "gpt-6-sol",
+    });
     expect(
       Object.entries(instances)
         .filter(([, instance]) => instance.enabled)

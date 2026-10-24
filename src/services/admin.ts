@@ -49,6 +49,7 @@ import type {
   RunEvent,
 } from "../domain/models.js";
 import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
+import { validateAgentSettings } from "./agent-settings.js";
 import {
   GatewayConfig,
   type GatewayConfigShape,
@@ -166,7 +167,7 @@ export interface AdminDeps {
   };
   readonly workspaceRepo: WorkspaceRepo["Service"];
   readonly promptTemplateRepo: PromptTemplateRepo["Service"];
-  readonly agentSettingsRepo?: AgentSettingsRepo["Service"];
+  readonly agentSettingsRepo: AgentSettingsRepo["Service"];
   readonly mcpServerRepo: McpServerRepo["Service"];
   readonly mcpOAuth: McpOAuth["Service"];
   readonly workspace: WorkspaceShape;
@@ -1123,10 +1124,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
           pageOptions.cursor === undefined || hasIssueEvent(events)
             ? events
             : yield* deps.runEventRepo.list(sessionId, { limit: 100 });
-        const runSettings =
-          deps.agentSettingsRepo === undefined
-            ? Option.none()
-            : yield* deps.agentSettingsRepo.getSnapshot(sessionId);
+        const runSettings = yield* deps.agentSettingsRepo.getSnapshot(
+          sessionId,
+          run.organizationId,
+        );
         const model = {
           ...runDetailModel(run, events, issueEvents),
           settings: Option.isSome(runSettings)
@@ -1363,10 +1364,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const executorInstance = yield* deps.executorInstanceRepo.get(
           session.organizationId,
         );
-        const agentSettings =
-          deps.agentSettingsRepo === undefined
-            ? null
-            : yield* deps.agentSettingsRepo.get(session.organizationId);
+        const agentSettings = yield* deps.agentSettingsRepo.get(
+          session.organizationId,
+        );
         const reconcilerStatus = yield* deps.reconciler.status();
         return Option.some(
           json({
@@ -1406,23 +1406,19 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "PUT"
       ) {
         const session = yield* requireMutation(request);
-        if (deps.agentSettingsRepo === undefined)
-          return Option.some(text("Agent settings unavailable", 500));
         const payload = yield* parseJsonBody(request);
-        const settings = yield* deps.agentSettingsRepo
-          .upsert(session.organizationId, payload)
-          .pipe(
-            Effect.catchTag("@Gateway/DatabaseError", (error) =>
-              Effect.fail(
-                new AdminError({ message: error.message, status: 400 }),
-              ),
-            ),
-            Effect.catchTag("@Gateway/RowDecodeError", (error) =>
-              Effect.fail(
-                new AdminError({ message: error.message, status: 400 }),
-              ),
-            ),
-          );
+        const validated = yield* Effect.try({
+          try: () => validateAgentSettings(payload),
+          catch: (error) =>
+            new AdminError({
+              message: error instanceof Error ? error.message : String(error),
+              status: 400,
+            }),
+        });
+        const settings = yield* deps.agentSettingsRepo.upsert(
+          session.organizationId,
+          validated,
+        );
         return Option.some(json({ settings }));
       }
       if (

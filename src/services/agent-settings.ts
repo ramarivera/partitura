@@ -1,4 +1,6 @@
+import { Schema } from "effect";
 import type { RuntimeMode } from "../drivers/driver.js";
+import { RUNTIME_MODES } from "../drivers/driver.js";
 
 export type DriverKind = "omp" | "t3";
 export type SettingName = "driver" | "model" | "effort" | "mode";
@@ -45,6 +47,42 @@ export interface EffectiveRunSettings {
   readonly warnings: ReadonlyArray<string>;
 }
 
+export const SettingSourceSchema = Schema.Literals([
+  "issue-label",
+  "project-label",
+  "admin-default",
+  "environment",
+]);
+export const RunSettingsSourcesSchema = Schema.Struct({
+  driver: SettingSourceSchema,
+  model: SettingSourceSchema,
+  effort: SettingSourceSchema,
+  mode: SettingSourceSchema,
+});
+export const EffectiveRunSettingsSchema = Schema.Struct({
+  driver: Schema.Literals(["omp", "t3"]),
+  modelAlias: Schema.NullOr(Schema.String),
+  ompModel: Schema.NullOr(Schema.String),
+  t3Model: Schema.NullOr(
+    Schema.Struct({
+      instanceId: Schema.NonEmptyString,
+      model: Schema.NonEmptyString,
+      options: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            id: Schema.NonEmptyString,
+            value: Schema.Union([Schema.String, Schema.Boolean]),
+          }),
+        ),
+      ),
+    }),
+  ),
+  effort: Schema.NullOr(Schema.String),
+  runtimeMode: Schema.Literals(RUNTIME_MODES),
+  sources: RunSettingsSourcesSchema,
+  warnings: Schema.Array(Schema.String),
+});
+
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
   labelPrefixes: {
     driver: "driver:",
@@ -55,6 +93,31 @@ export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
   defaults: {},
   modelAliases: {},
   allowFullAccessViaLabel: true,
+};
+
+export const applyEffortToT3Selection = (
+  selection: Omit<NonNullable<ModelAlias["t3"]>, "options"> & {
+    readonly options?: NonNullable<ModelAlias["t3"]>["options"] | undefined;
+  },
+  effort: string | null,
+): NonNullable<ModelAlias["t3"]> => {
+  if (effort === null)
+    return {
+      instanceId: selection.instanceId,
+      model: selection.model,
+      ...(selection.options === undefined
+        ? {}
+        : { options: selection.options }),
+    };
+  const optionId =
+    selection.instanceId === "claude-cliproxy" ? "effort" : "reasoningEffort";
+  const options = (selection.options ?? []).filter(
+    (option) => option.id !== "effort" && option.id !== "reasoningEffort",
+  );
+  return {
+    ...selection,
+    options: [...options, { id: optionId, value: effort }],
+  };
 };
 
 const runtimeModes: ReadonlyArray<string> = [
