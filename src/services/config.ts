@@ -15,7 +15,7 @@ import type { NativeBuildConfig } from "./native-build-client.js";
 import { modelProvider } from "./worker-profile.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
-export type WorkerSandboxMode = "native" | "sysbox";
+export type WorkerSandboxMode = "native" | "firecracker" | "sysbox";
 
 const isLogFileFrequency = (value: string): value is LogFileFrequency =>
   LOG_FILE_FREQUENCIES.some((frequency) => frequency === value);
@@ -125,7 +125,7 @@ export interface GatewayConfigShape {
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
   readonly workerExtensionPaths?: ReadonlyArray<string>;
   readonly workerClaudeExecutable?: string;
-  /** Native remains the development default. Sysbox fails closed without its broker. */
+  /** Firecracker is the default. Isolated runtimes fail closed without their broker. */
   readonly workerSandboxMode?: WorkerSandboxMode | undefined;
   readonly sessionSandboxBrokerSocketPath?: string | undefined;
   /** Gateway-only SSH transport for optional native build host tools. */
@@ -135,7 +135,7 @@ export interface GatewayConfigShape {
 }
 
 const isWorkerSandboxMode = (value: string): value is WorkerSandboxMode =>
-  value === "native" || value === "sysbox";
+  value === "native" || value === "firecracker" || value === "sysbox";
 
 const positiveInteger = (name: string, fallback: number) =>
   Config.String(name).pipe(
@@ -317,7 +317,7 @@ const logFile = Config.all({
 
 const GatewayConfigValues = Config.all({
   workerSandboxMode: Config.String("WORKER_SANDBOX_MODE").pipe(
-    Config.withDefault("native"),
+    Config.withDefault("firecracker"),
     Config.mapEffect((value) => {
       const mode = value.trim();
       return isWorkerSandboxMode(mode)
@@ -325,7 +325,8 @@ const GatewayConfigValues = Config.all({
         : Effect.fail(
             new Config.ConfigError(
               new ConfigProvider.SourceError({
-                message: "WORKER_SANDBOX_MODE must be native or sysbox",
+                message:
+                  "WORKER_SANDBOX_MODE must be native, firecracker, or sysbox",
               }),
             ),
           );
@@ -969,11 +970,11 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       const routing = yield* workerModelRouting();
       const t3Driver = yield* t3DriverConfig();
       if (
-        values.workerSandboxMode === "sysbox" &&
+        values.workerSandboxMode !== "native" &&
         values.sessionSandboxBrokerSocketPath === undefined
       )
         return yield* configFailure(
-          "WORKER_SANDBOX_MODE=sysbox requires SESSION_SANDBOX_BROKER_SOCKET",
+          `WORKER_SANDBOX_MODE=${values.workerSandboxMode} requires SESSION_SANDBOX_BROKER_SOCKET`,
         );
       if (
         (values.nativeBuildSshConfigFile === undefined) !==

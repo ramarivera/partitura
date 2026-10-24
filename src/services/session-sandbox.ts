@@ -2,6 +2,7 @@ import { createConnection, isIPv4 } from "node:net";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Effect, Schema } from "effect";
+import type { WorkerSandboxMode } from "./config.js";
 
 export class SandboxBrokerError extends Schema.TaggedError<SandboxBrokerError>()(
   "@Gateway/SandboxBrokerError",
@@ -17,6 +18,8 @@ export class SandboxBrokerError extends Schema.TaggedError<SandboxBrokerError>()
   },
 ) {}
 
+export type SessionSandboxRuntimeKind = Exclude<WorkerSandboxMode, "native">;
+
 export interface SessionSandboxHandle {
   readonly sessionId: string;
   readonly container: string;
@@ -29,6 +32,7 @@ export interface SessionSandboxHandle {
 export type SandboxBrokerRequest =
   | {
       readonly operation: "provision";
+      readonly runtime: SessionSandboxRuntimeKind;
       readonly sessionId: string;
       readonly workspacePath: string;
       readonly workerUid: string;
@@ -36,6 +40,7 @@ export type SandboxBrokerRequest =
   | { readonly operation: "destroy"; readonly sessionId: string }
   | {
       readonly operation: "recover";
+      readonly runtime: SessionSandboxRuntimeKind;
       readonly sessionId: string;
       readonly workspacePath: string;
       readonly workerUid: string;
@@ -295,6 +300,7 @@ const openBrokerRelay = (
 
 export const makeSessionSandboxRuntime = (
   socketPath: string,
+  runtime: SessionSandboxRuntimeKind = "firecracker",
 ): SessionSandboxRuntime => ({
   provision: Effect.fn("SessionSandbox.provision")(
     function* (sessionId, workspacePath, workerUid) {
@@ -303,6 +309,7 @@ export const makeSessionSandboxRuntime = (
         try: () =>
           requestBroker(socketPath, {
             operation,
+            runtime,
             sessionId,
             workspacePath,
             workerUid,
@@ -317,6 +324,13 @@ export const makeSessionSandboxRuntime = (
         return yield* Effect.fail(
           new SandboxBrokerError({
             message: result.error ?? "Sandbox provisioning failed",
+            operation,
+          }),
+        );
+      if (result.result?.runtime !== runtime)
+        return yield* Effect.fail(
+          new SandboxBrokerError({
+            message: "Sandbox broker returned an unexpected runtime",
             operation,
           }),
         );
@@ -379,6 +393,7 @@ export const makeSessionSandboxRuntime = (
         try: () =>
           requestBroker(socketPath, {
             operation,
+            runtime,
             sessionId,
             workspacePath,
             workerUid,
@@ -393,6 +408,13 @@ export const makeSessionSandboxRuntime = (
         return yield* Effect.fail(
           new SandboxBrokerError({
             message: result.error ?? "Sandbox recovery check failed",
+            operation,
+          }),
+        );
+      if (result.result?.runtime !== runtime)
+        return yield* Effect.fail(
+          new SandboxBrokerError({
+            message: "Sandbox broker returned an unexpected runtime",
             operation,
           }),
         );

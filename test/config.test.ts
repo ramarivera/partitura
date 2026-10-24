@@ -15,6 +15,7 @@ import { testPaths } from "./fixtures/paths.js";
 const temporaryDirectories: string[] = [];
 
 const baseValues = new Map<string, string>([
+  ["WORKER_SANDBOX_MODE", "native"],
   ["LINEAR_CLIENT_ID", "client"],
   ["LINEAR_CLIENT_SECRET", "secret"],
   ["LINEAR_WEBHOOK_SECRET", "webhook"],
@@ -89,24 +90,53 @@ describe("GatewayConfig", () => {
     expect(JSON.stringify(invalid)).not.toContain("secret-invalid-content");
   });
 
-  test("requires the allowlisted broker when sandbox mode is enabled", async () => {
-    const missingBroker = await Effect.runPromise(
-      configResult(valuesWith([["WORKER_SANDBOX_MODE", "sysbox"]])),
-    );
-    expect(Result.isFailure(missingBroker)).toBe(true);
+  test.each(["firecracker", "sysbox"] as const)(
+    "requires the allowlisted broker for %s",
+    async (runtime) => {
+      const missingBroker = await Effect.runPromise(
+        configResult(valuesWith([["WORKER_SANDBOX_MODE", runtime]])),
+      );
+      expect(Result.isFailure(missingBroker)).toBe(true);
 
-    const configured = await Effect.runPromise(
-      configResult(
-        valuesWith([
-          ["WORKER_SANDBOX_MODE", "sysbox"],
-          [
-            "SESSION_SANDBOX_BROKER_SOCKET",
-            "/run/partitura-sandbox/broker.sock",
-          ],
-        ]),
-      ),
+      const configured = await Effect.runPromise(
+        configResult(
+          valuesWith([
+            ["WORKER_SANDBOX_MODE", runtime],
+            [
+              "SESSION_SANDBOX_BROKER_SOCKET",
+              "/run/partitura-sandbox/broker.sock",
+            ],
+          ]),
+        ),
+      );
+      expect(Result.isSuccess(configured)).toBe(true);
+    },
+  );
+
+  test("defaults to Firecracker and refuses to fall back without its broker", async () => {
+    const values = valuesWith([]);
+    values.delete("WORKER_SANDBOX_MODE");
+    expect(
+      Result.isFailure(await Effect.runPromise(configResult(values))),
+    ).toBe(true);
+    values.set(
+      "SESSION_SANDBOX_BROKER_SOCKET",
+      "/run/partitura-sandbox/broker.sock",
     );
+    const configured = await Effect.runPromise(configResult(values));
     expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured))
+      expect(configured.success.workerSandboxMode).toBe("firecracker");
+  });
+
+  test("rejects unknown sandbox runtimes", async () => {
+    expect(
+      Result.isFailure(
+        await Effect.runPromise(
+          configResult(valuesWith([["WORKER_SANDBOX_MODE", "docker"]])),
+        ),
+      ),
+    ).toBe(true);
   });
 
   test("enables native build transport only with both private paths", async () => {
@@ -150,6 +180,7 @@ describe("GatewayConfig", () => {
       ),
     };
     const environment: Record<string, string> = {
+      WORKER_SANDBOX_MODE: "native",
       PUBLIC_URL: "https://ohmypi-symphony.ai.roxasroot.net",
     };
 
@@ -187,6 +218,7 @@ describe("GatewayConfig", () => {
 
     const values = configValuesFromEnvironment({
       PUBLIC_URL: "http://localhost:3000",
+      WORKER_SANDBOX_MODE: "native",
       LINEAR_CLIENT_ID: "direct-client",
       LINEAR_CLIENT_ID_FILE: clientIdFile,
       LINEAR_CLIENT_SECRET: "secret",

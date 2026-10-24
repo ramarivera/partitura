@@ -51,6 +51,7 @@ const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 const configProvider = ConfigProvider.fromUnknown(
   Object.fromEntries(
     new Map([
+      ["WORKER_SANDBOX_MODE", "native"],
       ["LINEAR_CLIENT_ID", "test"],
       ["LINEAR_CLIENT_SECRET", "test"],
       ["LINEAR_WEBHOOK_SECRET", "test"],

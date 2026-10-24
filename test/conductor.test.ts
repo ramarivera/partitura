@@ -25,6 +25,7 @@ import {
 const configProvider = ConfigProvider.fromUnknown(
   Object.fromEntries(
     new Map([
+      ["WORKER_SANDBOX_MODE", "native"],
       ["LINEAR_CLIENT_ID", "test-client"],
       ["LINEAR_CLIENT_SECRET", "test-client-secret"],
       ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],

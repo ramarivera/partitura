@@ -6,6 +6,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import {
   makeSessionSandboxRuntime,
+  type SandboxBrokerRequest,
   sandboxBrokerRequestTimeoutMs,
   sandboxContainerName,
   sandboxEnvironment,
@@ -17,7 +18,7 @@ import { testPaths } from "./fixtures/paths.js";
 const paths = testPaths();
 
 describe("session sandbox", () => {
-  it("allows bounded Docker lifecycle operations to finish", () => {
+  it("allows bounded sandbox lifecycle operations to finish", () => {
     expect(sandboxBrokerRequestTimeoutMs("provision")).toBe(15 * 60_000);
     expect(sandboxBrokerRequestTimeoutMs("recover")).toBe(5 * 60_000);
     expect(sandboxBrokerRequestTimeoutMs("destroy")).toBe(5 * 60_000);
@@ -101,54 +102,142 @@ describe("session sandbox", () => {
     }),
   );
 
-  it.live("sends bounded control requests through the Unix broker socket", () =>
-    Effect.promise(async () => {
-      const socketPath = paths("sandbox-broker.sock");
-      await mkdir(dirname(socketPath), { recursive: true });
-      const server = createServer((socket) => {
-        let request = "";
-        socket.on("data", (chunk) => {
-          request += chunk.toString();
-          if (!request.includes("\n")) return;
-          const parsed = JSON.parse(request) as { sessionId: string };
-          socket.end(
-            `${JSON.stringify({
-              ok: true,
-              result: {
-                container: `partitura-session-${parsed.sessionId}`,
-                workspace: "/workspace",
-                workerAddress: "172.20.0.2",
-                gatewayAddress: "172.18.0.3",
-                relayAddress: "172.20.0.1",
-              },
-            })}\n`,
+  it.live.each([undefined, "firecracker", "sysbox"] as const)(
+    "uses one broker lifecycle for runtime %s",
+    (runtime) =>
+      Effect.promise(async () => {
+        const socketPath = paths("sandbox-broker.sock");
+        await mkdir(dirname(socketPath), { recursive: true });
+        const requests: SandboxBrokerRequest[] = [];
+        const selectedRuntime = runtime ?? "firecracker";
+        const server = createServer((socket) => {
+          let request = "";
+          socket.on("data", (chunk) => {
+            request += chunk.toString();
+            if (!request.includes("\n")) return;
+            const parsed = JSON.parse(request) as SandboxBrokerRequest;
+            requests.push(parsed);
+            socket.end(
+              `${JSON.stringify({
+                ok: true,
+                result: {
+                  runtime: selectedRuntime,
+                  exists: true,
+                  running: true,
+                  container: `partitura-session-${parsed.sessionId}`,
+                  workspace: "/workspace",
+                  workerAddress: "172.20.0.2",
+                  gatewayAddress: "172.18.0.3",
+                  relayAddress: "172.20.0.1",
+                },
+              })}\n`,
+            );
+          });
+        });
+        await new Promise<void>((resolve) =>
+          server.listen(socketPath, resolve),
+        );
+        try {
+          const sandbox = makeSessionSandboxRuntime(socketPath, runtime);
+          const handle = await Effect.runPromise(
+            sandbox.provision("session-2", "/app/workspaces/session-2", "1002"),
+          );
+          expect(handle).toEqual({
+            sessionId: "session-2",
+            container: "partitura-session-session-2",
+            workspace: "/workspace",
+            workerAddress: "172.20.0.2",
+            gatewayAddress: "172.18.0.3",
+            relayAddress: "172.20.0.1",
+          });
+          expect(
+            await Effect.runPromise(
+              sandbox.recover("session-2", "/app/workspaces/session-2", "1002"),
+            ),
+          ).toEqual({ exists: true, running: true, handle });
+          await Effect.runPromise(sandbox.destroy("session-2"));
+          expect(requests).toEqual([
+            {
+              operation: "provision",
+              runtime: selectedRuntime,
+              sessionId: "session-2",
+              workspacePath: "/app/workspaces/session-2",
+              workerUid: "1002",
+            },
+            {
+              operation: "recover",
+              runtime: selectedRuntime,
+              sessionId: "session-2",
+              workspacePath: "/app/workspaces/session-2",
+              workerUid: "1002",
+            },
+            { operation: "destroy", sessionId: "session-2" },
+          ]);
+        } finally {
+          await new Promise<void>((resolve, reject) =>
+            server.close((error) => (error ? reject(error) : resolve())),
+          );
+          await unlink(socketPath).catch(() => undefined);
+        }
+      }),
+  );
+
+  it.live.each([
+    ["firecracker", "sysbox"],
+    ["sysbox", "firecracker"],
+    ["firecracker", undefined],
+    ["sysbox", undefined],
+  ] as const)(
+    "refuses requested %s when the broker reports %s",
+    ([runtime, reportedRuntime]) =>
+      Effect.promise(async () => {
+        const socketPath = paths("runtime-mismatch.sock");
+        const server = createServer((socket) => {
+          socket.on("data", () =>
+            socket.end(
+              `${JSON.stringify({
+                ok: true,
+                result: {
+                  runtime: reportedRuntime,
+                  exists: false,
+                  running: false,
+                },
+              })}\n`,
+            ),
           );
         });
-      });
-      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-      try {
-        const handle = await Effect.runPromise(
-          makeSessionSandboxRuntime(socketPath).provision(
-            "session-2",
-            "/app/workspaces/session-2",
-            "1002",
-          ),
+        await new Promise<void>((resolve) =>
+          server.listen(socketPath, resolve),
         );
-        expect(handle).toEqual({
-          sessionId: "session-2",
-          container: "partitura-session-session-2",
-          workspace: "/workspace",
-          workerAddress: "172.20.0.2",
-          gatewayAddress: "172.18.0.3",
-          relayAddress: "172.20.0.1",
-        });
-      } finally {
-        await new Promise<void>((resolve, reject) =>
-          server.close((error) => (error ? reject(error) : resolve())),
-        );
-        await unlink(socketPath).catch(() => undefined);
-      }
-    }),
+        try {
+          const sandbox = makeSessionSandboxRuntime(socketPath, runtime);
+          for (const operation of ["provision", "recover"] as const) {
+            await expect(
+              Effect.runPromise(
+                operation === "provision"
+                  ? sandbox
+                      .provision(
+                        "session-2",
+                        "/app/workspaces/session-2",
+                        "1002",
+                      )
+                      .pipe(Effect.asVoid)
+                  : sandbox
+                      .recover("session-2", "/app/workspaces/session-2", "1002")
+                      .pipe(Effect.asVoid),
+              ),
+            ).rejects.toMatchObject({
+              operation,
+              message: "Sandbox broker returned an unexpected runtime",
+            });
+          }
+        } finally {
+          await new Promise<void>((resolve, reject) =>
+            server.close((error) => (error ? reject(error) : resolve())),
+          );
+          await unlink(socketPath).catch(() => undefined);
+        }
+      }),
   );
 
   it.live(

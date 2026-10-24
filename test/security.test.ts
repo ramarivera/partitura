@@ -146,6 +146,7 @@ afterEach(async () => {
 });
 const key = Buffer.alloc(32, 0x42).toString("base64");
 const values = new Map([
+  ["WORKER_SANDBOX_MODE", "native"],
   ["LINEAR_CLIENT_ID", "test"],
   ["LINEAR_CLIENT_SECRET", "test"],
   ["LINEAR_WEBHOOK_SECRET", "test"],

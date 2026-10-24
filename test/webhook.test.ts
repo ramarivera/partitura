@@ -99,6 +99,7 @@ const configProviderFor = (gatewayConfig: GatewayConfigShape) =>
                 [...gatewayConfig.allowedOrganizationIds].join(","),
               ] as const,
             ]),
+        ["WORKER_SANDBOX_MODE", "native"],
         ["LINEAR_CLIENT_ID", gatewayConfig.linearClientId],
         ["LINEAR_CLIENT_SECRET", "client-secret"],
         ["LINEAR_WEBHOOK_SECRET", secret],

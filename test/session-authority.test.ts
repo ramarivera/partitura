@@ -987,6 +987,7 @@ const testConfigProvider = (
   valuesOverride: ReadonlyArray<readonly [string, string]> = [],
 ) => {
   const values: Array<readonly [string, string]> = [
+    ["WORKER_SANDBOX_MODE", "native"],
     ["LINEAR_CLIENT_ID", "test-client"],
     ["LINEAR_CLIENT_SECRET", "test-secret"],
     ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
@@ -1418,24 +1419,26 @@ const install = (organizationId: OrganizationId): Installation => ({
 });
 
 describe("run settings startup snapshots", () => {
-  it.effect("refuses a directly supplied Sysbox config without a broker", () =>
-    Effect.gen(function* () {
-      const result = yield* Effect.result(
-        withAuthority(() => Effect.void, {
-          configOverride: (config) => ({
-            ...config,
-            workerSandboxMode: "sysbox",
-            sessionSandboxBrokerSocketPath: undefined,
+  it.effect.each(["firecracker", "sysbox"] as const)(
+    "refuses a directly supplied %s config without a broker",
+    (runtime) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.result(
+          withAuthority(() => Effect.void, {
+            configOverride: (config) => ({
+              ...config,
+              workerSandboxMode: runtime,
+              sessionSandboxBrokerSocketPath: undefined,
+            }),
           }),
-        }),
-      );
-      expect(Result.isFailure(result)).toBe(true);
-      if (Result.isFailure(result))
-        expect(String(result.failure)).toContain(
-          "native execution is forbidden",
         );
-      expect(workerSpawnInputs).toHaveLength(0);
-    }),
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result))
+          expect(String(result.failure)).toContain(
+            "native execution is forbidden",
+          );
+        expect(workerSpawnInputs).toHaveLength(0);
+      }),
   );
 
   it.effect("reuses the frozen settings snapshot on a worker retry", () =>
@@ -1574,9 +1577,9 @@ describe("SessionAuthority team-access gate", () => {
     ),
   );
 
-  it.live(
-    "reserves a terminal uid when sandbox teardown is unavailable after restart",
-    () =>
+  it.live.each(["firecracker", "sysbox"] as const)(
+    "reserves a terminal uid when %s teardown is unavailable after restart",
+    (runtime) =>
       withAuthority(
         (db) =>
           Effect.gen(function* () {
@@ -1606,7 +1609,7 @@ describe("SessionAuthority team-access gate", () => {
           }),
         {
           config: [
-            ["WORKER_SANDBOX_MODE", "sysbox"],
+            ["WORKER_SANDBOX_MODE", runtime],
             ["SESSION_SANDBOX_BROKER_SOCKET", testPath("missing-broker.sock")],
           ],
         },
@@ -3924,7 +3927,7 @@ const withT3Authority = <A, E>(
   task: Parameters<typeof withAuthority<A, E>>[0],
   server: FakeT3Server,
   workerUid?: string,
-  sandboxMode = false,
+  sandboxMode: false | "firecracker" | "sysbox" = false,
 ) =>
   withAuthority(task, {
     withLinearGateway: true,
@@ -3933,7 +3936,7 @@ const withT3Authority = <A, E>(
       ? {
           configOverride: (config: GatewayConfig["Service"]) => ({
             ...config,
-            workerSandboxMode: "sysbox" as const,
+            workerSandboxMode: sandboxMode,
             sessionSandboxBrokerSocketPath: "/nonexistent-sandbox-broker.sock",
           }),
         }
@@ -4347,7 +4350,7 @@ describe("AgentDriver authority integration", () => {
     () =>
       Effect.gen(function* () {
         const server = yield* t3Server;
-        for (const sandboxMode of [false, true])
+        for (const sandboxMode of [false, "firecracker", "sysbox"] as const)
           yield* withT3Authority(
             () =>
               Effect.gen(function* () {

@@ -1,0 +1,27 @@
+# Source archive digest comes from kernel.org pub/linux/kernel/v6.x/sha256sums.asc.
+# Only x86_64 is qualified by this build recipe.
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential bc bison flex libelf-dev libssl-dev ca-certificates curl xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+ARG KERNEL_VERSION=6.1.155
+ARG KERNEL_SHA256=c29387aeee085fbcbd91236224b9df805063bac43615e75cea2c6b29604a5c73
+WORKDIR /build
+RUN curl --fail --location --retry 3 "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz" -o linux.tar.xz \
+ && echo "${KERNEL_SHA256}  linux.tar.xz" | sha256sum --check --strict \
+ && tar -xJf linux.tar.xz --strip-components=1 \
+ && rm linux.tar.xz
+COPY deploy/session-sandbox/firecracker/kernel.config /build/partitura.config
+ARG JOBS=4
+ENV KBUILD_BUILD_TIMESTAMP="Thu Jan 1 00:00:00 UTC 1970"
+ENV KBUILD_BUILD_USER=partitura KBUILD_BUILD_HOST=builder SOURCE_DATE_EPOCH=0
+RUN make x86_64_defconfig \
+ && scripts/kconfig/merge_config.sh -m .config partitura.config \
+ && make olddefconfig \
+ && while IFS= read -r option; do case "$option" in CONFIG_*=y) grep -qx "$option" .config || { echo "Required kernel option missing: $option" >&2; exit 1; } ;; esac; done < partitura.config \
+ && make -j"${JOBS}" vmlinux \
+ && install -d /artifacts \
+ && cp vmlinux .config /artifacts/ \
+ && cd /artifacts && sha256sum vmlinux > vmlinux.sha256
+FROM scratch
+COPY --from=build /artifacts/ /

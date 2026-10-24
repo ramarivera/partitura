@@ -150,10 +150,25 @@ export class Retention extends Context.Service<Retention>()("Retention", {
     const policy = yield* Config.unwrap(retentionConfig);
     const { db } = yield* SqliteClient;
     const nix = yield* NixEnvironment;
+    const sandboxMode = config.workerSandboxMode ?? "firecracker";
+    if (
+      sandboxMode !== "native" &&
+      config.sessionSandboxBrokerSocketPath === undefined
+    )
+      return yield* Effect.fail(
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: `${sandboxMode} retention requires SESSION_SANDBOX_BROKER_SOCKET`,
+          }),
+        ),
+      );
     const sandboxRuntime =
-      config.workerSandboxMode === "sysbox" &&
+      sandboxMode !== "native" &&
       config.sessionSandboxBrokerSocketPath !== undefined
-        ? makeSessionSandboxRuntime(config.sessionSandboxBrokerSocketPath)
+        ? makeSessionSandboxRuntime(
+            config.sessionSandboxBrokerSocketPath,
+            sandboxMode,
+          )
         : undefined;
     const { sweep } = makeRetention({
       db,

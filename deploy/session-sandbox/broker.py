@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Narrow Docker broker for Partitura's per-session Sysbox sandboxes.
+"""Single lifecycle broker for Firecracker and selectable Sysbox sandboxes.
 
 The broker accepts one JSON request per Unix socket connection. It deliberately
 does not implement the Docker Engine API. Docker's socket stays on the host.
@@ -13,11 +13,17 @@ import ipaddress
 import os
 import re
 import shlex
+import secrets
 import sys
 import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
+
+# Direct-script loading also works in isolated importlib-based broker tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import firecracker as vm
 
 SESSION_RE = re.compile(r"^[a-zA-Z0-9_-]{1,96}$")
 CONTAINER_PREFIX = "partitura-session-"
@@ -25,6 +31,9 @@ NETWORK_PREFIX = "partitura-network-"
 SANDBOX_IMAGE = os.environ.get("PARTITURA_SANDBOX_IMAGE", "")
 GATEWAY_CONTAINER = os.environ.get("PARTITURA_GATEWAY_CONTAINER", "")
 GATEWAY_NETWORK = os.environ.get("PARTITURA_GATEWAY_NETWORK", "")
+GATEWAY_ADDRESS = os.environ.get("PARTITURA_GATEWAY_ADDRESS", "")
+GATEWAY_RELAY_ADDRESS = os.environ.get("PARTITURA_GATEWAY_RELAY_ADDRESS", "")
+GATEWAY_INTERFACE = os.environ.get("PARTITURA_GATEWAY_INTERFACE", "")
 GATEWAY_NETWORK_CONTAINER = os.environ.get(
     "PARTITURA_GATEWAY_NETWORK_CONTAINER", GATEWAY_CONTAINER
 )
@@ -67,6 +76,19 @@ def _allow_listener(peer: str, address: str, port: int, network: str) -> None:
     bridge = metadata.get("Options", {}).get("com.docker.network.bridge.name") or "br-" + metadata["Id"][:12]
     if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", bridge):
         raise ValueError("managed firewall requires a valid bridge interface")
+    _allow_interface_listener(peer, address, port, bridge)
+
+
+def _allow_interface_listener(peer: str, address: str, port: int, bridge: str) -> None:
+    if not MANAGE_FIREWALL:
+        return
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", bridge):
+        raise ValueError("managed firewall requires a valid interface")
+    if not all(ipaddress.ip_address(value).version == 4 for value in (peer, address)):
+        raise ValueError("managed firewall requires IPv4 listener addresses")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError("managed firewall requires a valid listener port")
+    tag = _firewall_tag()
     subprocess.run(
         [IPTABLES, "-w", "5", "-I", "INPUT", "1", "-i", bridge, "-p", "tcp",
          "-s", peer + "/32", "-d", address + "/32", "--dport", str(port),
@@ -160,7 +182,7 @@ def _network(session: str) -> str:
     return NETWORK_PREFIX + session
 
 
-def _remove_owned(kind: str, name: str, session: str) -> None:
+def _remove_owned(kind: str, name: str, session: str, attempt: int = 0) -> None:
     inspected = subprocess.run(
         [DOCKER, kind, "inspect", name],
         capture_output=True,
@@ -186,6 +208,13 @@ def _remove_owned(kind: str, name: str, session: str) -> None:
         check=False,
     )
     if result.returncode != 0:
+        diagnostic = f"{result.stdout}\n{result.stderr}".lower()
+        transient = "tried to kill container" in diagnostic or "removal of container" in diagnostic and "in progress" in diagnostic
+        if kind == "container" and transient and attempt < 2:
+            time.sleep(0.2)
+            # Re-inspect exact session ownership and absence after the first
+            # removal's side effects before issuing a bounded retry.
+            return _remove_owned(kind, name, session, attempt + 1)
         raise RuntimeError(f"Docker {kind} removal failed; retry teardown")
 
 
@@ -240,7 +269,7 @@ async def _docker_api_json(
     return json.loads(response) if response else {}
 
 
-def provision(request: dict[str, Any]) -> dict[str, Any]:
+def _sysbox_provision(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
     worker_uid = _worker_uid(request.get("workerUid"))
     workspace = _workspace(request.get("workspacePath"))
@@ -319,14 +348,14 @@ def provision(request: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("Docker did not assign required network addresses")
     except Exception:
         try:
-            destroy({"sessionId": session})
+            _sysbox_destroy({"sessionId": session})
         except Exception as cleanup_error:
             raise RuntimeError("sandbox provisioning failed; retry teardown") from cleanup_error
         raise
     return {"container": container, "workspace": "/workspace", "workerAddress": worker_ip, "gatewayAddress": gateway_ip, "relayAddress": relay_ip}
 
 
-def destroy(request: dict[str, Any]) -> dict[str, Any]:
+def _sysbox_destroy(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
     _remove_owned("container", _container(session), session)
     _remove_owned("network", _network(session), session)
@@ -334,7 +363,7 @@ def destroy(request: dict[str, Any]) -> dict[str, Any]:
     return {"destroyed": True}
 
 
-def recover(request: dict[str, Any]) -> dict[str, Any]:
+def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
     worker_uid = _worker_uid(request.get("workerUid"))
     workspace = _workspace(request.get("workspacePath"))
@@ -408,6 +437,157 @@ def recover(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _runtime(request: dict[str, Any]) -> str:
+    runtime = request.get("runtime", "firecracker")
+    if runtime not in ("firecracker", "sysbox"):
+        raise ValueError("runtime must be firecracker or sysbox")
+    return runtime
+
+
+def provision(request: dict[str, Any]) -> dict[str, Any]:
+    session = _session(request.get("sessionId"))
+    runtime = _runtime(request)
+    uid = _worker_uid(request.get("workerUid"))
+    workspace = _workspace(request.get("workspacePath"))
+    with vm.SessionLock(session):
+        if vm.load(session) is not None:
+            raise ValueError("sandbox already exists; recover or destroy it first")
+        if runtime == "firecracker":
+            vm.provision(session, uid, workspace)
+            vm.start_workspace(session)
+            return {"runtime": runtime, "container": _container(session), "workspace": "/workspace",
+                    "workerAddress": "127.0.0.1", "gatewayAddress": "127.0.0.1", "relayAddress": "127.0.0.1"}
+        vm.save(session, {"sessionId": session, "runtime": runtime, "workerUid": uid,
+                          "workspaceHost": str(workspace)})
+        result = _sysbox_provision(request)
+        return {**result, "runtime": runtime}
+
+
+def recover(request: dict[str, Any]) -> dict[str, Any]:
+    session = _session(request.get("sessionId"))
+    runtime = _runtime(request)
+    uid = _worker_uid(request.get("workerUid"))
+    workspace = _workspace(request.get("workspacePath"))
+    with vm.SessionLock(session):
+        record = vm.load(session)
+        if record is None:
+            # Legacy Sysbox resources retain their Docker ownership checks.
+            if runtime == "sysbox":
+                result = _sysbox_recover(request)
+                if result.get("exists"):
+                    vm.save(session, {"sessionId": session, "runtime": runtime, "workerUid": uid,
+                                      "workspaceHost": str(workspace)})
+                return {**result, "runtime": runtime}
+            return {"runtime": runtime, "exists": False, "running": False}
+        if record["runtime"] != runtime or record["workerUid"] != uid or record["workspaceHost"] != str(workspace):
+            raise ValueError("sandbox recovery ownership or runtime does not match")
+        if runtime == "sysbox":
+            return {**_sysbox_recover(request), "runtime": runtime}
+        # Always restart to terminate orphan execs while preserving the same disk.
+        subprocess.run(["/usr/bin/systemctl", "stop", vm.unit(session)], check=True, capture_output=True, timeout=30)
+        vm.start(session)
+        vm.start_workspace(session)
+        return {"runtime": runtime, "exists": True, "running": True, "container": _container(session),
+                "workspace": "/workspace", "workerAddress": "127.0.0.1", "gatewayAddress": "127.0.0.1", "relayAddress": "127.0.0.1"}
+
+
+def destroy(request: dict[str, Any]) -> dict[str, Any]:
+    session = _session(request.get("sessionId"))
+    with vm.SessionLock(session):
+        record = vm.load(session)
+        if record is not None and record["runtime"] == "firecracker":
+            vm.destroy(session)
+        else:
+            _sysbox_destroy(request)
+            vm.state_path(session).unlink(missing_ok=True)
+    return {"destroyed": True}
+
+
+def _owned_runtime(request: dict[str, Any]) -> dict[str, Any]:
+    record = vm.load(_session(request.get("sessionId")))
+    if record is None:
+        raise ValueError("sandbox has no lifecycle owner; provision or recover first")
+    if "workerUid" in request and _worker_uid(request["workerUid"]) != record["workerUid"]:
+        raise ValueError("sandbox worker uid does not match")
+    return record
+
+
+async def _vm_exec(reader, writer, request, record):
+    if _worker_uid(request.get("workerUid")) != record["workerUid"]:
+        raise ValueError("sandbox worker uid does not match")
+    guest_reader, guest_writer = await vm.connect(record, {**request, "operation": "exec"})
+    inputs = asyncio.create_task(vm.pipe(reader, guest_writer))
+    outputs = asyncio.create_task(vm.pipe(guest_reader, writer))
+    try:
+        done, _ = await asyncio.wait({inputs, outputs}, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+        if inputs in done:
+            await outputs
+    finally:
+        inputs.cancel()
+        outputs.cancel()
+        await asyncio.gather(inputs, outputs, return_exceptions=True)
+        guest_writer.close()
+        await guest_writer.wait_closed()
+
+
+# The image owns this interpreter and its stdlib. Framing preserves the
+# distinction between closing child stdin and relinquishing process ownership.
+SYSBOX_EXEC_WRAPPER = r"""
+import os, signal, subprocess, sys, threading
+process = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, start_new_session=True)
+lock = threading.Lock()
+def stop():
+    with lock:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+def exact(length):
+    data = bytearray()
+    while len(data) < length:
+        part = sys.stdin.buffer.read(length - len(data))
+        if not part:
+            raise EOFError()
+        data.extend(part)
+    return bytes(data)
+def input_loop():
+    try:
+        while True:
+            header = exact(5)
+            kind, length = header[:1], int.from_bytes(header[1:], "big")
+            if kind == b"C" and length == 0:
+                process.stdin.close()
+            elif kind == b"I" and length <= 4 * 1024 * 1024:
+                data = exact(length)
+                if not process.stdin.closed:
+                    try:
+                        process.stdin.write(data)
+                        process.stdin.flush()
+                    except BrokenPipeError:
+                        process.stdin.close()
+            else:
+                raise ValueError("invalid input frame")
+    except (EOFError, OSError, ValueError):
+        stop()
+threading.Thread(target=input_loop, daemon=True).start()
+try:
+    code = process.wait()
+finally:
+    stop()
+os._exit(code if 0 <= code <= 255 else 1)
+"""
+
+
 async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: dict[str, Any]) -> None:
     session = _session(request.get("sessionId"))
     worker_uid = request.get("workerUid")
@@ -453,7 +633,7 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             "AttachStdout": True,
             "AttachStderr": True,
             "Tty": False,
-            "Cmd": argv,
+            "Cmd": ["/opt/partitura/bin/python3", "-I", "-S", "-c", SYSBOX_EXEC_WRAPPER, *argv],
             "Env": [f"{key}={value}" for key, value in env.items()],
             "WorkingDir": cwd,
             "User": f"{worker_uid}:{worker_uid}",
@@ -483,23 +663,25 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             while True:
                 header = await reader.readexactly(5)
                 kind, length = header[:1], int.from_bytes(header[1:], "big")
-                if kind == b"C":
-                    break
+                if kind == b"C" and length == 0:
+                    docker_writer.write(header)
+                    await docker_writer.drain()
+                    continue
                 if kind != b"I" or length > 4 * 1024 * 1024:
                     raise ValueError("invalid input frame")
-                docker_writer.write(await reader.readexactly(length))
+                docker_writer.write(header + await reader.readexactly(length))
                 await docker_writer.drain()
-        except asyncio.IncompleteReadError:
+        except (asyncio.IncompleteReadError, ConnectionError):
             pass
-        except ConnectionError:
-            docker_writer.close()
-            return
-        raw_socket = docker_writer.transport.get_extra_info("socket")
-        if raw_socket is not None:
-            try:
-                raw_socket.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+        finally:
+            # EOF belongs to the supervisor, which terminates only its child
+            # process group. C frames only close the child's input stream.
+            raw_socket = docker_writer.transport.get_extra_info("socket")
+            if raw_socket is not None:
+                try:
+                    raw_socket.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
 
     async def output_loop() -> None:
         while True:
@@ -638,21 +820,24 @@ async def _stream_relay(
 
 
 async def _stream_egress(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: dict[str, Any]
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: dict[str, Any], record: dict[str, Any] | None = None
 ) -> None:
     if not EGRESS_HOSTS:
         raise ValueError("PARTITURA_SANDBOX_EGRESS_HOSTS must not be empty")
     session = _session(request.get("sessionId"))
     network = _network(session)
     container = _container(session)
-    worker_ip = _run(
-        ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}', container]
-    )
-    relay_ip = _run(
-        ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
-    )
-    if not all(ipaddress.ip_address(value).version == 4 for value in (worker_ip, relay_ip)):
-        raise ValueError("egress proxy requires IPv4 Docker addresses")
+    if record is None:
+        worker_ip = _run(
+            ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}', container]
+        )
+        relay_ip = _run(
+            ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
+        )
+        if not all(ipaddress.ip_address(value).version == 4 for value in (worker_ip, relay_ip)):
+            raise ValueError("egress proxy requires IPv4 Docker addresses")
+    else:
+        worker_ip, relay_ip = None, "127.0.0.1"
     active_writers: set[asyncio.StreamWriter] = set()
     active_tasks: set[asyncio.Task[Any]] = set()
 
@@ -679,7 +864,7 @@ async def _stream_egress(
         remote_writer: asyncio.StreamWriter | None = None
         peer = client_writer.get_extra_info("peername")
         try:
-            if not isinstance(peer, tuple) or peer[0] != worker_ip:
+            if record is None and (not isinstance(peer, tuple) or peer[0] != worker_ip):
                 return
             try:
                 header = await asyncio.wait_for(client_reader.readuntil(b"\r\n\r\n"), timeout=5)
@@ -726,12 +911,25 @@ async def _stream_egress(
             if task is not None:
                 active_tasks.discard(task)
 
-    server = await asyncio.start_server(
-        proxy_client, relay_ip, EGRESS_PROXY_PORT, limit=8192
-    )
-    proxy_port = server.sockets[0].getsockname()[1]
+    guest_writer = None
+    unix_path = None
+    if record is None:
+        server = await asyncio.start_server(proxy_client, relay_ip, EGRESS_PROXY_PORT, limit=8192)
+        proxy_port = server.sockets[0].getsockname()[1]
+    else:
+        unix_path = vm.VM_ROOT / vm.key(session) / "v.sock_1081"
+        unix_path.unlink(missing_ok=True)
+        server = await asyncio.start_unix_server(proxy_client, path=str(unix_path), limit=8192)
+        os.chmod(unix_path, 0o666)
+        proxy_port = EGRESS_PROXY_PORT
     try:
-        _allow_listener(worker_ip, relay_ip, proxy_port, network)
+        if record is None:
+            _allow_listener(worker_ip, relay_ip, proxy_port, network)
+        else:
+            guest_reader, guest_writer = await vm.connect(record, {"operation": "listen", "port": proxy_port, "targetPort": 1081})
+            response = json.loads(await asyncio.wait_for(guest_reader.readline(), 10))
+            if response.get("ok") is not True:
+                raise RuntimeError("guest egress listener failed")
         writer.write((json.dumps({"ok": True, "result": {"address": relay_ip, "port": proxy_port}}) + "\n").encode())
         await writer.drain()
         await reader.read()
@@ -744,7 +942,103 @@ async def _stream_egress(
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
         await server.wait_closed()
-        _cleanup_firewall()
+        if guest_writer is not None:
+            guest_writer.close()
+            await guest_writer.wait_closed()
+        if unix_path is not None:
+            unix_path.unlink(missing_ok=True)
+        else:
+            _cleanup_firewall()
+
+
+async def _vm_relay(reader, writer, request, record):
+    target, port = request.get("target"), request.get("targetPort")
+    if target not in ("gateway", "worker") or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError("relay target or port is invalid")
+    if GATEWAY_ADDRESS or GATEWAY_RELAY_ADDRESS or GATEWAY_INTERFACE:
+        if not GATEWAY_ADDRESS or not GATEWAY_RELAY_ADDRESS or not GATEWAY_INTERFACE:
+            raise ValueError("native gateway routing requires address, relay address and interface")
+        gateway_ip, bridge_ip = GATEWAY_ADDRESS, GATEWAY_RELAY_ADDRESS
+    else:
+        gateway_ip = _run(["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_NETWORK_CONTAINER])
+        bridge_ip = _run(["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", GATEWAY_NETWORK])
+    if not all(ipaddress.ip_address(value).version == 4 for value in (gateway_ip, bridge_ip)):
+        raise ValueError("gateway relay requires IPv4 addresses")
+    active: set[asyncio.Task[Any]] = set()
+    guest_writer = None
+    unix_path = None
+
+    async def client(client_reader, client_writer):
+        task = asyncio.current_task()
+        active.add(task)
+        upstream_writer = None
+        try:
+            if target == "worker":
+                peer = client_writer.get_extra_info("peername")
+                if not isinstance(peer, tuple) or peer[0] != gateway_ip:
+                    return
+                upstream_reader, upstream_writer = await vm.connect(record, {"operation": "tunnel", "targetPort": port})
+                reply = json.loads(await asyncio.wait_for(upstream_reader.readline(), 10))
+                if reply.get("ok") is not True:
+                    raise RuntimeError("guest tunnel failed")
+            else:
+                upstream_reader, upstream_writer = await asyncio.wait_for(asyncio.open_connection(gateway_ip, port), 10)
+            outgoing = asyncio.create_task(vm.pipe(client_reader, upstream_writer))
+            incoming = asyncio.create_task(vm.pipe(upstream_reader, client_writer))
+            try:
+                await asyncio.wait({outgoing, incoming}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                outgoing.cancel()
+                incoming.cancel()
+                await asyncio.gather(outgoing, incoming, return_exceptions=True)
+        except (OSError, ValueError, RuntimeError, TimeoutError):
+            pass
+        finally:
+            client_writer.close()
+            if upstream_writer is not None:
+                upstream_writer.close()
+                await upstream_writer.wait_closed()
+            await client_writer.wait_closed()
+            active.discard(task)
+
+    if target == "worker":
+        server = await asyncio.start_server(client, bridge_ip, 0)
+        relay_port = server.sockets[0].getsockname()[1]
+        relay_ip = bridge_ip
+    else:
+        host_port = 2000 + secrets.randbelow(2**30)
+        unix_path = vm.VM_ROOT / vm.key(record["sessionId"]) / ("v.sock_" + str(host_port))
+        server = await asyncio.start_unix_server(client, path=str(unix_path))
+        os.chmod(unix_path, 0o666)
+        relay_ip, relay_port = "127.0.0.1", 0
+    try:
+        if target == "worker":
+            if GATEWAY_INTERFACE:
+                _allow_interface_listener(gateway_ip, relay_ip, relay_port, GATEWAY_INTERFACE)
+            else:
+                _allow_listener(gateway_ip, relay_ip, relay_port, GATEWAY_NETWORK)
+        else:
+            guest_reader, guest_writer = await vm.connect(record, {"operation": "listen", "port": 0, "targetPort": host_port})
+            response = json.loads(await asyncio.wait_for(guest_reader.readline(), 10))
+            relay_port = response.get("port")
+            if response.get("ok") is not True or not isinstance(relay_port, int) or not 1 <= relay_port <= 65535:
+                raise RuntimeError("guest relay listener failed")
+        writer.write((json.dumps({"ok": True, "result": {"address": relay_ip, "port": relay_port}}) + "\n").encode())
+        await writer.drain()
+        await reader.read()
+    finally:
+        server.close()
+        await server.wait_closed()
+        for task in list(active):
+            task.cancel()
+        await asyncio.gather(*active, return_exceptions=True)
+        if guest_writer is not None:
+            guest_writer.close()
+            await guest_writer.wait_closed()
+        if unix_path is not None:
+            unix_path.unlink(missing_ok=True)
+        else:
+            _cleanup_firewall()
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
@@ -756,13 +1050,22 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
             raise ValueError("request must be an object")
         operation = request.get("operation")
         if operation == "exec":
-            await _stream_exec(reader, writer, request)
+            record = _owned_runtime(request)
+            if record["runtime"] == "firecracker":
+                await _vm_exec(reader, writer, request, record)
+            else:
+                await _stream_exec(reader, writer, request)
             return
         if operation == "relay":
-            await _stream_relay(reader, writer, request)
+            record = _owned_runtime(request)
+            if record["runtime"] == "firecracker":
+                await _vm_relay(reader, writer, request, record)
+            else:
+                await _stream_relay(reader, writer, request)
             return
         if operation == "egress":
-            await _stream_egress(reader, writer, request)
+            record = _owned_runtime(request)
+            await _stream_egress(reader, writer, request, record if record["runtime"] == "firecracker" else None)
             return
         if operation == "provision":
             result = await asyncio.to_thread(provision, request)
@@ -772,6 +1075,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
             result = await asyncio.to_thread(recover, request)
         else:
             raise ValueError("unsupported operation")
+        if operation in ("provision", "recover") and result.get("runtime") == "firecracker" and result.get("exists", True):
+            record = _owned_runtime(request)
+            await vm.ready(record)
+            await vm.command(record, {"operation": "mount-workspace", "targetPort": vm.WORKSPACE_PORT})
         writer.write((json.dumps({"ok": True, "result": result}) + "\n").encode())
     except Exception as error:
         # Never relay process stdout/stderr: Docker diagnostics can contain paths.

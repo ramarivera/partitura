@@ -1,9 +1,115 @@
-# Session sandbox broker source
+# Session sandbox broker
 
-This directory contains the host-side broker source and systemd unit templates
-for a future Sysbox deployment. It does not install Sysbox or change host access
-controls. The gateway connects only to the broker's Unix socket; the broker is
-the only process that uses the host Docker API.
+The gateway connects only to the broker's Unix socket. The broker owns the
+host runtime and workspace mounts. Firecracker is the default session backend;
+Sysbox is an explicit alternative. Neither backend exposes the host Docker
+socket to workers. Installing source files does not qualify a live deployment.
+
+## Firecracker guest
+
+The generic x86_64 Linux guest starts from the digest-pinned worker image built
+by `Dockerfile.worker`. It includes the same immutable Mise Node/Python cache,
+C/C++ build tools, CMake, Git, OMP, T3, Codex and Claude Code. The guest adds
+SSHFS for its live session workspace and a Python standard-library control
+agent. It contains no repository checkout, operator Mise/fnox configuration,
+private keys or model credentials. Runtime credentials arrive only in the
+session's authenticated control requests.
+
+Build the kernel into scratch storage, from the repository root:
+
+```sh
+docker build -f deploy/session-sandbox/firecracker/Dockerfile.kernel \
+  --build-arg JOBS=4 \
+  --output type=local,dest=/absolute/scratch/kernel .
+```
+
+The recipe pins Linux 6.1.155 and verifies the kernel.org source archive SHA-256.
+`kernel.config` builds virtio block, network and vsock, ext4, FUSE, overlayfs,
+network namespaces, Docker bridge/NAT and cgroups into the kernel. Modules aren't
+needed at boot. The output contains `vmlinux`, `.config` and its checksum. This
+recipe targets x86_64; it doesn't qualify an ARM guest. The kernel source and
+builder base are pinned. Debian package repositories still supply build tools,
+so preserve the built artifact and hash rather than claiming a bit-identical
+rebuild across repository updates.
+
+Build a root filesystem from an existing immutable worker image ID:
+
+```sh
+bash deploy/session-sandbox/firecracker/build-rootfs.sh \
+  sha256:<worker-image-id> /absolute/scratch/guest
+```
+
+The script exports the worker filesystem, adds guest init/control files and
+SSHFS, then creates `rootfs.ext4` without privileged containers or host mounts.
+The default sparse filesystem size is 12 GiB; `PARTITURA_ROOTFS_SIZE_MIB` changes
+that build input. It emits `rootfs.ext4.sha256` and `worker-image-id`. Keep all
+outputs outside the checkout. The input must come from the generic worker image,
+not an operator's workstation image. Building uses the Docker API; workers never
+receive that API socket.
+
+The broker copies the base disk for each session. `/dev/vda` is that writable
+ext4 root; `/dev/vdb` is a separate read-only configuration disk containing
+root-owned mode-0400 `config.json` with a fresh 64-character hex `token` and the
+numeric `workerUid`. Start with `root=/dev/vda rw init=/sbin/partitura-init
+console=ttyS0 reboot=k panic=1 pci=off`. Init mounts proc, sysfs, devtmpfs,
+cgroup v2 and bounded `/run` and `/tmp` tmpfs filesystems. It enables loopback,
+starts the nested Docker daemon and listens on guest vsock port 52. The VM has
+no network interface. Docker's data lives in local ext4 `/var/lib/docker`,
+not on the workspace FUSE mount.
+
+The live workspace uses SSHFS slave mode over vsock to a host SFTP process.
+The host process runs as the session uid in a restricted filesystem jail that
+contains only its `/workspace` and the fixed SFTP executable/libraries. The
+worker's host workspace stays live for gateway Git and T3 operations. No SSH
+server, SSH keys or host-root filesystem is exposed. The authenticated
+`mount-workspace` request connects guest vsock CID 2 to host port 1080, then
+runs SSHFS with `allow_other`, `default_permissions`, `uid`/`gid` mapping,
+`nodev` and `nosuid`. Workspace programs can execute. Session readiness requires
+the mount, not just a successful control-agent ping.
+
+Host-to-guest connections use Firecracker's Unix vsock socket handshake
+`CONNECT 52` followed by newline. The agent then accepts one newline-terminated
+JSON request containing the token. `exec` validates the session uid, canonical
+workspace cwd and environment allowlist, then drops uid/gid, clears extra groups
+and sets `no_new_privs`. Input uses `I` plus a four-byte big-endian length and
+payload, or `C` plus four zero bytes to close stdin. Output uses `O`/`E` plus
+length/payload; `X` plus a four-byte exit code ends the command. Frames are
+bounded to 4 MiB and request JSON to 1 MiB. Closing the owner connection kills
+the command's process group, including after stdin closes.
+
+`listen` creates a control-owned guest loopback listener and forwards it to a
+fixed host vsock port. Port zero requests an allocated loopback port. Closing
+the control connection stops the listener. `tunnel` connects to a guest loopback
+service for gateway-to-worker traffic. The egress listener uses guest loopback
+3128 and host vsock 1081; the host applies its exact-host CONNECT allowlist.
+Guest Docker inherits that proxy. There is no direct Internet or host network
+route from the VM.
+
+Configure `PARTITURA_FIRECRACKER_BINARY`, `PARTITURA_FIRECRACKER_KERNEL` and
+`PARTITURA_FIRECRACKER_ROOTFS` to installed, validated artifacts. The broker's
+default artifact locations are `/usr/local/bin/firecracker`,
+`/opt/partitura-sandbox/vmlinux` and `/opt/partitura-sandbox/rootfs.ext4`.
+`PARTITURA_FIRECRACKER_SFTP_ROOT` identifies the prepared fixed SFTP runtime
+jail, and `PARTITURA_FIRECRACKER_VM_ROOT` holds per-session disk/state directories.
+The host needs usable KVM and a qualified Firecracker binary. Source-only tests
+don't prove guest boot, nested Docker or the deployed SFTP jail works.
+
+Run the guest protocol tests as root inside a disposable worker container:
+
+```sh
+docker run --rm --network none --entrypoint /opt/partitura/bin/python3 \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  --mount type=bind,src=/absolute/checkout,dst=/source,readonly \
+  sha256:<worker-image-id> /source/test/firecracker-guest.test.py
+```
+
+Those tests exercise real process uid/group changes, environment stripping,
+framed stdin/stdout/stderr and exit status, process cleanup after disconnect,
+request validation and relay-listener lifetime. Boot qualification must also
+check the actual VM's live host/guest workspace writes, common tools without
+networking, nested Docker build/run and denied host/private-network access.
+
+## Sysbox alternative
 
 The broker's operations are `provision`, `recover`, `exec`, `relay`, `egress`,
 and `destroy`. Provisioning accepts a canonical workspace under the configured
@@ -94,7 +200,7 @@ provider settings use that relay address, so native Linear tools remain
 available inside the isolated container without attaching it to the gateway
 network or exposing gateway credentials.
 
-The current `arch-cachy` Docker uses the containerd snapshotter on btrfs, and
+At the time this preparation was written, `arch-cachy` Docker used the containerd snapshotter on btrfs, and
 this broker does not enforce per-session disk quotas. Sandbox mode remains
 unqualified there until Sysbox and the selected init and nested toolchain meet
 their documented capability requirements. Keep the shared toolbox daemon
@@ -102,7 +208,6 @@ untouched. Any future disk-quota requirement needs a separately qualified
 storage design; don't treat the container CPU, memory, pid, or tmpfs limits as
 a quota for the workspace bind mount, Mise volume, or writable layer.
 
-This is preparation only. No Sysbox runtime, broker unit, socket mount, worker
-image, or live sandbox has been installed or verified on arch-cachy. Sandbox
-mode must remain disabled until the host routes are installed and acceptance
-tests prove the restrictions.
+Keep deployment qualification separate from this source documentation. A host
+operator must verify the installed runtime, broker, workspace mount, nested
+Docker and egress restrictions before enabling either backend for sessions.

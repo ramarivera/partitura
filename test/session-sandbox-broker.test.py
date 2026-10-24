@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
@@ -194,7 +195,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(broker, "_run", side_effect=docker), patch.multiple(
                 broker, **settings
             ):
-                result = broker.provision(
+                result = broker._sysbox_provision(
                     {
                         "sessionId": "session-3",
                         "workspacePath": "/app/workspaces/session-3",
@@ -230,11 +231,11 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(broker, "_workspace", return_value=Path("/workspaces/session-8")),
             patch.object(broker, "_run", side_effect=RuntimeError("network create failed")) as run,
-            patch.object(broker, "destroy") as destroy,
+            patch.object(broker, "_sysbox_destroy") as destroy,
             patch.multiple(broker, **settings),
         ):
             with self.assertRaisesRegex(RuntimeError, "network create failed"):
-                broker.provision(
+                broker._sysbox_provision(
                     {
                         "sessionId": "session-8",
                         "workspacePath": "/app/workspaces/session-8",
@@ -292,10 +293,56 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(broker.subprocess, "run", side_effect=docker):
             with self.assertRaisesRegex(RuntimeError, "retry teardown"):
-                broker.destroy({"sessionId": "session-2"})
+                broker._sysbox_destroy({"sessionId": "session-2"})
         self.assertEqual(calls[0][1:3], ["container", "inspect"])
         self.assertEqual(calls[1][1:], ["rm", "-f", "partitura-session-session-2"])
         self.assertEqual(len(calls), 2)
+
+    def test_destroy_rechecks_ownership_before_retrying_async_container_kill(self):
+        owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}}]), stderr="")
+        killing = SimpleNamespace(returncode=1, stdout="", stderr="tried to kill container, but did not receive an exit event")
+        removed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(broker.subprocess, "run", side_effect=[owned, killing, owned, removed]) as run, patch.object(broker.time, "sleep"):
+            broker._remove_owned("container", "partitura-session-session-2", "session-2")
+        self.assertEqual([call.args[0][1:3] for call in run.call_args_list], [["container", "inspect"], ["rm", "-f"], ["container", "inspect"], ["rm", "-f"]])
+        foreign = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "other-session"}}}]), stderr="")
+        with patch.object(broker.subprocess, "run", side_effect=[owned, killing, foreign]) as run, patch.object(broker.time, "sleep"):
+            with self.assertRaisesRegex(ValueError, "label does not match"):
+                broker._remove_owned("container", "partitura-session-session-2", "session-2")
+        self.assertEqual(run.call_count, 3)
+
+    async def test_sysbox_supervisor_keeps_c_close_alive_then_cancels_only_its_group(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
+            marker = Path(directory) / "heartbeat"
+            grandchild = "import pathlib,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); p=pathlib.Path(" + repr(str(marker)) + ");\nwhile True: p.write_text(str(time.monotonic())); time.sleep(.03)"
+            child = "import signal,subprocess,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); subprocess.Popen([sys.executable,'-c'," + repr(grandchild) + "]); print('ready',flush=True);\nwhile True: time.sleep(1)"
+            unrelated = await asyncio.create_subprocess_exec(sys.executable, "-I", "-S", "-c", broker.SYSBOX_EXEC_WRAPPER, sys.executable, "-c", "import time; print('ready',flush=True); time.sleep(60)", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+            process = await asyncio.create_subprocess_exec(sys.executable, "-I", "-S", "-c", broker.SYSBOX_EXEC_WRAPPER, sys.executable, "-c", child, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+            try:
+                self.assertEqual(await asyncio.wait_for(process.stdout.readline(), 3), b"ready\n")
+                self.assertEqual(await asyncio.wait_for(unrelated.stdout.readline(), 3), b"ready\n")
+                for _ in range(100):
+                    if marker.exists():
+                        break
+                    await asyncio.sleep(.02)
+                self.assertTrue(marker.exists())
+                process.stdin.write(b"C\x00\x00\x00\x00")
+                await process.stdin.drain()
+                previous = marker.read_text()
+                await asyncio.sleep(.12)
+                self.assertIsNone(process.returncode)
+                self.assertNotEqual(marker.read_text(), previous)
+                process.stdin.close()
+                await asyncio.wait_for(process.wait(), 4)
+                previous = marker.read_text()
+                await asyncio.sleep(.12)
+                self.assertEqual(marker.read_text(), previous)
+                self.assertIsNone(unrelated.returncode)
+            finally:
+                for owned in (process, unrelated):
+                    if owned.returncode is None:
+                        owned.stdin.close()
+                        await asyncio.wait_for(owned.wait(), 4)
 
     async def test_exec_streams_input_output_and_exit_code_over_engine_hijack(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
@@ -387,7 +434,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                 server.close()
                 await server.wait_closed()
 
-            self.assertEqual(received_stdin, b"abc")
+            self.assertEqual(received_stdin, b"I\x00\x00\x00\x03abcC\x00\x00\x00\x00")
             self.assertIn(b"O\x00\x00\x00\x12hello from sandbox", client_writer.data)
             self.assertIn(b"E\x00\x00\x00\x0cbuild notice", client_writer.data)
             self.assertTrue(client_writer.data.endswith(b"X\x00\x00\x00\x07"))

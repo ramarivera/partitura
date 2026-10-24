@@ -1232,6 +1232,7 @@ describe("retention", () => {
             }),
         });
         const values = new Map([
+          ["WORKER_SANDBOX_MODE", "native"],
           ["LINEAR_CLIENT_ID", "client"],
           ["LINEAR_CLIENT_SECRET", "secret"],
           ["LINEAR_WEBHOOK_SECRET", "secret"],

@@ -1,0 +1,20 @@
+# Pass the immutable digest produced from Dockerfile.worker, never a moving tag.
+ARG WORKER_IMAGE
+FROM ${WORKER_IMAGE} AS guest
+ARG SSHFS_VERSION=3.7.3-1.2~deb13u1
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends "sshfs=${SSHFS_VERSION}" \
+ && rm -rf /var/lib/apt/lists/*
+COPY deploy/session-sandbox/firecracker/guest-init.sh /sbin/partitura-init
+COPY deploy/session-sandbox/firecracker/guest-agent.py /usr/local/bin/partitura-guest-agent
+RUN chmod 0755 /sbin/partitura-init /usr/local/bin/partitura-guest-agent \
+ && mkdir -p /proc /sys /dev \
+ && install -d -m 0755 /run /var/lib/docker \
+ && chmod 1777 /tmp \
+ && printf 'user_allow_other\n' > /etc/fuse.conf
+
+FROM guest AS rootfs-builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends e2fsprogs \
+ && rm -rf /var/lib/apt/lists/*

@@ -1,7 +1,6 @@
 [Unit]
-Description=Partitura per-session Sysbox sandbox broker request
-Requires=docker.service
-After=docker.service
+Description=Partitura per-session sandbox lifecycle broker request
+After=network.target
 
 [Service]
 Type=oneshot
@@ -15,9 +14,11 @@ ExecStopPost=/usr/bin/python3 /opt/partitura-sandbox/broker.py --cleanup-firewal
 StandardInput=socket
 NoNewPrivileges=true
 PrivateTmp=true
+StateDirectory=partitura-sandbox partitura-vms
+StateDirectoryMode=0700
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/run/partitura-sandbox -/run/xtables.lock
+ReadWritePaths=/run/partitura-sandbox /var/lib/partitura-sandbox /var/lib/partitura-vms -/run/xtables.lock
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=true
 MemoryDenyWriteExecute=true

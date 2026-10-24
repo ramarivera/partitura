@@ -42,6 +42,7 @@ const LOG_LEVELS = [
 type GatewayLogLevel = (typeof LOG_LEVELS)[number];
 
 const baseConfigValues = new Map<string, string>([
+  ["WORKER_SANDBOX_MODE", "native"],
   ["LINEAR_CLIENT_ID", "client"],
   ["LINEAR_CLIENT_SECRET", "client-secret"],
   ["LINEAR_WEBHOOK_SECRET", "webhook-secret"],
@@ -347,6 +348,7 @@ describe("Pino logger plan", () => {
         const configProvider = ConfigProvider.layer(
           ConfigProvider.fromUnknown(
             Object.fromEntries(new Map([
+              ["WORKER_SANDBOX_MODE", "native"],
               ["LINEAR_CLIENT_ID", "client"],
               ["LINEAR_CLIENT_SECRET", "client-secret"],
               ["LINEAR_WEBHOOK_SECRET", "webhook-secret"],

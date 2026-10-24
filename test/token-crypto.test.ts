@@ -9,6 +9,7 @@ const testKeyBase64 = Buffer.from(testKey).toString("base64");
 const configProvider = ConfigProvider.fromUnknown(
   Object.fromEntries(
     new Map<string, string>([
+      ["WORKER_SANDBOX_MODE", "native"],
       ["LINEAR_CLIENT_ID", "test"],
       ["LINEAR_CLIENT_SECRET", "test"],
       ["LINEAR_WEBHOOK_SECRET", "test"],
@@ -144,6 +145,7 @@ describe("TokenCrypto", () => {
       const badProvider = ConfigProvider.fromUnknown(
         Object.fromEntries(
           new Map<string, string>([
+            ["WORKER_SANDBOX_MODE", "native"],
             ["LINEAR_CLIENT_ID", "test"],
             ["LINEAR_CLIENT_SECRET", "test"],
             ["LINEAR_WEBHOOK_SECRET", "test"],

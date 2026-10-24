@@ -451,13 +451,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const workerIdentities = yield* WorkerIdentityRepo;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      const sandboxMode = config.workerSandboxMode ?? "firecracker";
       if (
-        config.workerSandboxMode === "sysbox" &&
+        sandboxMode !== "native" &&
         config.sessionSandboxBrokerSocketPath === undefined
       )
         return yield* new RpcSpawnError({
-          message:
-            "Sysbox workers require SESSION_SANDBOX_BROKER_SOCKET; native execution is forbidden",
+          message: `${sandboxMode} workers require SESSION_SANDBOX_BROKER_SOCKET; native execution is forbidden`,
         });
       type NativeBuildClient = Awaited<
         ReturnType<
@@ -481,9 +481,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         return nativeBuildClientPromise;
       };
       const sandboxRuntime =
-        config.workerSandboxMode === "sysbox" &&
+        sandboxMode !== "native" &&
         config.sessionSandboxBrokerSocketPath !== undefined
-          ? makeSessionSandboxRuntime(config.sessionSandboxBrokerSocketPath)
+          ? makeSessionSandboxRuntime(
+              config.sessionSandboxBrokerSocketPath,
+              sandboxMode,
+            )
           : undefined;
       const mcpOAuth = yield* McpOAuth;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
@@ -2863,13 +2866,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           const uid = yield* workerIdentities.acquire(
             run.sessionId,
             config.workspaceRoot,
-            { retireTerminal: config.workerSandboxMode !== "sysbox" },
+            { retireTerminal: sandboxMode === "native" },
           );
           let driver: AgentDriver;
           if (t3Config.connection._tag === "Remote") {
             // One shared daemon can't reach mode-0700 per-uid workspaces
             // without collapsing session isolation.
-            if (uid !== undefined || config.workerSandboxMode === "sysbox")
+            if (uid !== undefined || sandboxMode !== "native")
               return yield* new RpcSpawnError({
                 message:
                   "A shared T3 daemon cannot serve isolated worker workspaces; set T3_MODE=launch",
@@ -3153,7 +3156,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         const workerUid = yield* workerIdentities.acquire(
           run.sessionId,
           config.workspaceRoot,
-          { retireTerminal: config.workerSandboxMode !== "sysbox" },
+          { retireTerminal: sandboxMode === "native" },
         );
         yield* Effect.tryPromise({
           try: () => prepareWorkerWorkspace(cwd, workerUid),

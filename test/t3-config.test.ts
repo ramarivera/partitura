@@ -11,6 +11,7 @@ import { testPaths } from "./fixtures/paths.js";
 const pathFor = testPaths();
 
 const baseValues: ReadonlyArray<readonly [string, string]> = [
+  ["WORKER_SANDBOX_MODE", "native"],
   ["LINEAR_CLIENT_ID", "client"],
   ["LINEAR_CLIENT_SECRET", "secret"],
   ["LINEAR_WEBHOOK_SECRET", "webhook"],

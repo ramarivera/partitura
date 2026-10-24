@@ -195,6 +195,7 @@ const gatewayConfigLayer = (workspaceRoot: string) =>
         ConfigProvider.fromUnknown(
           Object.fromEntries(
             new Map([
+              ["WORKER_SANDBOX_MODE", "native"],
               ["LINEAR_CLIENT_ID", "workspace-test-client"],
               ["LINEAR_CLIENT_SECRET", "workspace-test-client-secret"],
               ["LINEAR_WEBHOOK_SECRET", "workspace-test-webhook-secret"],
