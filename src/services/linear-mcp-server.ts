@@ -24,6 +24,7 @@ const errorResponse = (id: unknown, code: number, message: string): Response =>
 /** One revocable HTTP MCP endpoint for one worker session. */
 export const startLinearMcpServer = (input: {
   readonly tools: ReadonlyArray<RpcHostToolDefinition>;
+  readonly hostname?: string;
   readonly call: (request: {
     readonly toolName: string;
     readonly arguments: Record<string, unknown>;
@@ -34,7 +35,7 @@ export const startLinearMcpServer = (input: {
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
   const lifetime = new AbortController();
   const server = Bun.serve({
-    hostname: "127.0.0.1",
+    hostname: input.hostname ?? "127.0.0.1",
     port: 0,
     idleTimeout: 0,
     maxRequestBodySize: MCP_MAX_RESPONSE_BYTES,
