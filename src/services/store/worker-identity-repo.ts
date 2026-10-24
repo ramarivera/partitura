@@ -14,7 +14,15 @@ export const retireWorkerIdentitySync = (
   sessionId: string,
   uid: number,
   workspaceRoot: string,
+  completingDeletion = false,
 ): boolean => {
+  if (
+    !completingDeletion &&
+    db
+      .query("SELECT 1 FROM workspace WHERE session_id=? AND state='deleting'")
+      .get(sessionId) !== null
+  )
+    return false;
   try {
     stopWorkerUidProcessesSync(uid);
     cleanupWorkerSharedFilesSync(uid);
@@ -48,6 +56,14 @@ export const makeWorkerIdentityRepo = (db: Database) => {
       () =>
         db
           .transaction(() => {
+            if (
+              db
+                .query(
+                  "SELECT 1 FROM workspace WHERE session_id=? AND state='deleting'",
+                )
+                .get(sessionId) !== null
+            )
+              throw new Error("Workspace deletion is in progress");
             const range = workerUidRange(process.env);
             if (range === undefined) return undefined;
             if (workspaceRoot !== undefined) {

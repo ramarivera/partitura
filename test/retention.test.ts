@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import { existsSync, realpathSync, rmSync, statSync } from "node:fs";
+import * as filesystem from "node:fs/promises";
 import { link, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
@@ -35,12 +36,18 @@ import {
   SqliteClient,
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
+import { makeWorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
+import { assertWorkspaceAvailable } from "../src/services/store/workspace-deletion.js";
 import * as workerSecurity from "../src/services/worker-security.js";
 import { testPaths } from "./fixtures/paths.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return { ...actual, fchownSync: vi.fn(actual.fchownSync) };
+});
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, open: vi.fn(actual.open) };
 });
 const testPath = testPaths();
 afterEach(() => {
@@ -73,6 +80,142 @@ const withDatabase = <A, E>(effect: Effect.Effect<A, E, SqliteClient>) =>
   effect.pipe(Effect.provide(SqliteClientLive(":memory:")));
 
 describe("retention", () => {
+  it.live(
+    "keeps SQLite available while deletion fences reopen, path sharing and uid reuse",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const runs = yield* RunRepo;
+        const inputs = yield* RunInputRepo;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        const session = Schema.decodeUnknownSync(SessionId)("expired");
+        insertRun(db, session, "canceled", expired);
+        insertRun(db, "another", "queued");
+        vi.stubEnv("WORKER_UID_BASE", "31001");
+        vi.stubEnv("WORKER_UID_COUNT", "1");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('expired',31001,1)",
+        ).run();
+        const started = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const deletion = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          removeWorkspace: async (path) => {
+            started.resolve();
+            await release.promise;
+            rmSync(path, { recursive: true, force: true });
+          },
+        })
+          .sweep(now)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.gen(function* () {
+          yield* Effect.promise(() => started.promise);
+          expect(db.inTransaction).toBe(false);
+          expect(yield* runs.reopen(session)).toBe(false);
+          expect(
+            Result.isFailure(
+              yield* inputs
+                .enqueue({
+                  id: Schema.decodeUnknownSync(InputId)("new-input"),
+                  sessionId: session,
+                  kind: "prompted",
+                  body: "resume",
+                  payload: {},
+                })
+                .pipe(Effect.result),
+            ),
+          ).toBe(true);
+          expect(
+            db.query("SELECT COUNT(*) AS count FROM run_input").get(),
+          ).toEqual({ count: 0 });
+          expect(
+            Result.isFailure(
+              yield* makeWorkerIdentityRepo(db)
+                .acquire("another", root)
+                .pipe(Effect.result),
+            ),
+          ).toBe(true);
+          expect(() =>
+            assertWorkspaceAvailable(db, "another", join(expired, "child")),
+          ).toThrow("deletion");
+          const alias = join(root, "alias");
+          yield* Effect.promise(() => symlink(expired, alias));
+          expect(() =>
+            assertWorkspaceAvailable(db, "another", join(alias, "new-child")),
+          ).toThrow("deletion");
+          // A second sweeper can't race the in-flight filesystem removal.
+          expect(
+            (yield* makeRetention({
+              db,
+              workspaceRoot: root,
+              policy,
+              webhookReplayWindowMs: 100,
+            }).sweep(now)).workspaces,
+          ).toBe(0);
+        }).pipe(Effect.ensuring(Effect.sync(() => release.resolve())));
+        expect((yield* Fiber.join(deletion)).workspaces).toBe(1);
+        expect(yield* runs.reopen(session)).toBe(true);
+        expect(yield* makeWorkerIdentityRepo(db).acquire("another", root)).toBe(
+          "31001",
+        );
+      }).pipe(
+        Effect.provide(Layer.mergeAll(RunRepo.layer, RunInputRepo.layer)),
+        withDatabase,
+      ),
+  );
+
+  it.live(
+    "recovers a durable deletion claim after closing and reopening SQLite",
+    () =>
+      Effect.gen(function* () {
+        const database = testPath("retention.sqlite");
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        yield* Effect.gen(function* () {
+          const { db } = yield* SqliteClient;
+          insertRun(db, "expired", "failed", expired);
+          const result = yield* makeRetention({
+            db,
+            workspaceRoot: root,
+            policy,
+            webhookReplayWindowMs: 100,
+            removeWorkspace: async () => {
+              throw new Error("simulated crash before removal");
+            },
+          }).sweep(now);
+          expect(result.workspaces).toBe(0);
+          expect(db.query("SELECT state FROM workspace").get()).toEqual({
+            state: "deleting",
+          });
+          // A later stop mustn't postpone recovery behind the workspace TTL.
+          db.query("UPDATE agent_run SET updated_at=?").run(now);
+        }).pipe(Effect.provide(SqliteClientLive(database)));
+        yield* Effect.gen(function* () {
+          const { db } = yield* SqliteClient;
+          expect(db.query("SELECT state FROM workspace").get()).toEqual({
+            state: "deleting",
+          });
+          expect(
+            (yield* makeRetention({
+              db,
+              workspaceRoot: root,
+              policy,
+              webhookReplayWindowMs: 100,
+            }).sweep(now)).workspaces,
+          ).toBe(1);
+          expect(existsSync(expired)).toBe(false);
+          expect(
+            db.query("SELECT workspace_path FROM agent_run").get(),
+          ).toEqual({ workspace_path: null });
+          expect(db.query("SELECT * FROM workspace").all()).toEqual([]);
+        }).pipe(Effect.provide(SqliteClientLive(database)));
+      }),
+  );
+
   it.live(
     "reclaims a terminal allocation left by a crash with no published workspace",
     () =>
@@ -234,7 +377,7 @@ describe("retention", () => {
   );
 
   it.live(
-    "migrates legacy ownership before worker deletion under the synchronous reopen fence without following symlinks",
+    "migrates legacy ownership asynchronously under a durable reopen fence without following symlinks",
     () =>
       Effect.gen(function* () {
         const { db } = yield* SqliteClient;
@@ -255,22 +398,35 @@ describe("retention", () => {
         const migrated: string[] = [];
         // Exercise real inode inspection and traversal, stubbing only the
         // privileged syscall unavailable to the native test uid.
-        vi.spyOn(fs, "fchownSync").mockImplementation((fd, uid, gid) => {
-          expect(db.inTransaction).toBe(true);
-          expect([uid, gid]).toEqual([workerUid, workerUid]);
-          migrated.push(realpathSync(`/proc/self/fd/${fd}`));
+        const open = vi.mocked(filesystem.open).getMockImplementation();
+        if (open === undefined) throw new Error("Filesystem open missing");
+        vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
+          const handle = await open(...args);
+          vi.spyOn(handle, "chown").mockImplementation(async (uid, gid) => {
+            expect(db.inTransaction).toBe(false);
+            expect(
+              db
+                .query("SELECT state FROM workspace WHERE session_id='expired'")
+                .get(),
+            ).toEqual({ state: "deleting" });
+            expect([uid, gid]).toEqual([workerUid, workerUid]);
+            migrated.push(realpathSync(`/proc/self/fd/${handle.fd}`));
+          });
+          return handle;
         });
-        const spawnSync = Bun.spawnSync;
+        const spawn = Bun.spawn;
         const worker = vi
-          .spyOn(Bun, "spawnSync")
+          .spyOn(Bun, "spawn")
           .mockImplementation((command, options) => {
-            expect(db.inTransaction).toBe(true);
-            expect(migrated.sort()).toEqual([expired, nested, file].sort());
-            // Run the real deletion entry point as the test uid after the mocked
-            // migration. Production uses setpriv to select the migrated uid.
-            if (!Array.isArray(command))
-              throw new Error("Expected helper command");
-            return spawnSync(command.slice(command.indexOf("--") + 1), options);
+            if (
+              Array.isArray(command) &&
+              command.includes("remove-workspace-contents")
+            ) {
+              expect(db.inTransaction).toBe(false);
+              expect(migrated.sort()).toEqual([expired, nested, file].sort());
+              return spawn(command.slice(command.indexOf("--") + 1), options);
+            }
+            return spawn(command, options);
           });
         insertRun(db, "expired", "succeeded", expired);
         const result = yield* makeRetention({
@@ -281,7 +437,13 @@ describe("retention", () => {
         }).sweep(now);
         expect(result.workspaces).toBe(1);
         expect(result.skippedWorkspaces).toBe(0);
-        expect(worker).toHaveBeenCalledExactlyOnceWith(
+        const workerCalls = worker.mock.calls.filter(
+          ([command]) =>
+            Array.isArray(command) &&
+            command.includes("remove-workspace-contents"),
+        );
+        expect(workerCalls).toHaveLength(1);
+        expect(workerCalls[0]).toEqual([
           expect.arrayContaining([
             "--reuid",
             String(workerUid),
@@ -292,7 +454,7 @@ describe("retention", () => {
             expired,
           ]),
           expect.objectContaining({ cwd: expect.not.stringContaining(root) }),
-        );
+        ]);
         expect(existsSync(expired)).toBe(false);
         expect(statSync(sentinel)).toMatchObject({
           uid: before.uid,

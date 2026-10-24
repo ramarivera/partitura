@@ -135,6 +135,19 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
         yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
 
         const tx = Effect.gen(function* () {
+          yield* tryDb(() => {
+            if (
+              input.kind !== "stop" &&
+              db
+                .query(
+                  "SELECT 1 FROM workspace WHERE session_id=? AND state='deleting'",
+                )
+                .get(input.sessionId) !== null
+            )
+              throw new Error(
+                "Workspace deletion is in progress; retry the input",
+              );
+          }, "RunInputRepo.deletionFence");
           const run = yield* getRunState(input.sessionId);
           if (Option.isNone(run)) {
             return yield* Effect.fail(

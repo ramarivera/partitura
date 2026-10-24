@@ -49,8 +49,8 @@ and Git credential updates execute as the worker uid, including on resume, so
 worker-planted paths never cause privileged gateway writes. Git subprocesses receive a transport
 environment allowlist, without gateway or model-provider credentials.
 The workspace helper starts from its gateway-owned installation directory and
-receives the workspace as an absolute argument. Both asynchronous operations and
-synchronous retention pin Bun's configuration to `/dev/null`, disable `.env`
+receives the workspace as an absolute argument. Workspace operations and
+retention pin Bun's configuration to `/dev/null`, disable `.env`
 autoloading and automatic package installation, and use an environment allowlist
 that excludes `BUN_*`, `NODE_OPTIONS` and loader injection variables. Keep the
 helper, its installation directory, dependencies and parent directories unwritable
@@ -66,13 +66,24 @@ proxy bearer; upstream access tokens stay in the gateway. Git persistence sends
 only the repository-scoped header string on stdin, never argv; cleanup operations
 carry no credential payload.
 
-Retention removes workspace contents as the worker uid while holding its synchronous
-SQLite reopen fence. Before delegation, the gateway migrates legacy ownership with
+Retention commits `workspace.state='deleting'` in a short immediate transaction
+before removing contents asynchronously as the worker uid. Reopen, prompt input,
+new overlapping path references, lease acquisition and uid recycling respect this
+durable claim. The claim and uid reservation survive crashes and failed cleanup;
+the next sweep retries them, even if a later stop changed the run's update time.
+Kernel flock serializes sweepers across processes and PID namespaces. Filesystem
+removal finishes before interruption releases that lock. Metadata and saved driver
+session references are cleared only after successful removal and uid retirement.
+Before delegation, the gateway migrates legacy ownership with
 the same descriptor-based, no-follow walk used for workspace preparation. Only
 canonical paths strictly inside the workspace root qualify. The gateway only
 removes the empty top-level directory; it never recursively deletes a
 worker-controlled tree with gateway privileges. A
 failed cleanup leaves the workspace records intact for a later sweep.
+New clone staging names carry a random owner ID backed by the same kernel-lock
+mechanism. An active gateway holds the lock through clone publication and cleanup.
+Recovery acquires it before removing abandoned staging, so PID reuse and container
+restart don't stand in for liveness. Legacy names retain conservative PID checks.
 `/app/workspaces` must be a separate writable volume,
 outside `/app/data`; the image sets `WORKSPACE_ROOT=/app/workspaces`.
 
