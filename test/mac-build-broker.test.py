@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import time
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -123,6 +124,63 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(receipt['state'], 'failed')
         self.assertIn(['delete', 'partitura-job-'+self.job], self.trace())
         self.assertFalse(any('/usr/bin/tar' in args for args in self.trace()))
+
+    def retained_artifact(self, job, state, size, modified):
+        directory = self.root / job
+        directory.mkdir()
+        broker.record(directory, job=job, state=state)
+        artifact = directory / 'artifacts.tar'
+        with artifact.open('wb') as handle:
+            handle.truncate(size)
+        os.utime(artifact, (modified, modified))
+        return artifact
+
+    def test_retention_prunes_expired_and_oldest_archives_but_preserves_receipts(self):
+        now = time.time()
+        expired = self.retained_artifact('1'*32, 'succeeded', 1, now-broker.ARTIFACT_RETENTION_SECONDS-1)
+        oldest = self.retained_artifact('2'*32, 'succeeded', 4, now-10)
+        newest = self.retained_artifact('3'*32, 'succeeded', 4, now-1)
+        with patch.object(broker, 'ARTIFACT_STORAGE_LIMIT', broker.MAX_ARTIFACT + 6):
+            broker.prune_artifacts(self.root, now)
+        self.assertFalse(expired.exists())
+        self.assertFalse(oldest.exists())
+        self.assertTrue(newest.exists())
+        self.assertTrue(json.loads((oldest.parent / 'receipt.json').read_text())['artifactExpired'])
+        self.assertEqual(json.loads((expired.parent / 'receipt.json').read_text())['state'], 'succeeded')
+
+    def test_new_job_prunes_failed_archives_and_preserves_unfinished_output(self):
+        failed = self.retained_artifact('1'*32, 'failed', 3, 1)
+        running = self.retained_artifact('2'*32, 'running', 3, 1)
+        code, _ = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertFalse(failed.exists())
+        self.assertTrue(running.exists())
+
+    def test_failed_artifact_transfer_removes_partial_archive(self):
+        def partial_transfer(_arguments, _environment, destination, _timeout):
+            destination.write_bytes(b'partial')
+            raise TimeoutError('interrupted artifact transfer')
+        with patch.object(broker, 'bounded_output', side_effect=partial_transfer):
+            code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['state'], 'failed')
+        self.assertFalse((self.root / self.job / 'artifacts.tar').exists())
+        self.assertFalse((self.root / 'active-vm').exists())
+
+    def test_retention_refuses_symlinks_and_hardlinks_without_touching_targets(self):
+        artifact = self.retained_artifact('1'*32, 'succeeded', 3, 1)
+        outside = self.root / 'outside'
+        outside.write_bytes(b'keep')
+        artifact.unlink()
+        artifact.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, 'unsafe retained artifact'):
+            broker.prune_artifacts(self.root)
+        self.assertEqual(outside.read_bytes(), b'keep')
+        artifact.unlink()
+        os.link(outside, artifact)
+        with self.assertRaisesRegex(ValueError, 'unsafe retained artifact'):
+            broker.prune_artifacts(self.root)
+        self.assertEqual(outside.read_bytes(), b'keep')
 
     def test_failed_clone_still_attempts_cleanup(self):
         (self.root / 'scenario').write_text('clone-failure')

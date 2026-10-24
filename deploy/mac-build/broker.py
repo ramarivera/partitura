@@ -19,6 +19,8 @@ import time
 CONFIG = Path('/Library/Partitura/NativeBuild/config.json')
 MAX_BUNDLE = 1024 * 1024 * 1024
 MAX_ARTIFACT = 2 * MAX_BUNDLE
+ARTIFACT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+ARTIFACT_STORAGE_LIMIT = 8 * MAX_BUNDLE
 JOB = r'[a-f0-9]{32}'
 COMMIT = r'[a-f0-9]{40}'
 RUN = re.compile(rf'run ({JOB}) ({COMMIT}) ([1-9][0-9]{{0,7}}) ([a-z][a-z0-9-]{{0,63}}) ([1-9][0-9]{{0,9}})')
@@ -174,6 +176,34 @@ def record(directory, **receipt):
     durable_write(directory / 'receipt.json', json.dumps(receipt) + '\n')
 
 
+def prune_artifacts(root, now=None):
+    """Caller holds runner.lock. Keep receipts and reserve space for the next job."""
+    cutoff = (time.time() if now is None else now) - ARTIFACT_RETENTION_SECONDS
+    candidates = []
+    for directory in root.iterdir():
+        if not re.fullmatch(JOB, directory.name) or directory.is_symlink() or not directory.is_dir():
+            continue
+        receipt_path = directory / 'receipt.json'
+        artifact = directory / 'artifacts.tar'
+        if receipt_path.is_symlink() or not receipt_path.is_file() or not artifact.exists():
+            continue
+        receipt = json.loads(receipt_path.read_text())
+        if receipt.get('state') not in ('succeeded', 'failed', 'cancelled'):
+            continue
+        info = artifact.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError('unsafe retained artifact')
+        candidates.append((info.st_mtime, artifact, info.st_size, receipt))
+    retained = 0
+    for modified, artifact, size, receipt in sorted(candidates, key=lambda item: item[0], reverse=True):
+        if modified < cutoff or receipt['state'] != 'succeeded' or retained + size > ARTIFACT_STORAGE_LIMIT - MAX_ARTIFACT:
+            artifact.unlink()
+            receipt['artifactExpired'] = True
+            record(artifact.parent, **receipt)
+        else:
+            retained += size
+
+
 def environment_for(config):
     return {'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'TART_HOME': config['tartHome'], 'TART_NO_AUTO_PRUNE': '1'}
 
@@ -240,6 +270,7 @@ def run_job(config, request):
         cancelled = root / (job + '.cancel')
         if cancelled.exists():
             raise ValueError('native job was cancelled before submission')
+        prune_artifacts(root)
         directory.mkdir(mode=0o700)
         record(directory, job=job, commit=commit, action=action, state='receiving')
         bundle = directory / 'source.bundle'
@@ -319,6 +350,8 @@ def run_job(config, request):
             if cleanup_failed:
                 (root / 'cleanup-required').write_text(vm + '\n')
                 receipt.update(state='failed', cause='cleanup-required')
+            if receipt['state'] != 'succeeded':
+                (directory / 'artifacts.tar').unlink(missing_ok=True)
             record(directory, **receipt)
             bundle.unlink(missing_ok=True)
         print(json.dumps(receipt))

@@ -170,6 +170,14 @@ new jobs until recovery establishes that the clone is gone. Host power loss
 requires recovery after the host returns. The gateway records ownership and
 cancels its interrupted jobs during restart recovery.
 
+Before each new job, the host prunes terminal artifact archives older than seven
+days and the oldest archives needed to leave at most 6 GiB of retained output.
+The next job can add at most 2 GiB, bounding retained archives to 8 GiB. Failed
+jobs remove partial archives immediately. Receipts stay available for status
+queries and record `artifactExpired` when pruning removes their archive. An
+already-open artifact transfer can finish after its archive is unlinked. Pruning
+holds the job lock and never removes a running job's output or VM recovery fences.
+
 ## Acceptance
 
 After approved installation, verify account and SSH restrictions, exact installed
