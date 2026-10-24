@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# Docker invokes the distribution's iptables helpers from /usr/sbin.
+export PATH="$PATH:/usr/sbin:/sbin"
+
 data_root=${DOCKER_DATA_ROOT:-/workspace/.omp-home/docker}
 worker_uid=${PARTITURA_WORKER_UID:-}
 mise_data=${MISE_DATA_DIR:-/mise}
