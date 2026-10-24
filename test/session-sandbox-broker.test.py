@@ -222,6 +222,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("HTTP_PROXY=http://172.19.0.1:3128", joined)
         self.assertIn("HTTPS_PROXY=http://172.19.0.1:3128", joined)
         self.assertIn("PARTITURA_WORKER_UID=1003", joined)
+        self.assertIn("DOCKER_DATA_ROOT=/var/lib/docker", joined)
         self.assertIn("SYSBOX_HONOR_CAPS=FALSE", joined)
         self.assertIn("src=" + str(workspace), joined)
         self.assertIn("src=partitura-mise-session-3,dst=/mise,readonly=false", joined)

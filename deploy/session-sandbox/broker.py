@@ -440,6 +440,8 @@ def _sysbox_provision(request: dict[str, Any]) -> dict[str, Any]:
                 "SYSBOX_HONOR_CAPS=FALSE",
                 "--env",
                 f"PARTITURA_WORKER_UID={worker_uid}",
+                "--env",
+                "DOCKER_DATA_ROOT=/var/lib/docker",
                 "--security-opt=no-new-privileges",
                 "--env",
                 f"HTTP_PROXY={egress_proxy}",
