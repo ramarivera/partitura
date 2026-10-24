@@ -1,0 +1,13 @@
+.git
+.beads
+node_modules
+dist
+coverage
+.env
+.env.*
+*.sqlite
+*.sqlite-*
+*.log
+workspaces
+data
+logs
