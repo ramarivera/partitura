@@ -169,10 +169,11 @@ The API needs only `orchestration:read` and `orchestration:operate` scopes.
 
 ## Gaps
 
-- Linear host tools (`linear_get_issue`, `linear_create_comment`, ...) aren't
-  available to T3 agents. Activity, plans, questions and the PR link are
-  projected without them. Exposing them needs a gateway MCP endpoint with a
-  per-session bearer (bead `sym-gmy.6`).
+- Launched T3 agents receive Linear tools and `github_create_pull_request`
+  through a gateway MCP endpoint with a per-session bearer. Git pushes use the
+  session's Git broker. These paths require live qualification alongside the
+  selected provider and sandbox; a passing contract test alone doesn't prove
+  an agent can complete the workflow.
 - Organization MCP servers configured for OMP workers aren't rendered into T3
   provider settings yet.
 - Native same-uid mode (no `WORKER_UID_BASE`) runs each daemon with a private
