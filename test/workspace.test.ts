@@ -491,88 +491,99 @@ describe("Workspace", () => {
       }),
   );
 
-  it.live("refreshes GitHub credentials when reusing a workspace", () =>
-    Effect.gen(function* () {
-      const fixture = yield* gitFixture;
-      const id = sessionId("github-reuse-refresh");
-      const record = repositoryRecord({
-        id: "github-reuse-refresh",
-        url: "https://github.com/octo-org/private-repo.git",
-      });
-      yield* fixtureIo("workspace root creation", () =>
-        mkdir(fixture.workspaceRoot, { recursive: true }),
-      );
-      const target = join(fixture.workspaceRoot, safeSessionKey(id));
-      yield* fixtureIo("workspace target creation", () => mkdir(target));
-      yield* runGit(["init"], target);
-      yield* runGit(
-        [
-          "config",
-          "--local",
-          "http.https://github.com/.extraheader",
-          buildGitHubExtraHeader("stale-token"),
-        ],
-        target,
-      );
-      yield* runGit(
-        [
-          "config",
-          "--local",
-          "--add",
-          "http.https://github.com/.extraheader",
-          "X-User: retained",
-        ],
-        target,
-      );
-      yield* fixtureIo("workspace marker creation", () =>
-        writeFile(
-          join(target, MARKER_FILE),
-          JSON.stringify({
-            repositoryId: record.id,
-            url: record.url,
-            ref: record.ref,
-          }),
-        ),
-      );
-      let tokenCalls = 0;
-      const workspace = yield* makeWorkspace({
-        workspaceRoot: fixture.workspaceRoot,
-        repo: { listRepositories: () => Effect.succeed([]) },
-        githubApp: {
-          getBotIdentity: () =>
-            Effect.succeed({
-              name: "test-app[bot]",
-              email: "98765+test-app[bot]@users.noreply.github.com",
+  it.live(
+    "removes stale gateway GitHub credentials when reusing a workspace",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const id = sessionId("github-reuse-refresh");
+        const record = repositoryRecord({
+          id: "github-reuse-refresh",
+          url: "https://github.com/octo-org/private-repo.git",
+        });
+        yield* fixtureIo("workspace root creation", () =>
+          mkdir(fixture.workspaceRoot, { recursive: true }),
+        );
+        const target = join(fixture.workspaceRoot, safeSessionKey(id));
+        yield* fixtureIo("workspace target creation", () => mkdir(target));
+        yield* runGit(["init"], target);
+        yield* runGit(
+          [
+            "config",
+            "--local",
+            "http.https://github.com/.extraheader",
+            buildGitHubExtraHeader("stale-token"),
+          ],
+          target,
+        );
+        yield* runGit(
+          [
+            "config",
+            "--local",
+            "--add",
+            "http.https://github.com/.extraheader",
+            "X-User: retained",
+          ],
+          target,
+        );
+        yield* fixtureIo("workspace marker creation", () =>
+          writeFile(
+            join(target, MARKER_FILE),
+            JSON.stringify({
+              repositoryId: record.id,
+              url: record.url,
+              ref: record.ref,
             }),
-          getInstallationToken: () => {
-            tokenCalls += 1;
-            return Effect.succeed("fresh-token");
+          ),
+        );
+        let tokenCalls = 0;
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({
+                name: "test-app[bot]",
+                email: "98765+test-app[bot]@users.noreply.github.com",
+              }),
+            getInstallationToken: () => {
+              tokenCalls += 1;
+              return Effect.succeed("fresh-token");
+            },
           },
-        },
-      });
-      yield* workspace.materialize(id, record);
-      expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
-      expect(yield* readGitConfig("user.email", target)).toBe(
-        "98765+test-app[bot]@users.noreply.github.com",
-      );
-      yield* runGit(["commit", "--allow-empty", "-m", "worker commit"], target);
-      yield* runGit(["config", "--local", "--unset", "user.email"], target);
-      yield* workspace.materialize(id, record);
-      expect(yield* readGitConfig("user.email", target)).toBe(
-        "98765+test-app[bot]@users.noreply.github.com",
-      );
-      yield* runGit(["config", "--local", "--unset", "user.name"], target);
-      yield* workspace.refreshGitHubExtraHeader(id, record, target);
-      expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
-      expect(tokenCalls).toBe(3);
-      expect(
-        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
-      ).toEqual(["X-User: retained", buildGitHubExtraHeader("fresh-token")]);
-      yield* workspace.clearGitHubExtraHeader(id, target);
-      expect(
-        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
-      ).toEqual(["X-User: retained"]);
-    }),
+        });
+        yield* workspace.materialize(id, record);
+        expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
+        expect(yield* readGitConfig("user.email", target)).toBe(
+          "98765+test-app[bot]@users.noreply.github.com",
+        );
+        yield* runGit(
+          ["commit", "--allow-empty", "-m", "worker commit"],
+          target,
+        );
+        yield* runGit(["config", "--local", "--unset", "user.email"], target);
+        yield* workspace.materialize(id, record);
+        expect(yield* readGitConfig("user.email", target)).toBe(
+          "98765+test-app[bot]@users.noreply.github.com",
+        );
+        yield* runGit(["config", "--local", "--unset", "user.name"], target);
+        yield* workspace.refreshGitHubExtraHeader(id, record, target);
+        expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
+        expect(tokenCalls).toBe(0);
+        expect(
+          yield* readGitConfigAll(
+            "http.https://github.com/.extraheader",
+            target,
+          ),
+        ).toEqual(["X-User: retained"]);
+        yield* workspace.clearGitHubExtraHeader(id, target);
+        expect(
+          yield* readGitConfigAll(
+            "http.https://github.com/.extraheader",
+            target,
+          ),
+        ).toEqual(["X-User: retained"]);
+      }),
   );
 
   it.live(
@@ -606,14 +617,7 @@ describe("Workspace", () => {
         const refreshed = yield* Effect.result(
           workspace.refreshGitHubExtraHeader(id, record, inner),
         );
-        // Refresh must get past identity setup and stop at credential
-        // persistence, so the assertions below exercise the identity guard.
-        expect(Result.isFailure(refreshed)).toBe(true);
-        if (Result.isFailure(refreshed)) {
-          expect(refreshed.failure.message).toBe(
-            "Could not persist GitHub credential",
-          );
-        }
+        expect(Result.isSuccess(refreshed)).toBe(true);
         expect(yield* readGitConfig("user.name", outer)).toBeUndefined();
         expect(yield* readGitConfig("user.email", outer)).toBeUndefined();
         expect(
@@ -1307,8 +1311,12 @@ it.live(
       expect(clone?.[1]?.env?.GIT_ASKPASS).toBe("");
       expect(clone?.[1]?.env).not.toHaveProperty("LINEAR_CLIENT_SECRET");
       expect(
-        yield* readGitConfig("http.https://github.com/.extraheader", target),
-      ).toBe(header);
+        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
+      ).toEqual([]);
+      const fetch = calls.find(
+        ([command]) => Array.isArray(command) && command.includes("fetch"),
+      );
+      expect(fetch?.[1]?.env?.GIT_CONFIG_VALUE_0).toBe(header);
     }),
 );
 

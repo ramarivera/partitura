@@ -58,6 +58,12 @@ import { openDriverWorker } from "../drivers/worker-adapter.js";
 import { GatewayConfig, type T3LaunchConfig } from "./config.js";
 import { GitHubApp } from "./github-app.js";
 import { LinearGateway, type LinearIssue } from "./linear-gateway.js";
+import { startLinearMcpServer } from "./linear-mcp-server.js";
+import {
+  LINEAR_WORKSPACE_MUTATIONS,
+  LINEAR_WORKSPACE_TOOLS,
+  type LinearWorkspaceMutation,
+} from "./linear-workspace-tools.js";
 import {
   removeMcpConfig,
   resolveEffectiveMcpServers,
@@ -1765,25 +1771,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         yield* projector.projectRpcEvent(sessionId, sequence, event);
       });
 
-      const registerLinearHostTools = Effect.fn(
-        "SessionAuthority.registerLinearHostTools",
-      )(function* (
+      const linearHostToolsForRun = (
         run: AgentRun,
-        worker: RpcWorkerHandle,
-        workspacePath: string,
-        workerUid: string | undefined,
-      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
-        if (
-          worker.driverSession?.capabilities.hostTools !== undefined &&
-          worker.driverSession.capabilities.hostTools !== "inline"
-        )
-          return;
-        if (
-          typeof worker.onHostToolCall !== "function" ||
-          typeof worker.setHostTools !== "function"
-        ) {
-          return;
-        }
+        workspacePath?: string,
+        workerUid?: string,
+      ) => {
         const textResult = (
           text: string,
           details?: unknown,
@@ -1794,6 +1786,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           ...(isError ? { isError: true } : {}),
         });
         const linearDefinitions: ReadonlyArray<RpcHostToolDefinition> = [
+          ...LINEAR_WORKSPACE_TOOLS,
           {
             name: "linear_get_issue",
             label: "Linear: get issue",
@@ -1923,7 +1916,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               ] satisfies ReadonlyArray<RpcHostToolDefinition>)),
         ];
 
-        yield* worker.onHostToolCall((request: RpcHostToolCall) =>
+        const handler = (request: RpcHostToolCall) =>
           Effect.gen(function* () {
             const fail = (message: string) =>
               textResult(message, undefined, true);
@@ -2036,11 +2029,64 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             const mutating =
               request.toolName === "linear_create_comment" ||
               request.toolName === "linear_update_issue" ||
-              request.toolName === "linear_add_external_url";
+              request.toolName === "linear_add_external_url" ||
+              request.toolName === "linear_workspace_write";
             const linear = linearOption.value;
             const dispatch: Effect.Effect<RpcHostToolResult, never, never> =
               Effect.gen(function* () {
                 switch (request.toolName) {
+                  case "linear_workspace_read": {
+                    const operation = raw.operation;
+                    if (typeof operation !== "string")
+                      return fail("operation must be a string");
+                    if (!record(raw.input))
+                      return fail("input must be an object");
+                    return yield* linear
+                      .workspaceRead({
+                        sessionId: run.sessionId,
+                        operation,
+                        input: raw.input,
+                      })
+                      .pipe(
+                        Effect.map((data) =>
+                          textResult(JSON.stringify(data), data),
+                        ),
+                        Effect.catch(() =>
+                          Effect.succeed(
+                            fail("Unable to read Linear workspace"),
+                          ),
+                        ),
+                      );
+                  }
+                  case "linear_workspace_write": {
+                    const operation = raw.operation;
+                    if (
+                      typeof operation !== "string" ||
+                      !Object.hasOwn(LINEAR_WORKSPACE_MUTATIONS, operation)
+                    )
+                      return fail(
+                        "operation is not an allowed Linear workspace write",
+                      );
+                    if (!record(raw.input))
+                      return fail("input must be an object");
+                    return yield* linear
+                      .workspaceWrite({
+                        sessionId: run.sessionId,
+                        operation: operation as LinearWorkspaceMutation,
+                        ...(raw.id === undefined ? {} : { id: raw.id }),
+                        input: raw.input,
+                      })
+                      .pipe(
+                        Effect.map((data) =>
+                          textResult(JSON.stringify(data), data),
+                        ),
+                        Effect.catch(() =>
+                          Effect.succeed(
+                            fail("Unable to write Linear workspace"),
+                          ),
+                        ),
+                      );
+                  }
                   case "linear_get_issue": {
                     const requested = raw.issueId;
                     if (
@@ -2220,8 +2266,35 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 isError: true,
               }),
             ),
-          ),
+          );
+        return { definitions, handler };
+      };
+
+      const registerLinearHostTools = Effect.fn(
+        "SessionAuthority.registerLinearHostTools",
+      )(function* (
+        run: AgentRun,
+        worker: RpcWorkerHandle,
+        workspacePath: string,
+        workerUid: string | undefined,
+      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
+        if (
+          worker.driverSession?.capabilities.hostTools !== undefined &&
+          worker.driverSession.capabilities.hostTools !== "inline"
+        )
+          return;
+        if (
+          typeof worker.onHostToolCall !== "function" ||
+          typeof worker.setHostTools !== "function"
+        ) {
+          return;
+        }
+        const { definitions, handler } = linearHostToolsForRun(
+          run,
+          workspacePath,
+          workerUid,
         );
+        yield* worker.onHostToolCall(handler);
         // Host-tool registration is part of the worker contract. A failure
         // must fail startup rather than silently running without Linear tools.
         yield* worker.setHostTools(definitions);
@@ -2565,6 +2638,22 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               claudeExecutable: launch.claudeExecutable,
             });
             const cliproxyApiBaseUrl = config.cliproxyApiBaseUrl;
+            const linearTools = linearHostToolsForRun(run, cwd, uid);
+            const linearMcp = startLinearMcpServer({
+              tools: linearTools.definitions,
+              call: ({ toolName, arguments: toolArguments }) => {
+                const toolCallId = randomUUID();
+                return runPromise(
+                  linearTools.handler({
+                    id: toolCallId,
+                    toolCallId,
+                    toolName,
+                    arguments: toolArguments,
+                  }),
+                );
+              },
+            });
+            mcpProxies.set(run.sessionId, linearMcp.stop);
             // Preparation may outlive a lease. Fence again before creating a process.
             yield* updateRun(run.sessionId, {});
             driver = launchedT3Driver(
@@ -2586,6 +2675,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   launch,
                   runtimeMode: t3Config.runtimeMode,
                   defaultModel: modelSelection,
+                  linearMcp,
                 }),
                 writeSettings: (settings) =>
                   workspaceProcess(cwd, "t3-config", settings).then(

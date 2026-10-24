@@ -28,6 +28,7 @@ import {
   GitHubApp,
   type GitHubAppTokenService,
 } from "./github-app.js";
+import { startGitHubGitBroker } from "./github-git-broker.js";
 import { detachedProcessGroup, signalProcessTree } from "./process.js";
 import { WorkspaceRepo } from "./store/repositories.js";
 import {
@@ -958,23 +959,64 @@ export const makeWorkspace = (input: {
       "Workspace.refreshGitHubExtraHeader",
     )(function* (
       sessionId: string,
-      repository: RepositoryRecord,
+      _repository: RepositoryRecord,
       target: string,
     ): Effect.fn.Return<void, WorkspaceError> {
-      const githubExtraHeader =
+      yield* configureGitIdentity(sessionId, target);
+      // Installation tokens stay in the gateway. Workers get a session-bound
+      // Git broker URL at launch, never a credential in repository config.
+      yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
+    });
+
+    const openGitBroker = Effect.fn("Workspace.openGitBroker")(function* (
+      sessionId: string,
+      repository: RepositoryRecord,
+      bindHost?: string,
+    ) {
+      if (!isHttpsGitHubRepositoryUrl(repository.url)) return undefined;
+      const candidate = parseRepositorySuggestionCandidate(repository.url);
+      if (
+        candidate === null ||
+        candidate.hostname.toLowerCase() !== "github.com"
+      )
+        return undefined;
+      const [owner, repositoryName] = candidate.repositoryFullName.split("/");
+      if (!owner || !repositoryName) return undefined;
+      const token =
         input.githubApp === undefined
           ? undefined
-          : yield* mintGitHubExtraHeader(
-              input.githubApp,
-              repository,
-              sessionId,
-            );
-      yield* configureGitIdentity(sessionId, target);
-      if (githubExtraHeader === undefined) {
-        yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
-        return;
-      }
-      yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
+          : yield* input.githubApp
+              .getInstallationToken(
+                owner,
+                repositoryName,
+                repository.organizationId,
+              )
+              .pipe(
+                Effect.catch((error) =>
+                  error.reason === "not_installed"
+                    ? Effect.succeed(undefined)
+                    : Effect.fail(
+                        workspaceFailure(
+                          "Could not acquire GitHub installation credentials",
+                          "git_failed",
+                          sessionId,
+                        )(error),
+                      ),
+                ),
+              );
+      return yield* Effect.try({
+        try: () =>
+          startGitHubGitBroker({
+            repository,
+            ...(token === undefined ? {} : { token }),
+            ...(bindHost === undefined ? {} : { bindHost }),
+          }),
+        catch: workspaceFailure(
+          "Could not start GitHub Git broker",
+          "git_failed",
+          sessionId,
+        ),
+      });
     });
 
     const configureGitIdentity = Effect.fn("Workspace.configureGitIdentity")(
@@ -1259,20 +1301,13 @@ export const makeWorkspace = (input: {
                 sessionId,
               ),
             });
-          if (githubExtraHeader !== undefined) {
-            yield* persistGitHubExtraHeader(
-              staging,
-              sessionId,
-              githubExtraHeader,
-            );
-          }
-          // If anything after persisting the header fails, drop it so the next
-          // attempt doesn't inherit a stale/expired credential.
           yield* Effect.gen(function* () {
-            yield* git(
+            yield* runGit(
               ["fetch", "--depth=1", "--", "origin", repository.ref],
               staging,
               sessionId,
+              input.gitTimeoutMs,
+              githubExtraHeader,
             );
             yield* git(
               ["checkout", "--detach", "--force", "FETCH_HEAD", "--"],
@@ -1285,17 +1320,7 @@ export const makeWorkspace = (input: {
               repository,
               sessionId,
             );
-          }).pipe(
-            Effect.onError(() =>
-              githubExtraHeader === undefined
-                ? Effect.void
-                : unsetGitHubExtraHeader(
-                    staging,
-                    sessionId,
-                    input.gitTimeoutMs,
-                  ),
-            ),
-          );
+          });
 
           yield* Effect.tryPromise({
             try: () => rename(staging, target),
@@ -1339,6 +1364,7 @@ export const makeWorkspace = (input: {
       resolve,
       materialize,
       refreshGitHubExtraHeader,
+      openGitBroker,
       clearGitHubExtraHeader,
     };
   });

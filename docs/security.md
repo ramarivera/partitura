@@ -26,14 +26,14 @@ An absent list grants nobody gateway-wide cache administration.
 
 Repository URLs must be canonical `https://github.com/owner/repo` URLs, optionally
 ending in `.git`. Convert existing SSH/local/non-GitHub repository records before
-running them. GitHub tokens use Git environment configuration during clone, and
-mode-0600 local Git configuration for worker access, never command arguments.
-The worker can read that repository-scoped installation token, which GitHub
-expires after one hour. This is intentional for authenticated worker Git
-operations. It is not the GitHub App private key or an organization-wide token.
-Hiding a token from code that can invoke authenticated Git requires a separate
-Git broker, which this design doesn't provide. Gateway header refresh and
-terminal cleanup remove only generated values and retain user-installed headers.
+running them. Gateway-side clone and fetch commands receive the repository token
+through process environment and never persist it in the checkout. Worker Git
+requests go through a per-session broker bound to that one repository. The broker
+keeps the GitHub installation token in gateway memory, accepts only Git smart-HTTP
+upload and receive-pack paths, rejects redirects, and caps request and response
+bodies. Workers receive a random session URL for the broker, not the GitHub token.
+The session broker stops with its worker; the host relay must route its fixed Git
+service to that listener and deny direct worker access to GitHub.
 
 ## Docker worker identity
 
@@ -62,9 +62,9 @@ MCP configuration is projected to its generated `mcpServers` fields before helpe
 stdin is serialized. OAuth client records and renewal fields never cross that uid
 boundary. Agent database inputs are empty for gateway-managed OAuth servers.
 Generated MCP configuration contains only a loopback URL and the worker session's
-proxy bearer; upstream access tokens stay in the gateway. Git persistence sends
-only the repository-scoped header string on stdin, never argv; cleanup operations
-carry no credential payload.
+proxy bearer; upstream access tokens stay in the gateway. The Git relay carries
+only the session-bound broker URL. It never receives an installation token from
+the worker.
 
 Retention removes workspace contents as the worker uid while holding its synchronous
 SQLite reopen fence. Before delegation, the gateway migrates legacy ownership with
