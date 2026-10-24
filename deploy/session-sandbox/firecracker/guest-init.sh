@@ -33,7 +33,9 @@ shutdown() {
   wait "$docker_pid" 2>/dev/null || true
   wait "$agent_pid" 2>/dev/null || true
   sync
-  python3 -c 'import ctypes; ctypes.CDLL(None).reboot(0x4321fedc)'
+  # reboot=k exits Firecracker through its emulated keyboard controller.
+  # POWER_OFF falls back to a halted CPU with this guest's minimal kernel.
+  python3 -c 'import ctypes; ctypes.CDLL(None).reboot(0x01234567)'
 }
 trap shutdown TERM INT HUP
 # PID 1 reaps daemon children. Losing either control plane or Docker ends the VM.
