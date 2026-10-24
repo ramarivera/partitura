@@ -105,9 +105,15 @@ class FirecrackerTests(unittest.IsolatedAsyncioTestCase):
         (base / "workspace").mkdir(parents=True)
         (base / "server").write_text("immutable executable")
         vm.save("test-session", self.record)
-        with patch.object(vm, "SFTP_ROOT", str(base)):
-            vm.prepare_sftp_jail("test-session")
+        previous_umask = os.umask(0o077)
+        try:
+            with patch.object(vm, "SFTP_ROOT", str(base)):
+                vm.prepare_sftp_jail("test-session")
+        finally:
+            os.umask(previous_umask)
         jail = vm.sftp_jail("test-session")
+        self.assertEqual((jail / "etc").stat().st_mode & 0o777, 0o755)
+        self.assertEqual((jail / "dev").stat().st_mode & 0o777, 0o755)
         self.assertIn("partitura:x:1001:1001:", (jail / "etc/passwd").read_text())
         self.assertEqual((jail / "etc/group").read_text(), "partitura:x:1001:\n")
         self.assertEqual((jail / "server").stat().st_ino, (base / "server").stat().st_ino)

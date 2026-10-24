@@ -285,6 +285,7 @@ def prepare_sftp_jail(session: str) -> None:
     shutil.copytree(SFTP_ROOT, jail, copy_function=share_sftp_file)
     etc = jail / "etc"
     etc.mkdir(mode=0o755, exist_ok=True)
+    os.chmod(etc, 0o755)  # Broker UMask=0077 must not block the session uid.
     # OpenSSH requires getpwuid even for a keyless, stdio-only SFTP server.
     # This private NSS record never changes host accounts or SSH settings.
     (etc / "passwd").write_text(f"partitura:x:{uid}:{uid}:Partitura session:/workspace:/sbin/nologin\n")
@@ -294,6 +295,7 @@ def prepare_sftp_jail(session: str) -> None:
     # OpenSSH opens /dev/null before serving even in stdio mode. systemd binds
     # its private null device here; no host device tree enters the jail.
     (jail / "dev").mkdir(mode=0o755)
+    os.chmod(jail / "dev", 0o755)
     (jail / "dev/null").touch(mode=0o600)
 
 
