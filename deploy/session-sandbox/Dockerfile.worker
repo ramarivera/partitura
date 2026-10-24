@@ -56,7 +56,7 @@ ARG T3_VERSION=0.1.2
 ARG CODEX_VERSION=0.156.1
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PATH="/opt/partitura/bin:/mise/shims:/mise/bin:/opt/t3:/opt/codex/bin:/opt/claude/bin:/usr/local/bin:/usr/bin:/bin"
+ENV PATH="/mise/shims:/mise/bin:/opt/partitura/bin:/opt/t3:/opt/codex/bin:/opt/claude/bin:/usr/local/bin:/usr/bin:/bin"
 ENV DOCKER_HOST=unix:///run/docker.sock
 ENV DOCKER_DATA_ROOT=/workspace/.omp-home/docker
 ENV MISE_DATA_DIR=/mise

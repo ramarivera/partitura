@@ -211,6 +211,36 @@ describe("T3 launcher pure parts", () => {
       },
     });
   });
+
+  it.live(
+    "writes sandbox provider settings into the gateway-owned workspace",
+    () =>
+      Effect.promise(async () => {
+        const cwd = workspaceFor("sandbox-settings");
+        const rendered = renderT3LaunchSettings({
+          cwd: "/workspace",
+          cliproxyApiBaseUrl: "https://cliproxyapi.example.test",
+          launch: launchConfig("t3"),
+          runtimeMode: "auto",
+          defaultModel: { instanceId: "codex-cliproxy", model: "gpt-6-sol" },
+        });
+        await workspaceProcess(cwd, "t3-config", rendered);
+        const paths = t3SessionPaths(cwd);
+        const settings = JSON.parse(
+          readFileSync(join(paths.t3Home, "userdata", "settings.json"), "utf8"),
+        );
+        expect(
+          settings.providerInstances["codex-cliproxy"].config.homePath,
+        ).toBe("/workspace/.omp-home/t3/codex-cliproxy");
+        expect(
+          settings.providerInstances["claude-cliproxy"].config.homePath,
+        ).toBe("/workspace/.omp-home/t3/claude-cliproxy");
+        expect(readFileSync(join(paths.codexHome, "config.toml"), "utf8")).toBe(
+          rendered.codexConfig,
+        );
+        expect(JSON.stringify(settings)).not.toContain(cwd);
+      }),
+  );
 });
 
 describe("T3 launcher lifecycle", () => {

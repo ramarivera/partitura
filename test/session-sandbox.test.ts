@@ -31,7 +31,7 @@ describe("session sandbox", () => {
       }),
     ).toEqual({
       HOME: "/workspace/.omp-home",
-      PATH: "/mise/shims:/mise/bin:/usr/local/bin:/opt/claude/bin:/opt/codex/bin:/opt/t3:/usr/bin:/bin",
+      PATH: "/mise/shims:/mise/bin:/opt/partitura/bin:/usr/local/bin:/opt/claude/bin:/opt/codex/bin:/opt/t3:/usr/bin:/bin",
       MISE_DATA_DIR: "/mise",
       MISE_CACHE_DIR: "/mise/cache",
       MISE_CONFIG_DIR: "/workspace/.omp-home/mise/config",

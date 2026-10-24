@@ -2288,6 +2288,95 @@ describe("SessionAuthority host-tool mutation gate", () => {
       ).pipe(Effect.ensuring(Effect.sync(() => fetchMock.mockRestore())));
     },
   );
+  it.live("retries native recovery after the build host reconnects", () => {
+    const root = testPath("native-recovery");
+    const scratch = join(root, "jobs");
+    const ssh = join(root, "ssh");
+    const configFile = join(root, "ssh_config");
+    const job = "b".repeat(32);
+    return withAuthority(
+      () =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await chmod(root, 0o700);
+            await mkdir(scratch, { mode: 0o700 });
+            await writeFile(configFile, "# private transport fixture\n", {
+              mode: 0o600,
+            });
+            await writeFile(
+              ssh,
+              '#!/bin/sh\n[ -f "$(dirname "$0")/online" ] || exit 1\nexit 0\n',
+              { mode: 0o700 },
+            );
+            await writeFile(
+              join(scratch, `${job}.json`),
+              JSON.stringify({
+                job,
+                sessionId: testSessionId,
+                commit: "a".repeat(40),
+                action: "test",
+                state: "running",
+              }),
+              { mode: 0o600 },
+            );
+          });
+          const authority = yield* SessionAuthority;
+          const installations = yield* InstallationRepo;
+          const runs = yield* RunRepo;
+          yield* installations.put(install(testOrganizationId));
+          yield* runs.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runs.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some(testPath("native-recovery-workspace")),
+            ompSessionFile: Option.some(
+              testPath("native-recovery-workspace/session.jsonl"),
+            ),
+          });
+          yield* authority.processSession(testSessionId);
+          const listener = hostToolListener;
+          if (listener === undefined)
+            throw new Error("host tool listener missing");
+          const request = {
+            id: "native-status",
+            toolCallId: "native-status",
+            toolName: "native_build_status",
+            arguments: { job },
+          };
+          expect((yield* listener(request)).isError).toBe(true);
+          yield* Effect.promise(() => writeFile(join(root, "online"), ""));
+          const recovered = yield* listener(request);
+          expect(recovered.isError).not.toBe(true);
+          expect(recovered.content).toMatchObject([
+            {
+              type: "text",
+              text: expect.stringContaining('"state":"interrupted"'),
+            },
+          ]);
+          const persisted = yield* Effect.promise(() =>
+            readFile(join(scratch, `${job}.json`), "utf8"),
+          );
+          expect(JSON.parse(persisted)).toMatchObject({
+            sessionId: testSessionId,
+            state: "interrupted",
+          });
+        }),
+      {
+        configOverride: (config) => ({
+          ...config,
+          nativeBuild: {
+            sshConfigFile: configFile,
+            scratchRoot: scratch,
+            sshExecutable: ssh,
+          },
+        }),
+      },
+    );
+  });
+
   it.live("refuses native build mutations after stop", () =>
     withAuthority(
       () =>

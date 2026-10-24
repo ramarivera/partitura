@@ -470,9 +470,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         const nativeBuild: NativeBuildConfig | undefined = config.nativeBuild;
         if (nativeBuild === undefined)
           return Promise.reject(new Error("Native build tools are disabled"));
-        nativeBuildClientPromise ??= import("./native-build-client.js").then(
-          ({ createNativeBuildClient }) => createNativeBuildClient(nativeBuild),
-        );
+        nativeBuildClientPromise ??= import("./native-build-client.js")
+          .then(({ createNativeBuildClient }) =>
+            createNativeBuildClient(nativeBuild),
+          )
+          .catch((error: unknown) => {
+            nativeBuildClientPromise = undefined;
+            throw error;
+          });
         return nativeBuildClientPromise;
       };
       const sandboxRuntime =
@@ -3049,7 +3054,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   ),
                 ),
                 settings: renderT3LaunchSettings({
-                  cwd,
+                  cwd: sandbox?.handle.workspace ?? cwd,
                   cliproxyApiBaseUrl,
                   launch,
                   runtimeMode: effective.runtimeMode,
