@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 SOURCE = Path(__file__).resolve().parents[1] / "deploy/session-sandbox/broker.py"
 spec = importlib.util.spec_from_file_location("session_sandbox_broker", SOURCE)
@@ -43,6 +43,35 @@ class CaptureWriter:
 
 
 class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exec_rejects_worker_uid_mismatch_before_creating_exec(self):
+        inspect = AsyncMock(
+            return_value={
+                "Config": {
+                    "Labels": {
+                        "partitura.session": "session-1",
+                        "partitura.worker_uid": "1001",
+                    }
+                }
+            }
+        )
+        with patch.object(broker, "_docker_api_json", new=inspect):
+            with self.assertRaisesRegex(ValueError, "worker uid does not match"):
+                await broker._stream_exec(
+                    asyncio.StreamReader(),
+                    CaptureWriter(),
+                    {
+                        "sessionId": "session-1",
+                        "workerUid": "1002",
+                        "argv": ["/usr/local/bin/omp", "--version"],
+                        "cwd": "/workspace",
+                        "env": {"PATH": "/usr/local/bin:/usr/bin"},
+                    },
+                )
+
+        inspect.assert_awaited_once_with(
+            "GET", "/containers/partitura-session-session-1/json"
+        )
+
     def test_provision_uses_limits_proxy_and_only_the_session_worker_socket(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
             workspace = Path(directory) / "session-3"
@@ -165,8 +194,28 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                 request, body = await read_request(reader)
                 requests.append((request, body))
                 if index == 0:
-                    writer.write(http_response("201 Created", b'{"Id":"0123456789abcdef"}'))
+                    self.assertIn(
+                        "GET /v1.41/containers/partitura-session-session-1/json",
+                        request,
+                    )
+                    writer.write(
+                        http_response(
+                            "200 OK",
+                            json.dumps(
+                                {
+                                    "Config": {
+                                        "Labels": {
+                                            "partitura.session": "session-1",
+                                            "partitura.worker_uid": "1001",
+                                        }
+                                    }
+                                }
+                            ).encode(),
+                        )
+                    )
                 elif index == 1:
+                    writer.write(http_response("201 Created", b'{"Id":"0123456789abcdef"}'))
+                elif index == 2:
                     writer.write(
                         b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
                     )
@@ -225,13 +274,13 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(b"O\x00\x00\x00\x12hello from sandbox", client_writer.data)
             self.assertIn(b"E\x00\x00\x00\x0cbuild notice", client_writer.data)
             self.assertTrue(client_writer.data.endswith(b"X\x00\x00\x00\x07"))
-            create_request, create_body = requests[0]
+            create_request, create_body = requests[1]
             self.assertIn("POST /v1.41/containers/partitura-session-session-1/exec", create_request)
             self.assertEqual(json.loads(create_body)["User"], "1001:1001")
             self.assertIn("HTTP_PROXY=http://172.19.0.1:3128", json.loads(create_body)["Env"])
             self.assertIn("T3CODE_HOME=/workspace/.omp-home/t3", json.loads(create_body)["Env"])
-            self.assertIn("POST /v1.41/exec/0123456789abcdef/start", requests[1][0])
-            self.assertIn("GET /v1.41/exec/0123456789abcdef/json", requests[2][0])
+            self.assertIn("POST /v1.41/exec/0123456789abcdef/start", requests[2][0])
+            self.assertIn("GET /v1.41/exec/0123456789abcdef/json", requests[3][0])
 
     async def test_exec_closes_engine_stream_after_a_truncated_frame(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
@@ -245,23 +294,48 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                 connection_number += 1
                 request, _ = await read_request(reader)
                 if current == 0:
+                    self.assertIn(
+                        "GET /v1.41/containers/partitura-session-session-4/json",
+                        request,
+                    )
+                    writer.write(
+                        http_response(
+                            "200 OK",
+                            json.dumps(
+                                {
+                                    "Config": {
+                                        "Labels": {
+                                            "partitura.session": "session-4",
+                                            "partitura.worker_uid": "1004",
+                                        }
+                                    }
+                                }
+                            ).encode(),
+                        )
+                    )
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+                elif current == 1:
                     self.assertIn("POST /v1.41/containers/partitura-session-session-4/exec", request)
                     writer.write(http_response("201 Created", b'{"Id":"abcdef123456"}'))
                     await writer.drain()
                     writer.close()
                     await writer.wait_closed()
                     return
-                self.assertIn("POST /v1.41/exec/abcdef123456/start", request)
-                writer.write(
-                    b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
-                )
-                await writer.drain()
-                await reader.read()
-                writer.write(b"\x01\x00\x00\x00\x00\x00\x00\x03x")
-                await writer.drain()
-                writer.close()
-                await writer.wait_closed()
-                engine_closed.set()
+                else:
+                    self.assertIn("POST /v1.41/exec/abcdef123456/start", request)
+                    writer.write(
+                        b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+                    )
+                    await writer.drain()
+                    await reader.read()
+                    writer.write(b"\x01\x00\x00\x00\x00\x00\x00\x03x")
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    engine_closed.set()
 
             server = await asyncio.start_unix_server(engine, path=socket_path)
             previous_socket = broker.DOCKER_SOCKET
@@ -299,10 +373,34 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                 connection_number += 1
                 request, _ = await read_request(reader)
                 if current == 0:
+                    self.assertIn(
+                        "GET /v1.41/containers/partitura-session-session-5/json",
+                        request,
+                    )
+                    writer.write(
+                        http_response(
+                            "200 OK",
+                            json.dumps(
+                                {
+                                    "Config": {
+                                        "Labels": {
+                                            "partitura.session": "session-5",
+                                            "partitura.worker_uid": "1005",
+                                        }
+                                    }
+                                }
+                            ).encode(),
+                        )
+                    )
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+                elif current == 1:
                     self.assertIn("POST /v1.41/containers/partitura-session-session-5/exec", request)
                     writer.write(http_response("201 Created", b'{"Id":"abcdef123456"}'))
                     await writer.drain()
-                elif current == 1:
+                elif current == 2:
                     self.assertIn("POST /v1.41/exec/abcdef123456/start", request)
                     writer.write(
                         b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"

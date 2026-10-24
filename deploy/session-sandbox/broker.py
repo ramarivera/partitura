@@ -355,6 +355,15 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     }
     if set(env) - allowed_env:
         raise ValueError("environment contains unsupported variables")
+    container_record = await _docker_api_json(
+        "GET", f"/containers/{_container(session)}/json"
+    )
+    container_config = container_record.get("Config")
+    labels = container_config.get("Labels") if isinstance(container_config, dict) else None
+    if not isinstance(labels, dict) or labels.get("partitura.session") != session:
+        raise ValueError("sandbox container session label does not match")
+    if labels.get("partitura.worker_uid") != worker_uid:
+        raise ValueError("sandbox container worker uid does not match")
     exec_record = await _docker_api_json(
         "POST",
         f"/containers/{_container(session)}/exec",
