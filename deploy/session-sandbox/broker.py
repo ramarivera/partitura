@@ -254,6 +254,7 @@ def _docker_mutate(session: str, args: list[str], timeout: float = 60) -> subpro
     if record is None or record["runtime"] != "sysbox":
         raise DockerMutationFenceError("Docker mutation has no lifecycle owner")
     operation_unit = "partitura-docker-" + vm.key(session) + "-" + secrets.token_hex(16) + ".service"
+    config_directory = operation_unit.removesuffix(".service")
     record["dockerOperation"] = {"unit": operation_unit, "completed": False}
     # Persist the intent before the system manager can submit a daemon request.
     _save_docker_owner(session, record)
@@ -264,9 +265,10 @@ def _docker_mutate(session: str, args: list[str], timeout: float = 60) -> subpro
              "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=",
              "--property=PrivateNetwork=yes", "--property=PrivateTmp=yes",
              "--property=ProtectSystem=strict", "--property=ProtectHome=yes",
+             "--property=RuntimeDirectory=" + config_directory, "--property=RuntimeDirectoryMode=0700",
              "--property=RestrictAddressFamilies=AF_UNIX", "--property=TasksMax=64",
              "--property=MemoryMax=256M", "--property=StandardOutput=null", "--property=StandardError=null",
-             DOCKER, "--host", "unix://" + DOCKER_SOCKET, *args],
+             DOCKER, "--config", "/run/" + config_directory, "--host", "unix://" + DOCKER_SOCKET, *args],
             check=True, capture_output=True, text=True, timeout=10,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):

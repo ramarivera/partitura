@@ -807,7 +807,10 @@ class DockerMutationFenceTests(unittest.TestCase):
                 self.assertNotIn("--wait", args)
                 self.assertNotIn("--collect", args)
                 self.assertIn("--property=RemainAfterExit=yes", args)
-                mutation = args[args.index(broker.DOCKER) + 3:]
+                config = "/run/" + operation_unit.removesuffix(".service")
+                self.assertEqual(args[args.index(broker.DOCKER) + 1:args.index(broker.DOCKER) + 5], ["--config", config, "--host", "unix://" + broker.DOCKER_SOCKET])
+                self.assertIn("--property=RuntimeDirectory=" + config.removeprefix("/run/"), args)
+                mutation = args[args.index(broker.DOCKER) + 5:]
                 if mutation[0] == "create":
                     code = "import pathlib,time; time.sleep(.25); pathlib.Path(" + repr(str(marker)) + ").write_text('created')"
                 elif mutation[0] == "rm":
@@ -909,7 +912,7 @@ class DockerMutationFenceTests(unittest.TestCase):
                 owner = broker.vm.load(self.session)
                 self.assertEqual(owner["runtime"], "sysbox")
                 self.assertIn("dockerOperation", owner)
-                mutations.append(args[args.index(broker.DOCKER) + 3:])
+                mutations.append(args[args.index(broker.DOCKER) + 5:])
             elif args[:2] == ["/usr/bin/systemctl", "show"]:
                 return SimpleNamespace(returncode=0, stdout="LoadState=loaded\nSubState=exited\nExecMainCode=1\nExecMainStatus=0\n", stderr="")
             elif args[0] == broker.DOCKER:
@@ -933,7 +936,7 @@ class DockerMutationFenceTests(unittest.TestCase):
                         for field in ("runtime", "workerUid", "workspaceHost"):
                             self.assertEqual(owner[field], self.owner[field])
                         self.assertIn("dockerOperation", owner)
-                        mutations.append(args[args.index(broker.DOCKER) + 3:])
+                        mutations.append(args[args.index(broker.DOCKER) + 5:])
                     elif args[:2] == ["/usr/bin/systemctl", "show"]:
                         return SimpleNamespace(returncode=0, stdout="LoadState=loaded\nSubState=exited\nExecMainCode=1\nExecMainStatus=0\n", stderr="")
                     elif args[0] == broker.DOCKER:

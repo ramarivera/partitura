@@ -305,7 +305,7 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.state_root / (digest + ".machine.json")).exists())
         self.assertFalse((self.state_root / (digest + ".sftp-root")).exists())
         self.assertFalse((self.vm_root / digest).exists())
-        units = await self.run_host(["/usr/bin/systemctl", "list-units", "--all", "--no-legend", "--plain", "partitura-vm-" + digest + "*", "partitura-workspace-" + digest + "*", "partitura-sftp-" + digest + "*"])
+        units = await self.run_host(["/usr/bin/systemctl", "list-units", "--all", "--no-legend", "--plain", "partitura-vm-" + digest + "*", "partitura-workspace-" + digest + "*", "partitura-sftp-" + digest + "*", "partitura-docker-" + digest + "*"])
         self.assertEqual(units.strip(), "", "owned transient systemd units remain")
         for kind in ("container", "network", "volume"):
             options = ["--all"] if kind == "container" else []
