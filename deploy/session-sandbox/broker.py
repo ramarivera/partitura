@@ -12,6 +12,8 @@ import json
 import ipaddress
 import os
 import re
+import shlex
+import sys
 import socket
 import subprocess
 from pathlib import Path
@@ -34,11 +36,64 @@ MEMORY_LIMIT = os.environ.get("PARTITURA_SANDBOX_MEMORY", "8g")
 CPU_LIMIT = os.environ.get("PARTITURA_SANDBOX_CPUS", "4")
 PIDS_LIMIT = int(os.environ.get("PARTITURA_SANDBOX_PIDS", "2048"))
 EGRESS_PROXY_PORT = 3128
+MANAGE_FIREWALL = os.environ.get("PARTITURA_SANDBOX_MANAGE_FIREWALL", "false") == "true"
+IPTABLES = "/usr/bin/iptables"
 EGRESS_HOSTS = frozenset(
     host.strip().lower()
     for host in os.environ.get("PARTITURA_SANDBOX_EGRESS_HOSTS", "").split(",")
     if host.strip()
 )
+
+
+def _firewall_tag() -> str:
+    invocation = os.environ.get("INVOCATION_ID", "")
+    if not re.fullmatch(r"[a-f0-9]{32}", invocation):
+        raise ValueError("managed firewall requires a systemd invocation id")
+    return "partitura-sandbox-" + invocation
+
+
+def _allow_listener(peer: str, address: str, port: int, network: str) -> None:
+    """Allow only this listener's expected peer through the host INPUT chain."""
+    if not MANAGE_FIREWALL:
+        return
+    if not all(ipaddress.ip_address(value).version == 4 for value in (peer, address)):
+        raise ValueError("managed firewall requires IPv4 listener addresses")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError("managed firewall requires a valid listener port")
+    tag = _firewall_tag()
+    metadata = json.loads(_run(["network", "inspect", network]))[0]
+    if metadata.get("Driver") != "bridge" or not re.fullmatch(r"[a-f0-9]{64}", metadata.get("Id", "")):
+        raise ValueError("managed firewall requires a Docker bridge network")
+    bridge = metadata.get("Options", {}).get("com.docker.network.bridge.name") or "br-" + metadata["Id"][:12]
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", bridge):
+        raise ValueError("managed firewall requires a valid bridge interface")
+    subprocess.run(
+        [IPTABLES, "-w", "5", "-I", "INPUT", "1", "-i", bridge, "-p", "tcp",
+         "-s", peer + "/32", "-d", address + "/32", "--dport", str(port),
+         "-m", "comment", "--comment", tag, "-j", "ACCEPT"],
+        check=True, capture_output=True, timeout=10,
+    )
+
+
+def _cleanup_firewall() -> None:
+    """Also runs in ExecStopPost, including after a killed broker request."""
+    if not MANAGE_FIREWALL:
+        return
+    tag = _firewall_tag()
+    result = subprocess.run(
+        [IPTABLES, "-w", "5", "-S", "INPUT"], check=True,
+        capture_output=True, text=True, timeout=10,
+    )
+    for line in result.stdout.splitlines():
+        rule = shlex.split(line)
+        if rule[:2] != ["-A", "INPUT"]:
+            continue
+        if not any(rule[index:index + 2] == ["--comment", tag] for index in range(len(rule) - 1)):
+            continue
+        subprocess.run(
+            [IPTABLES, "-w", "5", "-D", *rule[1:]], check=True,
+            capture_output=True, timeout=10,
+        )
 
 
 def _session(value: Any) -> str:
@@ -563,9 +618,10 @@ async def _stream_relay(
 
     server = await asyncio.start_server(relay_client, relay_ip, 0)
     relay_port = server.sockets[0].getsockname()[1]
-    writer.write((json.dumps({"ok": True, "result": {"address": relay_ip, "port": relay_port}}) + "\n").encode())
-    await writer.drain()
     try:
+        _allow_listener(expected_peer, relay_ip, relay_port, network if target == "gateway" else GATEWAY_NETWORK)
+        writer.write((json.dumps({"ok": True, "result": {"address": relay_ip, "port": relay_port}}) + "\n").encode())
+        await writer.drain()
         # The control socket owns this relay's lifetime. Closing it stops all
         # listeners and active streams before the systemd instance exits.
         await reader.read()
@@ -578,6 +634,7 @@ async def _stream_relay(
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
         await server.wait_closed()
+        _cleanup_firewall()
 
 
 async def _stream_egress(
@@ -673,9 +730,10 @@ async def _stream_egress(
         proxy_client, relay_ip, EGRESS_PROXY_PORT, limit=8192
     )
     proxy_port = server.sockets[0].getsockname()[1]
-    writer.write((json.dumps({"ok": True, "result": {"address": relay_ip, "port": proxy_port}}) + "\n").encode())
-    await writer.drain()
     try:
+        _allow_listener(worker_ip, relay_ip, proxy_port, network)
+        writer.write((json.dumps({"ok": True, "result": {"address": relay_ip, "port": proxy_port}}) + "\n").encode())
+        await writer.drain()
         await reader.read()
     finally:
         server.close()
@@ -686,6 +744,7 @@ async def _stream_egress(
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
         await server.wait_closed()
+        _cleanup_firewall()
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
@@ -732,4 +791,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if sys.argv[1:] == ["--cleanup-firewall"]:
+        _cleanup_firewall()
+    elif sys.argv[1:]:
+        raise SystemExit("unsupported broker arguments")
+    else:
+        asyncio.run(main())

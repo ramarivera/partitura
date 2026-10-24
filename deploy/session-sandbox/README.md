@@ -29,6 +29,17 @@ bridge address. It accepts exact hostnames from
 answer is globally routable. Workers have no direct DNS or Internet route.
 Keep the allowlist to required package and model service hosts.
 
+Host INPUT firewalls can block these listeners even when Docker forwarding works.
+The optional `PARTITURA_SANDBOX_MANAGE_FIREWALL=true` mode creates one IPv4 TCP
+INPUT exception for each listener's exact expected source, bridge address and
+port. It doesn't enable direct Internet routing or grant access to other host
+ports. Each rule carries the owning systemd invocation ID. Closing the control
+connection removes its rule, and `ExecStopPost` repeats cleanup after process
+failure or termination. Other requests' rules and operator rules stay intact.
+This mode requires host-operator approval, the host's existing iptables backend,
+and the service's AF_NETLINK allowance. It defaults to false. A firewall reload
+can remove an active exception; restart affected workers after such a reload.
+
 Before installing these units, the host operator must install and validate the
 Sysbox runtime. Set `PARTITURA_WORKSPACE_ROOT=/app/workspaces` to the gateway
 container's logical workspace root and set `PARTITURA_WORKSPACE_HOST_ROOT` to

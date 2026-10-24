@@ -3,10 +3,12 @@ import asyncio
 import importlib.util
 import json
 import os
+import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 SOURCE = Path(__file__).resolve().parents[1] / "deploy/session-sandbox/broker.py"
 spec = importlib.util.spec_from_file_location("session_sandbox_broker", SOURCE)
@@ -43,6 +45,66 @@ class CaptureWriter:
 
 
 class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
+    def test_firewall_is_opt_in_and_rejects_unowned_invocations(self):
+        with patch.object(broker, "MANAGE_FIREWALL", False), patch.object(broker.subprocess, "run") as run:
+            broker._allow_listener("10.1.2.2", "10.1.2.1", 3128, "partitura-network-session-1")
+            broker._cleanup_firewall()
+            run.assert_not_called()
+        with patch.object(broker, "MANAGE_FIREWALL", True), patch.dict(os.environ, {"INVOCATION_ID": ""}), patch.object(broker.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "systemd invocation"):
+                broker._allow_listener("10.1.2.2", "10.1.2.1", 3128, "partitura-network-session-1")
+            with self.assertRaisesRegex(ValueError, "systemd invocation"):
+                broker._cleanup_firewall()
+            run.assert_not_called()
+
+    def test_firewall_rule_limits_source_destination_and_listener_port(self):
+        with patch.object(broker, "MANAGE_FIREWALL", True), patch.dict(os.environ, {"INVOCATION_ID": "a" * 32}), patch.object(broker, "_run", return_value=json.dumps([{"Driver": "bridge", "Id": "b" * 64, "Options": {}}])), patch.object(broker.subprocess, "run") as run:
+            broker._allow_listener("10.1.2.2", "10.1.2.1", 3128, "partitura-network-session-1")
+            args = run.call_args.args[0]
+            self.assertEqual(args, ["/usr/bin/iptables", "-w", "5", "-I", "INPUT", "1", "-i", "br-" + "b" * 12, "-p", "tcp", "-s", "10.1.2.2/32", "-d", "10.1.2.1/32", "--dport", "3128", "-m", "comment", "--comment", "partitura-sandbox-" + "a" * 32, "-j", "ACCEPT"])
+            for port in (0, 65536, True):
+                with self.assertRaisesRegex(ValueError, "valid listener port"):
+                    broker._allow_listener("10.1.2.2", "10.1.2.1", port, "partitura-network-session-1")
+            with self.assertRaisesRegex(ValueError, "IPv4"):
+                broker._allow_listener("::1", "10.1.2.1", 3128, "partitura-network-session-1")
+            self.assertEqual(run.call_count, 1)
+
+    def test_firewall_cleanup_preserves_other_requests_and_operator_rules(self):
+        tag = "partitura-sandbox-" + "a" * 32
+        own = f'-A INPUT -s 10.1.2.2/32 -d 10.1.2.1/32 -p tcp -m tcp --dport 3128 -m comment --comment "{tag}" -j ACCEPT'
+        rules = "\n".join(["-P INPUT DROP", "-A INPUT -j ufw-before-input", own, own.replace("a" * 32, "b" * 32), own.replace(tag, tag + "-other")])
+        with patch.object(broker, "MANAGE_FIREWALL", True), patch.dict(os.environ, {"INVOCATION_ID": "a" * 32}), patch.object(broker.subprocess, "run", return_value=SimpleNamespace(stdout=rules)) as run:
+            broker._cleanup_firewall()
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0], ["/usr/bin/iptables", "-w", "5", "-S", "INPUT"])
+            delete = run.call_args_list[1].args[0]
+            self.assertEqual(delete[3:5], ["-D", "INPUT"])
+            self.assertIn(tag, delete)
+            self.assertNotIn("ufw-before-input", delete)
+            run.side_effect = subprocess.CalledProcessError(1, ["iptables"])
+            with self.assertRaises(subprocess.CalledProcessError):
+                broker._cleanup_firewall()
+
+    async def test_listener_closes_and_cleans_rules_even_when_firewall_setup_fails(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                reader = asyncio.StreamReader()
+                reader.feed_eof()
+                writer = CaptureWriter()
+                server = SimpleNamespace(sockets=[SimpleNamespace(getsockname=lambda: ("10.1.2.1", 3128, "partitura-network-session-1"))], close=Mock(), wait_closed=AsyncMock())
+                with patch.object(broker, "EGRESS_HOSTS", frozenset(["registry.npmjs.org"])), patch.object(broker, "_run", side_effect=["10.1.2.2", "10.1.2.1"]), patch.object(broker.asyncio, "start_server", new=AsyncMock(return_value=server)), patch.object(broker, "_allow_listener", side_effect=RuntimeError("firewall unavailable") if fail else None) as allow, patch.object(broker, "_cleanup_firewall") as cleanup:
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "firewall unavailable"):
+                            await broker._stream_egress(reader, writer, {"sessionId": "session-1"})
+                        self.assertEqual(writer.data, b"")
+                    else:
+                        await broker._stream_egress(reader, writer, {"sessionId": "session-1"})
+                        self.assertTrue(json.loads(writer.data)["ok"])
+                    allow.assert_called_once_with("10.1.2.2", "10.1.2.1", 3128, "partitura-network-session-1")
+                    cleanup.assert_called_once_with()
+                server.close.assert_called_once_with()
+                server.wait_closed.assert_awaited_once_with()
+
     async def test_engine_json_accepts_chunked_and_eof_delimited_bodies(self):
         body = b'{"Config":{"Labels":{"partitura.session":"session-1"}}}'
         responses = [
