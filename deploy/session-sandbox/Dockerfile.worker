@@ -1,0 +1,86 @@
+# Build this image once, then configure the broker with its sha256 digest.
+# The session container is isolated by Sysbox; its Docker daemon never shares
+# the host Docker socket.
+ARG DOCKER_VERSION=29.9.1
+FROM docker:${DOCKER_VERSION}-dind AS docker
+
+FROM node:26.8.1-bookworm-slim AS node
+
+FROM rust:1.98.1-bookworm AS rust-tools
+ARG MISE_VERSION=2026.10.15
+ARG FNOX_VERSION=1.42.0
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends cmake libudev-dev \
+  && rm -rf /var/lib/apt/lists/*
+RUN cargo install mise --version "${MISE_VERSION}" --locked
+RUN cargo install fnox --version "${FNOX_VERSION}" --locked
+
+FROM oven/bun:1.3.14 AS worker-extensions
+WORKDIR /opt/omp-extensions
+COPY deploy/worker-extensions/package.json deploy/worker-extensions/bun.lock ./
+RUN bun install --frozen-lockfile --production --omit=optional --ignore-scripts
+
+FROM oven/bun:1.3.14 AS app-build
+WORKDIR /app
+COPY package.json bun.lock* ./
+RUN bun install --frozen-lockfile
+COPY tsconfig.json biome.json ./
+COPY src ./src
+RUN bun run build
+
+FROM oven/bun:1.3.14
+ARG OMP_VERSION=18.8.6
+ARG CLAUDE_VERSION=2.1.304
+ARG T3_VERSION=0.1.2
+ARG CODEX_VERSION=0.156.1
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/mise/shims:/mise/bin:/opt/t3:/opt/codex/bin:/opt/claude/bin:/usr/local/bin:/usr/bin:/bin"
+ENV DOCKER_HOST=unix:///run/docker.sock
+ENV DOCKER_DATA_ROOT=/workspace/.omp-home/docker
+ENV MISE_DATA_DIR=/mise
+ENV MISE_CACHE_DIR=/mise/cache
+ENV MISE_CONFIG_DIR=/workspace/.omp-home/mise/config
+ENV MISE_TRUSTED_CONFIG_PATHS=/workspace
+WORKDIR /workspace
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git libssl-dev libudev1 openssh-client pkg-config tini iptables iproute2 procps xz-utils \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker /usr/local/bin/dockerd /usr/local/bin/dockerd
+COPY --from=docker /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/containerd-shim-runc-v2
+COPY --from=docker /usr/local/bin/runc /usr/local/bin/runc
+COPY --from=docker /usr/local/bin/docker-proxy /usr/local/bin/docker-proxy
+COPY --from=docker /usr/local/bin/docker-init /usr/local/bin/docker-init
+COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+COPY --from=rust-tools /usr/local/cargo/bin/mise /usr/local/bin/mise
+COPY --from=rust-tools /usr/local/cargo/bin/fnox /usr/local/bin/fnox
+COPY --from=worker-extensions /opt/omp-extensions /opt/omp-extensions
+COPY --from=app-build /app/dist /app/dist
+COPY deploy/agent-clis/install-agent-clis.sh /usr/local/bin/install-agent-clis
+COPY deploy/agent-clis/claude-cliproxy /usr/local/bin/claude-cliproxy
+COPY deploy/session-sandbox/worker-init.sh /usr/local/bin/worker-init
+RUN TARGETARCH="${TARGETARCH}" install-agent-clis \
+      "claude=${CLAUDE_VERSION}" "codex=${CODEX_VERSION}" "t3=${T3_VERSION}" \
+  && case "${TARGETARCH}" in \
+       amd64) asset="omp-linux-x64"; checksum="877acdc48384b80fe4c083b1e610433d28922dd9fccde9ea430aaace8765b19b" ;; \
+       arm64) asset="omp-linux-arm64"; checksum="a6bf1405877a739965586fcf973136f72078d2e6dc288905fab08588469c13cf" ;; \
+       *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
+  && curl --fail --location --retry 3 \
+       "https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}/${asset}" \
+       --output /usr/local/bin/omp \
+  && echo "${checksum}  /usr/local/bin/omp" | sha256sum --check --strict \
+  && chmod 0755 /usr/local/bin/omp /usr/local/bin/worker-init \
+  && ln -s /opt/claude/bin/claude /usr/local/bin/claude \
+  && ln -s /opt/codex/bin/codex /usr/local/bin/codex \
+  && ln -s /opt/t3/t3 /usr/local/bin/t3 \
+  && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+  && chmod 0755 /usr/local/bin/claude-cliproxy \
+  && chown -Rh root:root /opt/claude /opt/codex /opt/t3 /opt/omp-extensions \
+  && chmod -R go-w /opt/claude /opt/codex /opt/t3 /opt/omp-extensions \
+  && install -d -m 0755 /mise /workspace/.omp-home
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/worker-init"]
