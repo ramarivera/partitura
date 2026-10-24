@@ -22,7 +22,10 @@ import {
   seedWorkerProfileFiles,
   type WorkerProfileManifest,
 } from "./services/worker-profile.js";
-import { workerMcpCredential } from "./services/worker-security.js";
+import {
+  workerMcpCredential,
+  writeAgeIdentityFile,
+} from "./services/worker-security.js";
 import { cleanupWorkerSharedDirectoriesSync } from "./services/worker-shared-cleanup.js";
 import {
   assertT3GitCredentials,
@@ -116,6 +119,20 @@ switch (action) {
     );
     if (missing.length > 0)
       await appendFile(excludePath, `\n${missing.join("\n")}\n`);
+    break;
+  }
+  case "age-identity": {
+    if (
+      typeof input !== "object" ||
+      input === null ||
+      !("identity" in input) ||
+      typeof input.identity !== "string" ||
+      input.identity.length === 0 ||
+      input.identity.length > 256 * 1024
+    )
+      throw new Error("Expected a bounded age identity string");
+    const path = await writeAgeIdentityFile(cwd, input.identity);
+    process.stdout.write(path);
     break;
   }
   case "t3-config": {

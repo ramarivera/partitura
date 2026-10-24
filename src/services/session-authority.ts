@@ -68,6 +68,10 @@ import {
   materializeMcpAgentDb,
   removeMcpAgentDb,
 } from "./mcp-oauth.js";
+import {
+  deliverNativeArtifact,
+  type NativeBuildConfig,
+} from "./native-build-client.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import {
@@ -84,6 +88,11 @@ import type {
   RpcWorkerHandle,
 } from "./rpc-worker.js";
 import { RpcWorker } from "./rpc-worker.js";
+import {
+  makeSessionSandboxRuntime,
+  type SessionSandboxHandle,
+  type SessionSandboxRelay,
+} from "./session-sandbox.js";
 import {
   InstallationRepo,
   McpServerRepo,
@@ -370,6 +379,8 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const runtime = yield* Effect.context<never>();
       const runPromise = Effect.runPromiseWith(runtime);
       const mcpProxies = new Map<SessionId, () => void>();
+      const sandboxHandles = new Map<SessionId, SessionSandboxHandle>();
+      const sandboxRelays = new Map<SessionId, SessionSandboxRelay[]>();
       // One pool per gateway: launched T3 daemons never share a port.
       let t3PortPool: T3PortPool | undefined;
       const t3Ports = (launch: T3LaunchConfig): T3PortPool => {
@@ -380,8 +391,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         mcpProxies.get(sessionId)?.();
         mcpProxies.delete(sessionId);
       };
+      const stopSandboxRelays = (sessionId: SessionId) => {
+        for (const relay of sandboxRelays.get(sessionId) ?? []) relay.stop();
+        sandboxRelays.delete(sessionId);
+      };
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
+          for (const sessionId of sandboxHandles.keys())
+            stopSandboxRelays(sessionId);
           for (const stop of mcpProxies.values()) stop();
           mcpProxies.clear();
         }),
@@ -397,9 +414,132 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const workerIdentities = yield* WorkerIdentityRepo;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      type NativeBuildClient = Awaited<
+        ReturnType<
+          typeof import("./native-build-client.js").createNativeBuildClient
+        >
+      >;
+      let nativeBuildClientPromise: Promise<NativeBuildClient> | undefined;
+      const nativeBuildJobs = new Map<SessionId, Set<string>>();
+      const getNativeBuildClient = () => {
+        const nativeBuild: NativeBuildConfig | undefined = config.nativeBuild;
+        if (nativeBuild === undefined)
+          return Promise.reject(new Error("Native build tools are disabled"));
+        nativeBuildClientPromise ??= import("./native-build-client.js").then(
+          ({ createNativeBuildClient }) => createNativeBuildClient(nativeBuild),
+        );
+        return nativeBuildClientPromise;
+      };
+      const sandboxRuntime =
+        config.workerSandboxMode === "sysbox" &&
+        config.sessionSandboxBrokerSocketPath !== undefined
+          ? makeSessionSandboxRuntime(config.sessionSandboxBrokerSocketPath)
+          : undefined;
       const mcpOAuth = yield* McpOAuth;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
       const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
+
+      const rememberSandboxRelay = (
+        sessionId: SessionId,
+        relay: SessionSandboxRelay,
+      ) => {
+        const current = sandboxRelays.get(sessionId) ?? [];
+        current.push(relay);
+        sandboxRelays.set(sessionId, current);
+        return relay;
+      };
+      const openSandboxRelay = Effect.fn("SessionAuthority.openSandboxRelay")(
+        function* (
+          sessionId: SessionId,
+          target: "gateway" | "worker",
+          targetPort: number,
+        ) {
+          if (sandboxRuntime === undefined)
+            return yield* Effect.fail(
+              new RpcSpawnError({ message: "Sandbox relay is unavailable" }),
+            );
+          const relay = yield* sandboxRuntime
+            .openRelay(sessionId, target, targetPort)
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new RpcSpawnError({
+                    message: "Could not start the per-session sandbox relay",
+                  }),
+              ),
+            );
+          return rememberSandboxRelay(sessionId, relay);
+        },
+      );
+      const provisionSandbox = Effect.fn("SessionAuthority.provisionSandbox")(
+        function* (
+          sessionId: SessionId,
+          cwd: string,
+          workerUid: string | undefined,
+        ) {
+          if (sandboxRuntime === undefined) return undefined;
+          if (workerUid === undefined)
+            return yield* new RpcSpawnError({
+              message: "Sysbox mode requires a per-session worker uid range",
+            });
+          const recovered = yield* sandboxRuntime.recover(sessionId, cwd).pipe(
+            Effect.mapError(
+              () =>
+                new RpcSpawnError({
+                  message: "Could not recover the per-session sandbox",
+                }),
+            ),
+          );
+          const handle =
+            recovered.handle ??
+            (yield* sandboxRuntime.provision(sessionId, cwd).pipe(
+              Effect.mapError(
+                () =>
+                  new RpcSpawnError({
+                    message: "Could not provision the per-session sandbox",
+                  }),
+              ),
+            ));
+          sandboxHandles.set(sessionId, handle);
+          const proxy = yield* sandboxRuntime.openEgressProxy(sessionId).pipe(
+            Effect.mapError(
+              () =>
+                new RpcSpawnError({
+                  message: "Could not start the sandbox egress proxy",
+                }),
+            ),
+            Effect.tapError(() =>
+              sandboxRuntime
+                .destroy(sessionId)
+                .pipe(
+                  Effect.ignore,
+                  Effect.andThen(
+                    Effect.sync(() => sandboxHandles.delete(sessionId)),
+                  ),
+                ),
+            ),
+          );
+          rememberSandboxRelay(sessionId, proxy);
+          return { handle, egressProxyUrl: proxy.baseUrl };
+        },
+      );
+      const destroySandbox = (sessionId: SessionId) =>
+        Effect.gen(function* () {
+          stopSandboxRelays(sessionId);
+          if (sandboxRuntime === undefined || !sandboxHandles.has(sessionId))
+            return;
+          yield* sandboxRuntime.destroy(sessionId).pipe(
+            Effect.mapError(
+              () =>
+                new RpcSpawnError({
+                  message: "Could not destroy the per-session sandbox",
+                }),
+            ),
+            Effect.tap(() =>
+              Effect.sync(() => sandboxHandles.delete(sessionId)),
+            ),
+          );
+        });
 
       const stopShouldApply = Effect.fn("SessionAuthority.stopShouldApply")(
         function* (
@@ -466,6 +606,50 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           ),
           Effect.asVoid,
         );
+      const cancelSessionNativeBuilds = (sessionId: SessionId) =>
+        Effect.promise(async () => {
+          const jobs = nativeBuildJobs.get(sessionId);
+          if (jobs === undefined || nativeBuildClientPromise === undefined)
+            return;
+          try {
+            const client = await nativeBuildClientPromise;
+            for (const job of jobs) {
+              try {
+                const status = await client.status(sessionId, job);
+                if (status.state === "starting" || status.state === "running")
+                  await client.cancel(sessionId, job);
+              } catch {
+                // Session cleanup must continue if the build host is down.
+              }
+            }
+          } catch {
+            // Session cleanup must continue if client initialization failed.
+          } finally {
+            nativeBuildJobs.delete(sessionId);
+          }
+        });
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* Effect.forEach(
+            [...sandboxHandles.keys()],
+            (sessionId) =>
+              bestEffort(
+                `destroy sandbox for ${sessionId} during shutdown`,
+                destroySandbox(sessionId),
+              ),
+            { discard: true, concurrency: "unbounded" },
+          );
+          const nativeBuildClientForShutdown = nativeBuildClientPromise;
+          if (nativeBuildClientForShutdown !== undefined)
+            yield* Effect.promise(async () => {
+              try {
+                await (await nativeBuildClientForShutdown).close();
+              } catch {
+                // Shutdown cleanup must not prevent other finalizers.
+              }
+            });
+        }),
+      );
 
       const updateRun = (
         sessionId: SessionId,
@@ -1121,6 +1305,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const dropWorker = (sessionId: SessionId) =>
         Effect.gen(function* () {
           stopMcpProxy(sessionId);
+          yield* cancelSessionNativeBuilds(sessionId);
           const state = (yield* Ref.get(workersRef)).get(sessionId);
           if (state !== undefined) {
             yield* state.unsubscribe();
@@ -1132,6 +1317,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               return next;
             });
           }
+          yield* bestEffort(
+            `destroy sandbox for ${sessionId}`,
+            destroySandbox(sessionId),
+          );
         });
 
       const cancel = Effect.fn("SessionAuthority.cancel")(function* (
@@ -1581,6 +1770,8 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       )(function* (
         run: AgentRun,
         worker: RpcWorkerHandle,
+        workspacePath: string,
+        workerUid: string | undefined,
       ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
         if (
           worker.driverSession?.capabilities.hostTools !== undefined &&
@@ -1602,7 +1793,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           ...(details === undefined ? {} : { details }),
           ...(isError ? { isError: true } : {}),
         });
-        const definitions: ReadonlyArray<RpcHostToolDefinition> = [
+        const linearDefinitions: ReadonlyArray<RpcHostToolDefinition> = [
           {
             name: "linear_get_issue",
             label: "Linear: get issue",
@@ -1657,15 +1848,172 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             },
           },
         ];
+        const definitions: ReadonlyArray<RpcHostToolDefinition> = [
+          ...linearDefinitions,
+          ...(config.nativeBuild === undefined
+            ? []
+            : ([
+                {
+                  name: "native_build_start",
+                  label: "Native build: start",
+                  description:
+                    "Start the configured isolated native build for this commit and pull request.",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["commit", "pullRequest", "action"],
+                    properties: {
+                      commit: {
+                        type: "string",
+                        pattern: "^[a-f0-9]{40}$",
+                      },
+                      pullRequest: {
+                        type: "integer",
+                        minimum: 1,
+                        maximum: 99999999,
+                      },
+                      action: {
+                        type: "string",
+                        enum: ["archive", "native-smoke"],
+                      },
+                    },
+                  },
+                },
+                {
+                  name: "native_build_status",
+                  label: "Native build: status",
+                  description: "Read a native build job owned by this session.",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["job"],
+                    properties: {
+                      job: { type: "string", pattern: "^[a-f0-9]{32}$" },
+                    },
+                  },
+                },
+                {
+                  name: "native_build_artifact",
+                  label: "Native build: deliver artifact",
+                  description:
+                    "Copy a verified native build archive into this session workspace.",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["job"],
+                    properties: {
+                      job: { type: "string", pattern: "^[a-f0-9]{32}$" },
+                    },
+                  },
+                },
+                {
+                  name: "native_build_cancel",
+                  label: "Native build: cancel",
+                  description:
+                    "Cancel a native build job owned by this session.",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["job"],
+                    properties: {
+                      job: { type: "string", pattern: "^[a-f0-9]{32}$" },
+                    },
+                  },
+                },
+              ] satisfies ReadonlyArray<RpcHostToolDefinition>)),
+        ];
 
         yield* worker.onHostToolCall((request: RpcHostToolCall) =>
           Effect.gen(function* () {
             const fail = (message: string) =>
               textResult(message, undefined, true);
-            if (Option.isNone(linearOption)) {
-              return fail("Linear gateway is unavailable");
-            }
             const raw = request.arguments;
+            if (request.toolName.startsWith("native_build_")) {
+              if (config.nativeBuild === undefined)
+                return fail("Native build tools are disabled");
+              const job = raw.job;
+              const nativeOperation = Effect.promise(async () => {
+                try {
+                  const client = await getNativeBuildClient();
+                  switch (request.toolName) {
+                    case "native_build_start": {
+                      if (
+                        typeof raw.commit !== "string" ||
+                        typeof raw.pullRequest !== "number" ||
+                        (raw.action !== "archive" &&
+                          raw.action !== "native-smoke")
+                      )
+                        return fail("Invalid native build request");
+                      const started = await client.start({
+                        sessionId: run.sessionId,
+                        workspacePath,
+                        ...(workerUid === undefined ? {} : { workerUid }),
+                        commit: raw.commit,
+                        pullRequest: raw.pullRequest,
+                        action: raw.action,
+                      });
+                      const jobs =
+                        nativeBuildJobs.get(run.sessionId) ?? new Set<string>();
+                      jobs.add(started.job);
+                      nativeBuildJobs.set(run.sessionId, jobs);
+                      return textResult(JSON.stringify(started), started);
+                    }
+                    case "native_build_status": {
+                      if (typeof job !== "string")
+                        return fail("job is required");
+                      const status = await client.status(run.sessionId, job);
+                      return textResult(JSON.stringify(status), status);
+                    }
+                    case "native_build_artifact": {
+                      if (typeof job !== "string")
+                        return fail("job is required");
+                      const artifact = await deliverNativeArtifact(client, {
+                        sessionId: run.sessionId,
+                        job,
+                        workspacePath,
+                        ...(workerUid === undefined ? {} : { workerUid }),
+                      });
+                      nativeBuildJobs.get(run.sessionId)?.delete(job);
+                      const workerArtifact = {
+                        path: sandboxHandles.has(run.sessionId)
+                          ? `/workspace/.omp-home/native-build/${job}.tar`
+                          : artifact.path,
+                        sha256: artifact.sha256,
+                        bytes: artifact.bytes,
+                      };
+                      return textResult(
+                        JSON.stringify(workerArtifact),
+                        workerArtifact,
+                      );
+                    }
+                    case "native_build_cancel": {
+                      if (typeof job !== "string")
+                        return fail("job is required");
+                      await client.cancel(run.sessionId, job);
+                      nativeBuildJobs.get(run.sessionId)?.delete(job);
+                      return textResult("Native build canceled");
+                    }
+                    default:
+                      return fail(
+                        `Unknown native build tool: ${request.toolName}`,
+                      );
+                  }
+                } catch {
+                  return fail("Native build operation failed");
+                }
+              });
+              if (
+                request.toolName === "native_build_start" ||
+                request.toolName === "native_build_cancel"
+              )
+                return yield* withSessionMutationGate(
+                  run.sessionId,
+                  nativeOperation,
+                );
+              return yield* nativeOperation;
+            }
+            if (Option.isNone(linearOption))
+              return fail("Linear gateway is unavailable");
             // Host-tool callbacks intentionally turn infrastructure failures
             // into an isError result for the model; they must not masquerade
             // as an absent run.
@@ -1880,7 +2228,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       });
 
       const attachWorker = Effect.fn("SessionAuthority.attachWorker")(
-        function* (run: AgentRun, worker: RpcWorkerHandle) {
+        function* (
+          run: AgentRun,
+          worker: RpcWorkerHandle,
+          workspacePath: string,
+          workerUid: string | undefined,
+        ) {
           const queue = yield* Queue.unbounded<RpcEvent>();
 
           const unsubscribe = yield* worker.onEvent((event) => {
@@ -1923,7 +2276,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           });
 
           yield* worker.start();
-          yield* registerLinearHostTools(run, worker).pipe(
+          yield* registerLinearHostTools(
+            run,
+            worker,
+            workspacePath,
+            workerUid,
+          ).pipe(
             Effect.catch((error) =>
               Effect.gen(function* () {
                 // Registration happens after the worker is started and indexed;
@@ -2148,6 +2506,19 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             });
             // Always a private HOME: the daemon's state must never be shared.
             const environment = sessionWorkerEnvironment(cwd, process.env);
+            const sandbox = yield* provisionSandbox(run.sessionId, cwd, uid);
+            if (sandbox !== undefined) {
+              environment.HTTP_PROXY = sandbox.egressProxyUrl;
+              environment.HTTPS_PROXY = sandbox.egressProxyUrl;
+              environment.NO_PROXY = [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                sandbox.handle.workerAddress,
+                sandbox.handle.gatewayAddress,
+                sandbox.handle.relayAddress,
+              ].join(",");
+            }
             // Same repo-scoped, short-lived Git credential path as OMP workers.
             yield* applyRepositoryEnvironment(
               run,
@@ -2220,6 +2591,17 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   workspaceProcess(cwd, "t3-config", settings).then(
                     () => undefined,
                   ),
+                ...(sandbox === undefined ||
+                config.sessionSandboxBrokerSocketPath === undefined
+                  ? {}
+                  : {
+                      sandbox: {
+                        brokerSocketPath: config.sessionSandboxBrokerSocketPath,
+                        workerAddress: sandbox.handle.workerAddress,
+                        createRelay: (port: number) =>
+                          openSandboxRelay(run.sessionId, "worker", port),
+                      },
+                    }),
               }),
               (endpoint) => t3DriverOptionsFromConfig(t3Config, endpoint),
             );
@@ -2237,7 +2619,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             );
             // A gateway restart must not leave two turns operating in a workspace.
             if (Option.isSome(saved)) yield* worker.abort();
-            yield* attachWorker(run, worker);
+            yield* attachWorker(run, worker, cwd, uid);
           }).pipe(Effect.onError(() => worker.stop()));
           return worker;
         }
@@ -2286,6 +2668,19 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           workerUid === undefined
             ? workerEnvironment(process.env)
             : sessionWorkerEnvironment(cwd, process.env);
+        const sandbox = yield* provisionSandbox(run.sessionId, cwd, workerUid);
+        if (sandbox !== undefined) {
+          environment.HTTP_PROXY = sandbox.egressProxyUrl;
+          environment.HTTPS_PROXY = sandbox.egressProxyUrl;
+          environment.NO_PROXY = [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            sandbox.handle.workerAddress,
+            sandbox.handle.gatewayAddress,
+            sandbox.handle.relayAddress,
+          ].join(",");
+        }
         yield* applyRepositoryEnvironment(
           run,
           cwd,
@@ -2329,6 +2724,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             try: () =>
               startWorkerMcpProxy({
                 servers: oauthServers,
+                ...(sandbox === undefined
+                  ? {}
+                  : { bindHost: sandbox.handle.gatewayAddress }),
                 allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp ?? false,
                 accessToken: (server, rejectedAccessToken) =>
                   runPromise(
@@ -2376,8 +2774,23 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               }),
           });
           mcpProxies.set(run.sessionId, proxy.stop);
+          const relay =
+            sandbox === undefined
+              ? undefined
+              : yield* openSandboxRelay(run.sessionId, "gateway", proxy.port);
           const byId = new Map(
-            proxy.servers.map((server) => [server.id, server]),
+            proxy.servers.map((server) => {
+              if (relay === undefined || Option.isNone(server.url))
+                return [server.id, server] as const;
+              const endpoint = new URL(server.url.value);
+              const base = new URL(relay.baseUrl);
+              endpoint.hostname = base.hostname;
+              endpoint.port = base.port;
+              return [
+                server.id,
+                { ...server, url: Option.some(endpoint.toString()) },
+              ] as const;
+            }),
           );
           configServers = effectiveMcpServers.map(
             (server) => byId.get(server.id) ?? server,
@@ -2472,6 +2885,17 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         const worker = yield* rpc.spawn({
           command,
           ...(workerUid === undefined ? {} : { workerUid }),
+          ...(sandbox === undefined ||
+          config.sessionSandboxBrokerSocketPath === undefined ||
+          workerUid === undefined
+            ? {}
+            : {
+                sandbox: {
+                  brokerSocketPath: config.sessionSandboxBrokerSocketPath,
+                  sessionId: run.sessionId,
+                  workerUid,
+                },
+              }),
           cwd,
           env: { ...environment, PI_CODING_AGENT_DIR: agentDir },
           injectedEnv: workerModelEnvironment({
@@ -2503,7 +2927,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             run.sessionId,
             adapted.driverSession.ref,
           );
-          yield* attachWorker(run, adapted);
+          yield* attachWorker(run, adapted, cwd, workerUid);
         }).pipe(Effect.onError(() => adapted.stop()));
         return adapted;
       });
@@ -2511,7 +2935,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const startWorker = (...args: Parameters<typeof openWorker>) =>
         openWorker(...args).pipe(
           Effect.onError(() =>
-            Effect.sync(() => stopMcpProxy(args[0].sessionId)),
+            Effect.gen(function* () {
+              stopMcpProxy(args[0].sessionId);
+              stopSandboxRelays(args[0].sessionId);
+              yield* bestEffort(
+                `destroy failed sandbox for ${args[0].sessionId}`,
+                destroySandbox(args[0].sessionId),
+              );
+            }),
           ),
         );
 

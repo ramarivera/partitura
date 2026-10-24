@@ -175,3 +175,15 @@ The API needs only `orchestration:read` and `orchestration:operate` scopes.
 The in-process T3 tests prove gateway behavior against the pinned contract,
 and the launcher tests run a real child process through the lifecycle. They
 don't establish the deployed Linear-session-to-PR acceptance target.
+
+## Optional native build tools
+
+OMP workers can use `native_build_start`, `native_build_status`,
+`native_build_artifact`, and `native_build_cancel` when the gateway has both
+`NATIVE_BUILD_SSH_CONFIG_FILE` and `NATIVE_BUILD_SCRATCH_ROOT` configured.
+The gateway opens the SSH client on first use. The SSH config and scratch path
+stay on the gateway, and job IDs are scoped to the session that started them.
+Artifact delivery returns only a path inside that session workspace, its SHA-256,
+and byte count. T3 workers don't expose inline host tools, so these tools aren't
+registered for T3 sessions. Host setup and live acceptance requirements are in
+`deploy/mac-build/README.md`; source tests don't qualify a live Mac host.

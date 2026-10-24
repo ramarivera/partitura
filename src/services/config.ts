@@ -11,9 +11,11 @@ import {
 } from "effect";
 import type { LogLevel } from "../domain/models.js";
 import { RUNTIME_MODES, type RuntimeMode } from "../drivers/driver.js";
+import type { NativeBuildConfig } from "./native-build-client.js";
 import { modelProvider } from "./worker-profile.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
+export type WorkerSandboxMode = "native" | "sysbox";
 
 const isLogFileFrequency = (value: string): value is LogFileFrequency =>
   LOG_FILE_FREQUENCIES.some((frequency) => frequency === value);
@@ -119,9 +121,17 @@ export interface GatewayConfigShape {
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
   readonly workerExtensionPaths?: ReadonlyArray<string>;
   readonly workerClaudeExecutable?: string;
+  /** Native remains the development default. Sysbox fails closed without its broker. */
+  readonly workerSandboxMode?: WorkerSandboxMode | undefined;
+  readonly sessionSandboxBrokerSocketPath?: string | undefined;
+  /** Gateway-only SSH transport for optional native build host tools. */
+  readonly nativeBuild?: NativeBuildConfig | undefined;
   /** Present only when T3_MODE or T3_BASE_URL is set. */
   readonly t3Driver?: T3DriverConfig;
 }
+
+const isWorkerSandboxMode = (value: string): value is WorkerSandboxMode =>
+  value === "native" || value === "sysbox";
 
 const positiveInteger = (name: string, fallback: number) =>
   Config.String(name).pipe(
@@ -302,6 +312,48 @@ const logFile = Config.all({
 );
 
 const GatewayConfigValues = Config.all({
+  workerSandboxMode: Config.String("WORKER_SANDBOX_MODE").pipe(
+    Config.withDefault("native"),
+    Config.mapEffect((value) => {
+      const mode = value.trim();
+      return isWorkerSandboxMode(mode)
+        ? Effect.succeed(mode)
+        : Effect.fail(
+            new Config.ConfigError(
+              new ConfigProvider.SourceError({
+                message: "WORKER_SANDBOX_MODE must be native or sysbox",
+              }),
+            ),
+          );
+    }),
+  ),
+  sessionSandboxBrokerSocketPath: Config.option(
+    Config.String("SESSION_SANDBOX_BROKER_SOCKET"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildSshConfigFile: Config.option(
+    Config.String("NATIVE_BUILD_SSH_CONFIG_FILE"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildScratchRoot: Config.option(
+    Config.String("NATIVE_BUILD_SCRATCH_ROOT"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
   logLevel,
   logFile,
   mcpOAuthAllowLoopbackHttp: Config.Boolean(
@@ -862,6 +914,20 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       }
       const routing = yield* workerModelRouting();
       const t3Driver = yield* t3DriverConfig();
+      if (
+        values.workerSandboxMode === "sysbox" &&
+        values.sessionSandboxBrokerSocketPath === undefined
+      )
+        return yield* configFailure(
+          "WORKER_SANDBOX_MODE=sysbox requires SESSION_SANDBOX_BROKER_SOCKET",
+        );
+      if (
+        (values.nativeBuildSshConfigFile === undefined) !==
+        (values.nativeBuildScratchRoot === undefined)
+      )
+        return yield* configFailure(
+          "NATIVE_BUILD_SSH_CONFIG_FILE and NATIVE_BUILD_SCRATCH_ROOT must be configured together",
+        );
       if (t3Driver?.connection._tag === "Launch") {
         // Launched daemons only get the proxy client key, like OMP workers.
         if (routing.cliproxyApiBaseUrl === undefined)
@@ -875,6 +941,15 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       }
       return {
         ...values,
+        ...(values.nativeBuildSshConfigFile === undefined ||
+        values.nativeBuildScratchRoot === undefined
+          ? {}
+          : {
+              nativeBuild: {
+                sshConfigFile: values.nativeBuildSshConfigFile,
+                scratchRoot: values.nativeBuildScratchRoot,
+              },
+            }),
         ...routing,
         allowedOrganizationIds,
         gatewayAdminOrganizationIds,

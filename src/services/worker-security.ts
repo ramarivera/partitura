@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -14,9 +15,13 @@ import {
 import {
   type FileHandle,
   lstat,
+  mkdir,
   open,
   readdir,
   realpath,
+  rename,
+  rm,
+  writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -42,6 +47,7 @@ const WORKER_ENV = new Set([
   "NIX_SSL_CERT_FILE",
   "PI_CODING_AGENT_DIR",
   "PI_PACKAGE_DIR",
+  "FNOX_AGE_KEY_FILE",
   "OMP_SKIP_UPDATE_CHECK",
   "NO_COLOR",
 ]);
@@ -100,6 +106,26 @@ export const sessionWorkerEnvironment = (
   XDG_CONFIG_HOME: join(cwd, ".omp-home", ".config"),
   XDG_DATA_HOME: join(cwd, ".omp-home", ".local", "share"),
 });
+
+/** Write a session-only age identity as the worker uid, never through argv. */
+export const writeAgeIdentityFile = async (
+  cwd: string,
+  identity: string,
+): Promise<string> => {
+  if (identity.length === 0 || Buffer.byteLength(identity, "utf8") > 256 * 1024)
+    throw new Error("Age identity must be non-empty and at most 256 KiB");
+  const directory = join(cwd, ".omp-home", ".config", "sops", "age");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, "keys.txt");
+  const temporary = join(directory, `.keys-${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, identity, { flag: "wx", mode: 0o400 });
+    await rename(temporary, path);
+    return path;
+  } finally {
+    await rm(temporary, { force: true });
+  }
+};
 
 export const workerIdentityCommand = (
   command: ReadonlyArray<string>,

@@ -19,6 +19,7 @@ import {
   detachedProcessGroup,
   signalProcessTree,
 } from "../../services/process.js";
+import { sandboxWorkerLaunch } from "../../services/session-sandbox.js";
 import { workerIdentityCommand } from "../../services/worker-security.js";
 import { type AgentDriver, DriverError } from "../driver.js";
 import {
@@ -194,6 +195,16 @@ export interface T3LaunchInput {
   readonly readListeners?: () => ReadonlyArray<string> | undefined;
   readonly pollIntervalMs?: number;
   readonly stopTimeoutMs?: number;
+  readonly sandbox?: {
+    readonly brokerSocketPath: string;
+    readonly workerAddress: string;
+    readonly createRelay: (
+      port: number,
+    ) => Effect.Effect<
+      { readonly baseUrl: string; readonly stop: () => void },
+      RpcSpawnError
+    >;
+  };
 }
 
 export interface T3Daemon extends T3Endpoint {
@@ -238,6 +249,7 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
       ? process.getuid?.()
       : Number(input.workerUid);
   const listenerState = (port: number): ListenerState => {
+    if (input.sandbox !== undefined) return "unknown";
     const tables = readListeners();
     if (tables === undefined) return "unknown";
     const owners = listenerOwnerUids(tables, port);
@@ -245,7 +257,11 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
     return owners.every((uid) => uid === expectedUid) ? "owned" : "foreign";
   };
   // Isolation depends on the ownership check; only native dev may skip it.
-  if (input.workerUid !== undefined && readListeners() === undefined)
+  if (
+    input.sandbox === undefined &&
+    input.workerUid !== undefined &&
+    readListeners() === undefined
+  )
     return yield* launchError(
       "T3 launcher cannot verify loopback listener ownership without /proc/net/tcp",
     );
@@ -259,8 +275,28 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
     DISABLE_AUTOUPDATER: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
   };
-  const command = (args: ReadonlyArray<string>) =>
-    workerIdentityCommand([input.launch.cliPath, ...args], input.workerUid);
+  const command = (args: ReadonlyArray<string>, env = environment) =>
+    input.sandbox === undefined
+      ? workerIdentityCommand([input.launch.cliPath, ...args], input.workerUid)
+      : sandboxWorkerLaunch(
+          input.sessionId,
+          input.sandbox.brokerSocketPath,
+          input.workerUid ?? "",
+          input.cwd,
+          env,
+          [input.launch.cliPath, ...args],
+        ).command;
+  const commandEnvironment = (env: Record<string, string>) =>
+    input.sandbox === undefined
+      ? env
+      : sandboxWorkerLaunch(
+          input.sessionId,
+          input.sandbox.brokerSocketPath,
+          input.workerUid ?? "",
+          input.cwd,
+          env,
+          [input.launch.cliPath, "true"],
+        ).env;
 
   yield* Effect.tryPromise({
     try: () => input.writeSettings(input.settings),
@@ -274,22 +310,24 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
   const issued = yield* Effect.tryPromise({
     try: async () => {
       const child = Bun.spawn(
-        command([
-          "auth",
-          "session",
-          "issue",
-          "--base-dir",
-          paths.t3Home,
-          ...T3_LAUNCH_SCOPES.flatMap((scope) => ["--scope", scope]),
-          "--ttl",
-          "30d",
-          "--label",
-          `Partitura ${input.sessionId}`.slice(0, 80),
-          "--json",
-        ]),
+        [
+          ...command([
+            "auth",
+            "session",
+            "issue",
+            "--base-dir",
+            paths.t3Home,
+            ...T3_LAUNCH_SCOPES.flatMap((scope) => ["--scope", scope]),
+            "--ttl",
+            "30d",
+            "--label",
+            `Partitura ${input.sessionId}`.slice(0, 80),
+            "--json",
+          ]),
+        ],
         {
           cwd: input.cwd,
-          env: environment,
+          env: commandEnvironment(environment),
           stdin: "ignore",
           stdout: "pipe",
           stderr: "ignore",
@@ -336,6 +374,16 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => input.ports.release(port)),
   );
+  const relay =
+    input.sandbox === undefined
+      ? undefined
+      : yield* input.sandbox
+          .createRelay(port)
+          .pipe(
+            Effect.tap((handle) =>
+              Effect.addFinalizer(() => Effect.sync(handle.stop)),
+            ),
+          );
 
   const tail: string[] = [];
   const stopTimeoutMs = input.stopTimeoutMs ?? 5_000;
@@ -343,19 +391,24 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
     Effect.try({
       try: (): Subprocess<"ignore", "pipe", "pipe"> =>
         Bun.spawn(
-          command([
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            String(port),
-            "--base-dir",
-            paths.t3Home,
-            input.cwd,
-          ]),
+          [
+            ...command([
+              "serve",
+              "--host",
+              input.sandbox === undefined ? "127.0.0.1" : "0.0.0.0",
+              "--port",
+              String(port),
+              "--base-dir",
+              paths.t3Home,
+              input.cwd,
+            ]),
+          ],
           {
             cwd: input.cwd,
-            env: { ...environment, ...input.modelEnvironment },
+            env: commandEnvironment({
+              ...environment,
+              ...input.modelEnvironment,
+            }),
             stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
@@ -379,7 +432,7 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
   drain(child.stdout, tail);
   drain(child.stderr, tail);
 
-  const baseUrl = new URL(`http://127.0.0.1:${port}`);
+  const baseUrl = new URL(relay?.baseUrl ?? `http://127.0.0.1:${port}`);
   const deadline =
     (yield* Clock.currentTimeMillis) + input.launch.launchTimeoutMs;
   const pollIntervalMs = input.pollIntervalMs ?? 200;
@@ -419,14 +472,15 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
     token: Effect.suspend(() => {
       const state = listenerState(port);
       return state === "owned" ||
-        (state === "unknown" && input.workerUid === undefined)
+        (state === "unknown" &&
+          (input.workerUid === undefined || input.sandbox !== undefined))
         ? Effect.succeed(token)
         : Effect.fail(
             new T3RpcError({
               reason: "auth",
               method: "token",
               sent: false,
-              message: `T3 loopback port ${port} is not held by this session's daemon`,
+              message: `T3 port ${port} is not held by this session's daemon`,
             }),
           );
     }),
