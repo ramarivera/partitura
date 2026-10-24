@@ -283,6 +283,10 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             response === null ||
             !("job" in response) ||
             response.job !== job.job ||
+            !("commit" in response) ||
+            response.commit !== request.commit ||
+            !("action" in response) ||
+            response.action !== request.action ||
             !("state" in response) ||
             response.state !== "succeeded" ||
             !("artifactSha256" in response) ||
@@ -290,6 +294,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             !/^[a-f0-9]{64}$/u.test(response.artifactSha256) ||
             !("artifactBytes" in response) ||
             typeof response.artifactBytes !== "number" ||
+            !Number.isSafeInteger(response.artifactBytes) ||
             response.artifactBytes < 0 ||
             response.artifactBytes > MAX_ARTIFACT
           )

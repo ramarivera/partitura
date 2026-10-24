@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -131,6 +132,41 @@ class BrokerTests(unittest.TestCase):
         broker.cancel_job(self.config, self.job)
         self.assertTrue((self.root / 'active-vm').exists())
         self.assertFalse((self.root / 'trace').exists())
+
+    def test_repeated_shutdown_signal_cannot_interrupt_vm_cleanup(self):
+        shutdown_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        previous = {number: signal.getsignal(number) for number in shutdown_signals}
+
+        def interrupt(_number, _frame):
+            raise InterruptedError('signal')
+
+        signal.signal(signal.SIGTERM, interrupt)
+        owned = broker.owned
+        destroy = broker.destroy_vm
+        interrupted = False
+
+        def owned_with_initial_interrupt(arguments, *args, **kwargs):
+            nonlocal interrupted
+            if arguments[1] == 'clone' and not interrupted:
+                interrupted = True
+                raise InterruptedError('initial shutdown signal')
+            return owned(arguments, *args, **kwargs)
+
+        def destroy_with_repeat(config, job):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return destroy(config, job)
+
+        try:
+            with patch.object(broker, 'owned', side_effect=owned_with_initial_interrupt), patch.object(broker, 'destroy_vm', side_effect=destroy_with_repeat):
+                code, receipt = self.invoke()
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['state'], 'failed')
+        self.assertFalse((self.root / 'active-vm').exists())
+        self.assertIn(['delete', 'partitura-job-'+self.job], self.trace())
 
 
 if __name__ == '__main__':
