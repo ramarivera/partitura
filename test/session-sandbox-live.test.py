@@ -377,7 +377,7 @@ timeout 120 /bin/sh -ec '
         self.assertEqual(details["uid"], self.uid)
         self.assertTrue(details["node"].startswith("v24."))
         self.assertTrue(details["python"].startswith("Python 3.13."))
-        self.assertIn("mise", details["mise"])
+        self.assertRegex(details["mise"], r"^2026\.10\.15 linux-x64\b")
         if runtime == "firecracker":
             assert_guest_network(details)
             self.assertNotEqual(details["kernel"], os.uname().release)
