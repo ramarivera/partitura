@@ -1,4 +1,4 @@
-name: symphony-tailnet
+name: partitura-tailnet
 
 services:
   tailscale:
@@ -18,12 +18,12 @@ services:
       # Native file: support, not an inline key or an unsupported TS_AUTHKEY_FILE.
       TS_AUTHKEY: file:/run/secrets/ts_authkey
       TS_AUTH_ONCE: "true"
-      TS_HOSTNAME: ${TS_HOSTNAME:-symphony}
+      TS_HOSTNAME: ${TS_HOSTNAME:-partitura}
       TS_STATE_DIR: /var/lib/tailscale
       TS_USERSPACE: "false"
       # Keep Docker DNS for sidecar bootstrap. Gateway DNS is configured below.
       TS_ACCEPT_DNS: "false"
-      TS_EXTRA_ARGS: --advertise-tags=tag:symphony
+      TS_EXTRA_ARGS: --advertise-tags=tag:partitura
       TS_ENABLE_HEALTH_CHECK: "true"
       TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
     secrets:
@@ -40,7 +40,7 @@ services:
   gateway:
     build:
       context: ../..
-    image: ohmypi-symphony:tailscale
+    image: partitura:tailscale
     restart: unless-stopped
     network_mode: service:tailscale
     depends_on:
@@ -61,7 +61,7 @@ services:
       - SETGID
       - SETPCAP
     environment:
-      PUBLIC_URL: ${PUBLIC_URL:-https://symphony.YOUR-TAILNET.ts.net}
+      PUBLIC_URL: ${PUBLIC_URL:-https://partitura.YOUR-TAILNET.ts.net}
       PORT: "3000"
       LINEAR_ALLOWED_ORGANIZATION_IDS: ${LINEAR_ALLOWED_ORGANIZATION_IDS:-}
       GATEWAY_ADMIN_ORGANIZATION_IDS: ${GATEWAY_ADMIN_ORGANIZATION_IDS:-}

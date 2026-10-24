@@ -31,7 +31,7 @@ This example doesn't enable Funnel or configure a public ingress.
    `NET_RAW`. On Docker Desktop these requirements apply inside its Linux VM.
    Rootless engines may not support the required device/capabilities.
 2. Enable MagicDNS in the tailnet. Add the policy below and create a pre-approved,
-   short-lived, single-use auth key tagged `tag:symphony`. For an always-on gateway,
+   short-lived, single-use auth key tagged `tag:partitura`. For an always-on gateway,
    use a non-ephemeral node and keep its state volume. Ephemeral keys suit disposable
    deployments: the node disappears after disconnecting, and its next registration
    needs a usable key. Auth-key expiry and node-key expiry are separate settings.
@@ -68,7 +68,7 @@ This example doesn't enable Funnel or configure a public ingress.
    `GATEWAY_ADMIN_ORGANIZATION_IDS` and `GITHUB_APP_ALLOWED_OWNERS_JSON` as described
    in [gateway security](security.md) before using those administrative features.
    With only private HTTPS, use the
-   node's actual full `https://symphony.<tailnet>.ts.net` name. For Linear delivery,
+   node's actual full `https://partitura.<tailnet>.ts.net` name. For Linear delivery,
    use the public URL described above. Optionally add your actual tailnet search
    suffix to `resolv.conf` for short hostnames.
 5. For HTTPS, enable HTTPS certificates in the Tailscale admin console, then run:
@@ -98,18 +98,18 @@ allow-all rules if these restrictions are intended to enforce isolation.
 ```json
 {
   "tagOwners": {
-    "tag:symphony": ["autogroup:admin"],
+    "tag:partitura": ["autogroup:admin"],
     "tag:mac-builder": ["autogroup:admin"]
   },
   "acls": [
     {
       "action": "accept",
       "src": ["admin@example.com"],
-      "dst": ["tag:symphony:443", "tag:symphony:3000"]
+      "dst": ["tag:partitura:443", "tag:partitura:3000"]
     },
     {
       "action": "accept",
-      "src": ["tag:symphony"],
+      "src": ["tag:partitura"],
       "dst": ["tag:mac-builder:22"]
     }
   ]
