@@ -287,7 +287,7 @@ def _network(session: str) -> str:
     return NETWORK_PREFIX + session
 
 
-def _remove_owned(kind: str, name: str, session: str, attempt: int = 0, stopped: bool = False) -> None:
+def _remove_owned(kind: str, name: str, session: str, stopped: bool = False) -> None:
     try:
         inspected = subprocess.run(
             [DOCKER, kind, "inspect", name],
@@ -312,34 +312,15 @@ def _remove_owned(kind: str, name: str, session: str, attempt: int = 0, stopped:
     if kind == "container" and records[0].get("State", {}).get("Running") is True:
         if stopped:
             raise RuntimeError("Docker container remained running after stop; retry teardown")
-        try:
-            result = _docker_mutate(session, ["stop", "--timeout", "10", name], timeout=20)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Docker container stop timed out; retry teardown") from None
-        if result.returncode != 0:
-            raise RuntimeError("Docker container stop failed; retry teardown")
+        _docker_mutate(session, ["stop", "--timeout", "10", name], timeout=20)
         # Stop lets worker-init deliver TERM to nested dockerd before Docker's
         # own bounded kill deadline. Re-inspect ownership after that mutation.
-        return _remove_owned(kind, name, session, attempt, stopped=True)
+        return _remove_owned(kind, name, session, stopped=True)
     action = {"container": "rm", "network": "network rm", "volume": "volume rm"}[kind]
-    try:
-        # Sysbox may spend over a minute reverting the container's shifted
-        # filesystem before Docker removal completes. Stay inside the gateway's
-        # five-minute teardown budget without abandoning the durable owner.
-        result = _docker_mutate(session, [*action.split(), name], timeout=120 if kind == "container" else 30)
-    except subprocess.TimeoutExpired:
-        # Docker may continue an asynchronous removal after its CLI exits. Keep
-        # the lifecycle record so the next teardown rechecks exact ownership.
-        raise RuntimeError(f"Docker {kind} removal timed out; retry teardown") from None
-    if result.returncode != 0:
-        diagnostic = f"{result.stdout}\n{result.stderr}".lower()
-        transient = "tried to kill container" in diagnostic or "removal of container" in diagnostic and "in progress" in diagnostic
-        if kind == "container" and transient and attempt < 2:
-            time.sleep(0.2)
-            # Re-inspect exact session ownership and absence after the first
-            # removal's side effects before issuing a bounded retry.
-            return _remove_owned(kind, name, session, attempt + 1, stopped)
-        raise RuntimeError(f"Docker {kind} removal failed; retry teardown")
+    # Sysbox may spend over a minute reverting the shifted filesystem. The
+    # mutation owner fences pending or ambiguous results before another request
+    # can inspect resources or submit a retry.
+    _docker_mutate(session, [*action.split(), name], timeout=120 if kind == "container" else 30)
 
 
 async def _docker_api_json(

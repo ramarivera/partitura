@@ -51,7 +51,13 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         # Existing Docker protocol tests isolate the daemon seam. Dedicated
         # lifetime tests below exercise the real durable mutation owner.
         def mutate(session, args, timeout=60):
-            return broker.subprocess.run([broker.DOCKER, *args], capture_output=True, text=True, check=False, timeout=timeout)
+            try:
+                result = broker.subprocess.run([broker.DOCKER, *args], capture_output=True, text=True, check=False, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise broker.DockerMutationFenceError("Docker mutation still pending; retry teardown") from None
+            if result.returncode != 0:
+                raise broker.DockerMutationFenceError("Docker mutation result is ambiguous; ownership retained")
+            return result
         patcher = patch.object(broker, "_docker_mutate", side_effect=mutate)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -303,7 +309,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             )()
 
         with patch.object(broker.subprocess, "run", side_effect=docker):
-            with self.assertRaisesRegex(RuntimeError, "retry teardown"):
+            with self.assertRaisesRegex(broker.DockerMutationFenceError, "ambiguous; ownership retained"):
                 broker._sysbox_destroy({"sessionId": "session-2"})
         self.assertEqual(calls[0][1:3], ["container", "inspect"])
         self.assertEqual(calls[1][1:], ["rm", "partitura-session-session-2"])
@@ -326,7 +332,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}, "State": {"Running": True}}]), stderr="")
         for failure in (subprocess.TimeoutExpired(["docker", "stop"], 20), SimpleNamespace(returncode=1, stdout="", stderr="stop failed")):
             with patch.object(broker.subprocess, "run", side_effect=[owned, failure]) as run:
-                with self.assertRaisesRegex(RuntimeError, "stop .*retry teardown"):
+                with self.assertRaises(broker.DockerMutationFenceError):
                     broker._remove_owned("container", "partitura-session-session-2", "session-2")
             self.assertEqual(run.call_count, 2)
             self.assertEqual(run.call_args.args[0][1], "stop")
@@ -336,25 +342,20 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         timeout = subprocess.TimeoutExpired(["docker"], 30)
         for results, phase, expected_calls in (([timeout], "ownership check", 1), ([owned, timeout], "removal", 2)):
             with self.subTest(phase=phase), patch.object(broker.subprocess, "run", side_effect=results) as run:
-                with self.assertRaisesRegex(RuntimeError, phase + " timed out; retry teardown"):
+                with self.assertRaisesRegex(RuntimeError, "ownership check timed out; retry teardown" if phase == "ownership check" else "still pending; retry teardown"):
                     broker._remove_owned("container", "partitura-session-session-2", "session-2")
                 self.assertEqual(run.call_count, expected_calls)
                 self.assertEqual(run.call_args_list[0].kwargs["timeout"], 10)
                 if expected_calls == 2:
                     self.assertEqual(run.call_args_list[1].kwargs["timeout"], 120)
 
-    def test_destroy_rechecks_ownership_before_retrying_async_container_kill(self):
+    def test_ambiguous_removal_never_retries_or_inspects_foreign_replacement(self):
         owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}}]), stderr="")
         killing = SimpleNamespace(returncode=1, stdout="", stderr="tried to kill container, but did not receive an exit event")
-        removed = SimpleNamespace(returncode=0, stdout="", stderr="")
-        with patch.object(broker.subprocess, "run", side_effect=[owned, killing, owned, removed]) as run, patch.object(broker.time, "sleep"):
-            broker._remove_owned("container", "partitura-session-session-2", "session-2")
-        self.assertEqual([call.args[0][1:3] for call in run.call_args_list], [["container", "inspect"], ["rm", "partitura-session-session-2"], ["container", "inspect"], ["rm", "partitura-session-session-2"]])
-        foreign = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "other-session"}}}]), stderr="")
-        with patch.object(broker.subprocess, "run", side_effect=[owned, killing, foreign]) as run, patch.object(broker.time, "sleep"):
-            with self.assertRaisesRegex(ValueError, "label does not match"):
+        with patch.object(broker.subprocess, "run", side_effect=[owned, killing]) as run:
+            with self.assertRaisesRegex(broker.DockerMutationFenceError, "ambiguous; ownership retained"):
                 broker._remove_owned("container", "partitura-session-session-2", "session-2")
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0][1:3] for call in run.call_args_list], [["container", "inspect"], ["rm", "partitura-session-session-2"]])
 
     async def test_sysbox_supervisor_keeps_c_close_alive_then_cancels_only_its_group(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:

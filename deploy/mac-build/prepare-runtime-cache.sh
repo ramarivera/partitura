@@ -5,6 +5,7 @@ umask 077
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 [ "$#" -eq 5 ] || { echo 'Usage: prepare-runtime-cache.sh MISE_BINARY MISE_SHA256 NODE_VERSION PYTHON_VERSION NEW_OUTPUT_DIRECTORY' >&2; exit 64; }
 mise_binary=$1 mise_sha=$2 node_version=$3 python_version=$4 output=$5
+[[ "$mise_binary" = /* ]] || { echo 'Mise binary must be an absolute path' >&2; exit 1; }
 [ "$(uname -s):$(uname -m)" = Darwin:arm64 ] || { echo 'runtime cache requires an Apple silicon Mac' >&2; exit 1; }
 [[ "$mise_sha" =~ ^[a-f0-9]{64}$ && "$node_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$python_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'runtime cache needs exact tool pins' >&2; exit 1; }
 [ -f "$mise_binary" ] && [ ! -L "$mise_binary" ] && [ -x "$mise_binary" ] || { echo 'Mise binary must be a regular executable' >&2; exit 1; }
