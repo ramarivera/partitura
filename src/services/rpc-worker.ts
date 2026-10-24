@@ -16,6 +16,7 @@ import {
   RpcTimeoutError,
 } from "../domain/errors.js";
 import { detachedProcessGroup, signalProcessTree } from "./process.js";
+import { sandboxWorkerLaunch } from "./session-sandbox.js";
 import {
   workerEnvironment,
   workerIdentityCommand,
@@ -170,6 +171,11 @@ export class RpcWorker extends Context.Service<RpcWorker>()("RpcWorker", {
       readonly requestTimeoutMs?: number;
       readonly sessionId?: string;
       readonly workerUid?: string;
+      readonly sandbox?: {
+        readonly brokerSocketPath: string;
+        readonly sessionId: string;
+        readonly workerUid: string;
+      };
     }): Effect.fn.Return<RpcWorkerHandle, RpcSpawnError> {
       if (input.command.length === 0) {
         return yield* Effect.fail(
@@ -177,17 +183,15 @@ export class RpcWorker extends Context.Service<RpcWorker>()("RpcWorker", {
         );
       }
       const workerUid = input.workerUid;
-      const command = yield* Effect.try({
+      yield* Effect.try({
         try: () => {
+          if (input.sandbox !== undefined) return;
           if (
             workerUidRange(process.env) !== undefined &&
             workerUid === undefined
           )
             throw new Error("Missing per-session worker uid");
-          return workerIdentityCommand(
-            [...input.command, "--mode", "rpc"],
-            workerUid,
-          );
+          workerIdentityCommand([...input.command, "--mode", "rpc"], workerUid);
         },
         catch: () =>
           new RpcSpawnError({
@@ -210,6 +214,28 @@ export class RpcWorker extends Context.Service<RpcWorker>()("RpcWorker", {
         ),
         ...input.injectedEnv,
       };
+      const launch = yield* Effect.try({
+        try: () =>
+          input.sandbox === undefined
+            ? {
+                command: workerIdentityCommand(
+                  [...input.command, "--mode", "rpc"],
+                  workerUid,
+                ),
+                env,
+              }
+            : sandboxWorkerLaunch(
+                input.sandbox.sessionId,
+                input.sandbox.brokerSocketPath,
+                input.sandbox.workerUid,
+                cwd,
+                env,
+                [...input.command, "--mode", "rpc"],
+              ),
+        catch: () =>
+          new RpcSpawnError({ message: "Invalid worker launch configuration" }),
+      });
+      const command = [...launch.command];
       const processRef = yield* Ref.make<
         Option.Option<Subprocess<"pipe", "pipe", "pipe">>
       >(Option.none());
@@ -948,7 +974,7 @@ export class RpcWorker extends Context.Service<RpcWorker>()("RpcWorker", {
             try: () =>
               Bun.spawn(command, {
                 cwd,
-                env,
+                env: launch.env,
                 detached: detachedProcessGroup,
                 stdin: "pipe",
                 stdout: "pipe",

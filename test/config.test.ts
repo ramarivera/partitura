@@ -62,6 +62,53 @@ afterEach(async () => {
 const testPath = testPaths();
 
 describe("GatewayConfig", () => {
+  test("requires the allowlisted broker when sandbox mode is enabled", async () => {
+    const missingBroker = await Effect.runPromise(
+      configResult(valuesWith([["WORKER_SANDBOX_MODE", "sysbox"]])),
+    );
+    expect(Result.isFailure(missingBroker)).toBe(true);
+
+    const configured = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["WORKER_SANDBOX_MODE", "sysbox"],
+          [
+            "SESSION_SANDBOX_BROKER_SOCKET",
+            "/run/partitura-sandbox/broker.sock",
+          ],
+        ]),
+      ),
+    );
+    expect(Result.isSuccess(configured)).toBe(true);
+  });
+
+  test("enables native build transport only with both private paths", async () => {
+    const incomplete = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["NATIVE_BUILD_SSH_CONFIG_FILE", "/run/secrets/native-ssh-config"],
+        ]),
+      ),
+    );
+    expect(Result.isFailure(incomplete)).toBe(true);
+
+    const configured = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["NATIVE_BUILD_SSH_CONFIG_FILE", "/run/secrets/native-ssh-config"],
+          ["NATIVE_BUILD_SCRATCH_ROOT", "/app/data/native-build"],
+        ]),
+      ),
+    );
+    expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured)) {
+      expect(configured.success.nativeBuild).toEqual({
+        sshConfigFile: "/run/secrets/native-ssh-config",
+        scratchRoot: "/app/data/native-build",
+      });
+    }
+  });
+
   test("loads required values from Docker secret files", async () => {
     const directory = await mkdtemp(
       join(testPath("temporary"), "gateway-secrets-"),

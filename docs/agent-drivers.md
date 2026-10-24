@@ -202,3 +202,15 @@ per-session settings file.
 
 Unknown labels and multiple values for the same setting generate a Linear issue
 comment and fall through to the next settings tier. They don't stop the run.
+
+## Optional native build tools
+
+OMP and T3 workers can use `native_build_start`, `native_build_status`,
+`native_build_artifact`, and `native_build_cancel` when the gateway has both
+`NATIVE_BUILD_SSH_CONFIG_FILE` and `NATIVE_BUILD_SCRATCH_ROOT` configured.
+The gateway opens the SSH client on first use. The SSH config and scratch path
+stay on the gateway, and job IDs are scoped to the session that started them.
+Artifact delivery returns only a path inside that session workspace, its SHA-256,
+and byte count. T3 receives the tools through its per-session MCP endpoint.
+Host setup and live acceptance requirements are in
+`deploy/mac-build/README.md`; source tests don't qualify a live Mac host.
