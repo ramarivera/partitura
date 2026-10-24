@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -46,6 +47,15 @@ class CaptureWriter:
 
 
 class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Existing Docker protocol tests isolate the daemon seam. Dedicated
+        # lifetime tests below exercise the real durable mutation owner.
+        def mutate(session, args, timeout=60):
+            return broker.subprocess.run([broker.DOCKER, *args], capture_output=True, text=True, check=False, timeout=timeout)
+        patcher = patch.object(broker, "_docker_mutate", side_effect=mutate)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_firewall_is_opt_in_and_rejects_unowned_invocations(self):
         with patch.object(broker, "MANAGE_FIREWALL", False), patch.object(broker.subprocess, "run") as run:
             broker._allow_listener("10.1.2.2", "10.1.2.1", 3128, "partitura-network-session-1")
@@ -192,7 +202,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                 "CPU_LIMIT": "3.5",
                 "PIDS_LIMIT": 512,
             }
-            with patch.object(broker, "_run", side_effect=docker), patch.multiple(
+            with patch.object(broker, "_run", side_effect=docker), patch.object(broker, "_docker_mutate", side_effect=lambda session, args, **kwargs: docker(args, **kwargs)), patch.multiple(
                 broker, **settings
             ):
                 result = broker._sysbox_provision(
@@ -230,7 +240,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch.object(broker, "_workspace", return_value=Path("/workspaces/session-8")),
-            patch.object(broker, "_run", side_effect=RuntimeError("network create failed")) as run,
+            patch.object(broker, "_docker_mutate", side_effect=RuntimeError("network create failed")) as run,
             patch.object(broker, "_sysbox_destroy") as destroy,
             patch.multiple(broker, **settings),
         ):
@@ -243,7 +253,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
 
-        self.assertEqual(run.call_args.args[0][:2], ["network", "create"])
+        self.assertEqual(run.call_args.args[1][:2], ["network", "create"])
         destroy.assert_called_once_with({"sessionId": "session-8"})
 
     def test_maps_logical_workspace_into_host_volume_and_rejects_escape(self):
@@ -295,8 +305,30 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "retry teardown"):
                 broker._sysbox_destroy({"sessionId": "session-2"})
         self.assertEqual(calls[0][1:3], ["container", "inspect"])
-        self.assertEqual(calls[1][1:], ["rm", "-f", "partitura-session-session-2"])
+        self.assertEqual(calls[1][1:], ["rm", "partitura-session-session-2"])
         self.assertEqual(len(calls), 2)
+
+    def test_running_sysbox_stops_gracefully_then_rechecks_ownership_before_remove(self):
+        def owned(running, session="session-2"):
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": session}}, "State": {"Running": running}}]), stderr="")
+        success = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(broker.subprocess, "run", side_effect=[owned(True), success, owned(False), success]) as run:
+            broker._remove_owned("container", "partitura-session-session-2", "session-2")
+        self.assertEqual([call.args[0][1:] for call in run.call_args_list], [["container", "inspect", "partitura-session-session-2"], ["stop", "--timeout", "10", "partitura-session-session-2"], ["container", "inspect", "partitura-session-session-2"], ["rm", "partitura-session-session-2"]])
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 20)
+        with patch.object(broker.subprocess, "run", side_effect=[owned(True), success, owned(False, "foreign")]) as run:
+            with self.assertRaisesRegex(ValueError, "label does not match"):
+                broker._remove_owned("container", "partitura-session-session-2", "session-2")
+        self.assertEqual(run.call_count, 3)
+
+    def test_stop_timeout_keeps_container_owned_and_never_overlaps_remove(self):
+        owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}, "State": {"Running": True}}]), stderr="")
+        for failure in (subprocess.TimeoutExpired(["docker", "stop"], 20), SimpleNamespace(returncode=1, stdout="", stderr="stop failed")):
+            with patch.object(broker.subprocess, "run", side_effect=[owned, failure]) as run:
+                with self.assertRaisesRegex(RuntimeError, "stop .*retry teardown"):
+                    broker._remove_owned("container", "partitura-session-session-2", "session-2")
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args.args[0][1], "stop")
 
     def test_docker_teardown_cli_timeouts_are_bounded_and_report_retry(self):
         owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}}]), stderr="")
@@ -316,7 +348,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         removed = SimpleNamespace(returncode=0, stdout="", stderr="")
         with patch.object(broker.subprocess, "run", side_effect=[owned, killing, owned, removed]) as run, patch.object(broker.time, "sleep"):
             broker._remove_owned("container", "partitura-session-session-2", "session-2")
-        self.assertEqual([call.args[0][1:3] for call in run.call_args_list], [["container", "inspect"], ["rm", "-f"], ["container", "inspect"], ["rm", "-f"]])
+        self.assertEqual([call.args[0][1:3] for call in run.call_args_list], [["container", "inspect"], ["rm", "partitura-session-session-2"], ["container", "inspect"], ["rm", "partitura-session-session-2"]])
         foreign = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "other-session"}}}]), stderr="")
         with patch.object(broker.subprocess, "run", side_effect=[owned, killing, foreign]) as run, patch.object(broker.time, "sleep"):
             with self.assertRaisesRegex(ValueError, "label does not match"):
@@ -669,6 +701,45 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             target_server.close()
             await target_server.wait_closed()
 
+    async def test_vm_gateway_relay_uses_guest_port_range_and_preserves_colliding_socket(self):
+        for samples, expected_port in (([65535 - 2000], 65535), ([0, 1], 2001)):
+            with self.subTest(samples=samples), tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
+                root = Path(directory)
+                record = {"sessionId": "relay-session"}
+                machine = root / broker.vm.key(record["sessionId"])
+                machine.mkdir()
+                occupied = machine / "v.sock_2000"
+                existing = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                existing.bind(str(occupied))
+                existing.listen()
+                inode = occupied.stat().st_ino
+                guest_reader = asyncio.StreamReader()
+                guest_reader.feed_data(b'{"ok":true,"port":1234}\n')
+                guest_writer = SimpleNamespace(close=Mock(), wait_closed=AsyncMock())
+                control_reader = asyncio.StreamReader()
+                control_reader.feed_eof()
+                control_writer = CaptureWriter()
+                connect = AsyncMock(return_value=(guest_reader, guest_writer))
+                try:
+                    with patch.object(broker.vm, "VM_ROOT", root), patch.object(broker, "_gateway_routing", return_value=("127.0.0.1", "127.0.0.1")), patch.object(broker.secrets, "randbelow", side_effect=samples) as random, patch.object(broker.vm, "connect", new=connect):
+                        await broker._vm_relay(control_reader, control_writer, {"target": "gateway", "targetPort": 8080}, record)
+                    connect.assert_awaited_once_with(record, {"operation": "listen", "port": 0, "targetPort": expected_port})
+                    self.assertEqual(random.call_count, len(samples))
+                    for call in random.call_args_list:
+                        self.assertEqual(call.args, (65536 - 2000,))
+                    self.assertEqual(json.loads(control_writer.data)["result"]["port"], 1234)
+                    self.assertFalse((machine / ("v.sock_" + str(expected_port))).exists())
+                    self.assertEqual(occupied.stat().st_ino, inode)
+                    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    try:
+                        probe.connect(str(occupied))
+                    finally:
+                        probe.close()
+                    guest_writer.close.assert_called_once_with()
+                    guest_writer.wait_closed.assert_awaited_once_with()
+                finally:
+                    existing.close()
+
     async def test_egress_partial_header_closes_client_before_control_ends(self):
         control_reader = asyncio.StreamReader()
         control_writer = CaptureWriter()
@@ -704,6 +775,190 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                 if client_writer is not None:
                     client_writer.close()
                     await client_writer.wait_closed()
+
+
+class DockerMutationFenceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.root = Path(self.directory.name)
+        state = patch.object(broker.vm, "STATE_ROOT", self.root / "state")
+        state.start()
+        self.addCleanup(state.stop)
+        self.addCleanup(self.directory.cleanup)
+        self.session = "late-create-session"
+        self.request = {"sessionId": self.session, "runtime": "sysbox", "workerUid": "1001", "workspacePath": "/app/workspaces/session"}
+        self.owner = {"sessionId": self.session, "runtime": "sysbox", "workerUid": "1001", "workspaceHost": "/host/session"}
+        broker.vm.save(self.session, self.owner)
+
+    def operation(self):
+        return {"unit": "partitura-docker-" + broker.vm.key(self.session) + "-" + "a" * 32 + ".service", "completed": False}
+
+    def test_real_delayed_create_outlives_caller_and_blocks_absence_cleanup_until_finished(self):
+        marker = self.root / "late-created"
+        units = {}
+        stops = []
+        inspections = []
+        launch = subprocess.Popen
+        real_settle = broker._settle_docker_operation
+        def managed(args, **kwargs):
+            if args[0] == "/usr/bin/systemd-run":
+                operation_unit = args[args.index("--unit") + 1]
+                self.assertEqual(broker.vm.load(self.session)["dockerOperation"]["unit"], operation_unit)
+                self.assertNotIn("--wait", args)
+                self.assertNotIn("--collect", args)
+                self.assertIn("--property=RemainAfterExit=yes", args)
+                mutation = args[args.index(broker.DOCKER) + 3:]
+                if mutation[0] == "create":
+                    code = "import pathlib,time; time.sleep(.25); pathlib.Path(" + repr(str(marker)) + ").write_text('created')"
+                elif mutation[0] == "rm":
+                    code = "import pathlib; pathlib.Path(" + repr(str(marker)) + ").unlink()"
+                else:
+                    self.fail("unexpected fake mutation " + repr(mutation))
+                units[operation_unit] = launch([sys.executable, "-c", code])
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:2] == ["/usr/bin/systemctl", "show"]:
+                process = units.get(args[2])
+                if process is None:
+                    output = "LoadState=not-found\nActiveState=inactive\nSubState=dead\nExecMainCode=0\nExecMainStatus=0\n"
+                elif process.poll() is None:
+                    output = "LoadState=loaded\nActiveState=active\nSubState=running\nExecMainCode=0\nExecMainStatus=0\n"
+                else:
+                    output = "LoadState=loaded\nActiveState=active\nSubState=exited\nExecMainCode=1\nExecMainStatus=" + str(process.returncode) + "\n"
+                return SimpleNamespace(returncode=0, stdout=output, stderr="")
+            if args[:2] == ["/usr/bin/systemctl", "stop"]:
+                process = units[args[2]]
+                self.assertIsNotNone(process.poll(), "a caller must never stop its pending mutation")
+                stops.append(args[2])
+                del units[args[2]]
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[0] == broker.DOCKER and args[2] == "inspect":
+                inspections.append(args)
+                if args[1] == "container" and marker.exists():
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": self.session}}, "State": {"Running": False}}]), stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="No such object")
+            self.fail("unexpected manager call " + repr(args))
+        try:
+            with patch.object(broker.subprocess, "run", side_effect=managed):
+                with self.assertRaisesRegex(broker.DockerMutationFenceError, "still pending"):
+                    broker._docker_mutate(self.session, ["create", "--name", broker._container(self.session)], timeout=.01)
+                pending = list(units.values())[0]
+                self.assertIsNone(pending.poll())
+                self.assertFalse(marker.exists())
+                self.assertEqual(stops, [])
+                # Reload the actual broker code to prove ownership is on disk,
+                # independent of the original request/module's memory.
+                fresh_spec = importlib.util.spec_from_file_location("restarted_sandbox_broker", SOURCE)
+                fresh = importlib.util.module_from_spec(fresh_spec)
+                fresh_spec.loader.exec_module(fresh)
+                with patch.object(fresh, "_settle_docker_operation", side_effect=lambda session, timeout=60: real_settle(session, timeout=0)), patch.object(fresh, "_workspace", return_value=Path("/host/session")):
+                    for action in (fresh.destroy, fresh.recover):
+                        with self.assertRaisesRegex(broker.DockerMutationFenceError, "still pending"):
+                            action(self.request)
+                self.assertEqual(inspections, [])
+                self.assertIsNotNone(broker.vm.load(self.session))
+                pending.wait(timeout=3)
+                self.assertTrue(marker.exists())
+                self.assertEqual(broker.destroy(self.request), {"destroyed": True})
+                self.assertFalse(marker.exists())
+                self.assertIsNone(broker.vm.load(self.session))
+                self.assertEqual(len(stops), 2)
+        finally:
+            for process in units.values():
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=3)
+
+    def test_missing_failed_or_killed_operation_keeps_owner_and_never_inspects_absence(self):
+        for state in ({"LoadState": "not-found"}, {"LoadState": "loaded", "SubState": "failed", "ExecMainCode": "2", "ExecMainStatus": "9"}, {"LoadState": "loaded", "SubState": "exited", "ExecMainCode": "1", "ExecMainStatus": "1"}):
+            with self.subTest(state=state):
+                broker.vm.save(self.session, {**self.owner, "dockerOperation": self.operation()})
+                with patch.object(broker, "_docker_operation_status", return_value=state), patch.object(broker.subprocess, "run") as command:
+                    with self.assertRaises(broker.DockerMutationFenceError):
+                        broker.destroy(self.request)
+                    command.assert_not_called()
+                self.assertIn("dockerOperation", broker.vm.load(self.session))
+
+    def test_submission_failure_keeps_durable_intent_for_reconciliation(self):
+        with patch.object(broker.subprocess, "run", side_effect=subprocess.TimeoutExpired(["systemd-run"], 10)):
+            with self.assertRaisesRegex(broker.DockerMutationFenceError, "submission is ambiguous"):
+                broker._docker_mutate(self.session, ["create"], timeout=.01)
+        self.assertIn("dockerOperation", broker.vm.load(self.session))
+
+    def test_verified_completion_survives_crash_before_manager_cleanup(self):
+        operation = {**self.operation(), "completed": True}
+        broker.vm.save(self.session, {**self.owner, "dockerOperation": operation})
+        with patch.object(broker, "_docker_operation_status") as status, patch.object(broker.subprocess, "run", return_value=SimpleNamespace(returncode=4, stderr="Unit not loaded")):
+            broker._settle_docker_operation(self.session, timeout=0)
+        status.assert_not_called()
+        self.assertNotIn("dockerOperation", broker.vm.load(self.session))
+
+    def test_queued_inactive_operation_does_not_clear_intent_before_execution(self):
+        broker.vm.save(self.session, {**self.owner, "dockerOperation": self.operation()})
+        queued = {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead", "ExecMainCode": "0", "ExecMainStatus": "0"}
+        with patch.object(broker, "_docker_operation_status", return_value=queued), patch.object(broker.subprocess, "run") as command:
+            with self.assertRaisesRegex(broker.DockerMutationFenceError, "still pending"):
+                broker._settle_docker_operation(self.session, timeout=0)
+            command.assert_not_called()
+        self.assertIn("dockerOperation", broker.vm.load(self.session))
+
+    def test_legacy_destroy_persists_owner_before_managed_removal(self):
+        broker.vm.state_path(self.session).unlink()
+        mutations = []
+        def command(args, **kwargs):
+            if args[0] == "/usr/bin/systemd-run":
+                owner = broker.vm.load(self.session)
+                self.assertEqual(owner["runtime"], "sysbox")
+                self.assertIn("dockerOperation", owner)
+                mutations.append(args[args.index(broker.DOCKER) + 3:])
+            elif args[:2] == ["/usr/bin/systemctl", "show"]:
+                return SimpleNamespace(returncode=0, stdout="LoadState=loaded\nSubState=exited\nExecMainCode=1\nExecMainStatus=0\n", stderr="")
+            elif args[0] == broker.DOCKER:
+                if args[1] == "container":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": self.session}}, "State": {"Running": False}}]), stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="No such object")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(broker.subprocess, "run", side_effect=command):
+            self.assertEqual(broker.destroy(self.request), {"destroyed": True})
+        self.assertEqual(mutations, [["rm", broker._container(self.session)]])
+        self.assertIsNone(broker.vm.load(self.session))
+
+    def test_legacy_recovery_validates_metadata_before_managed_restart(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                broker.vm.state_path(self.session).unlink(missing_ok=True)
+                mutations = []
+                def command(args, **kwargs):
+                    if args[0] == "/usr/bin/systemd-run":
+                        owner = broker.vm.load(self.session)
+                        for field in ("runtime", "workerUid", "workspaceHost"):
+                            self.assertEqual(owner[field], self.owner[field])
+                        self.assertIn("dockerOperation", owner)
+                        mutations.append(args[args.index(broker.DOCKER) + 3:])
+                    elif args[:2] == ["/usr/bin/systemctl", "show"]:
+                        return SimpleNamespace(returncode=0, stdout="LoadState=loaded\nSubState=exited\nExecMainCode=1\nExecMainStatus=0\n", stderr="")
+                    elif args[0] == broker.DOCKER:
+                        if args[1] == "inspect":
+                            output = "false" if args[3] == "{{.State.Running}}" else json.dumps({"partitura.session": self.session, "partitura.workspace": "/host/session", "partitura.worker_uid": "1001" if valid else "9999"})
+                        else:
+                            output = json.dumps([{"Labels": {"partitura.session": self.session}}])
+                        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                with patch.object(broker.subprocess, "run", side_effect=command), patch.object(broker, "_workspace", return_value=Path("/host/session")), patch.object(broker, "_run", side_effect=["172.19.0.2", "172.18.0.4", "172.19.0.1"]):
+                    if valid:
+                        self.assertTrue(broker.recover(self.request)["running"])
+                        self.assertEqual(mutations, [["restart", broker._container(self.session)]])
+                        self.assertNotIn("dockerOperation", broker.vm.load(self.session))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "worker uid"):
+                            broker.recover(self.request)
+                        self.assertEqual(mutations, [])
+                        self.assertIsNone(broker.vm.load(self.session))
+
+    def test_recovery_daemon_failure_preserves_existing_owner(self):
+        with patch.object(broker, "_workspace", return_value=Path("/host/session")), patch.object(broker.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="Cannot connect to the Docker daemon")):
+            with self.assertRaisesRegex(RuntimeError, "ownership check failed"):
+                broker.recover(self.request)
+        self.assertEqual(broker.vm.load(self.session), self.owner)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ does not implement the Docker Engine API. Docker's socket stays on the host.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import ipaddress
 import os
@@ -174,6 +175,108 @@ def _run(args: list[str], *, timeout: int = 60) -> str:
     return completed.stdout.strip()
 
 
+class DockerMutationFenceError(RuntimeError):
+    """An unfinished or ambiguous mutation still owns its session resources."""
+
+
+def _save_docker_owner(session: str, record: dict[str, Any]) -> None:
+    vm.save(session, record)
+    descriptor = os.open(vm.STATE_ROOT, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _docker_operation_status(unit: str) -> dict[str, str]:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "show", unit,
+             "--property=LoadState,ActiveState,SubState,ExecMainCode,ExecMainStatus"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        raise DockerMutationFenceError("Docker mutation status unavailable; ownership retained") from None
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def _finish_docker_operation(session: str, record: dict[str, Any]) -> None:
+    operation = record["dockerOperation"]
+    # Only a previously verified normal successful exit permits stopping this
+    # RemainAfterExit unit. Pending Docker clients are never signalled here.
+    try:
+        result = subprocess.run(["/usr/bin/systemctl", "stop", operation["unit"]],
+            check=False, capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        raise DockerMutationFenceError("Docker mutation cleanup pending; ownership retained") from None
+    if result.returncode != 0 and "not loaded" not in result.stderr.lower() and "not found" not in result.stderr.lower():
+        raise DockerMutationFenceError("Docker mutation cleanup failed; ownership retained")
+    record.pop("dockerOperation")
+    _save_docker_owner(session, record)
+
+
+def _settle_docker_operation(session: str, timeout: float = 60) -> None:
+    record = vm.load(session)
+    if record is None or "dockerOperation" not in record:
+        return
+    operation = record["dockerOperation"]
+    expected = r"partitura-docker-" + vm.key(session) + r"-[a-f0-9]{32}\.service"
+    if not isinstance(operation, dict) or not isinstance(operation.get("unit"), str) or not re.fullmatch(expected, operation["unit"]):
+        raise DockerMutationFenceError("Docker mutation ownership is invalid; ownership retained")
+    if operation.get("completed") is True:
+        _finish_docker_operation(session, record)
+        return
+    deadline = time.monotonic() + timeout
+    while True:
+        state = _docker_operation_status(operation["unit"])
+        if state.get("LoadState") == "not-found":
+            # This also fences a broker crash between saving intent and unit
+            # submission, and lost transient-unit evidence after a host reboot.
+            raise DockerMutationFenceError("Docker mutation result is missing; ownership retained")
+        terminal = state.get("SubState") in ("exited", "dead", "failed") and (state.get("ExecMainCode") != "0" or state.get("SubState") == "failed")
+        if terminal:
+            if state.get("ExecMainCode") != "1" or state.get("ExecMainStatus") != "0":
+                # A killed client, daemon disconnect or nonzero CLI exit does
+                # not prove that the daemon abandoned its asynchronous work.
+                raise DockerMutationFenceError("Docker mutation result is ambiguous; ownership retained")
+            operation["completed"] = True
+            _save_docker_owner(session, record)
+            _finish_docker_operation(session, record)
+            return
+        if time.monotonic() >= deadline:
+            raise DockerMutationFenceError("Docker mutation still pending; retry teardown")
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
+def _docker_mutate(session: str, args: list[str], timeout: float = 60) -> subprocess.CompletedProcess:
+    _settle_docker_operation(session, timeout=timeout)
+    record = vm.load(session)
+    if record is None or record["runtime"] != "sysbox":
+        raise DockerMutationFenceError("Docker mutation has no lifecycle owner")
+    operation_unit = "partitura-docker-" + vm.key(session) + "-" + secrets.token_hex(16) + ".service"
+    record["dockerOperation"] = {"unit": operation_unit, "completed": False}
+    # Persist the intent before the system manager can submit a daemon request.
+    _save_docker_owner(session, record)
+    try:
+        subprocess.run(
+            ["/usr/bin/systemd-run", "--quiet", "--no-block", "--unit", operation_unit,
+             "--property=Type=exec", "--property=RemainAfterExit=yes",
+             "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=",
+             "--property=PrivateNetwork=yes", "--property=PrivateTmp=yes",
+             "--property=ProtectSystem=strict", "--property=ProtectHome=yes",
+             "--property=RestrictAddressFamilies=AF_UNIX", "--property=TasksMax=64",
+             "--property=MemoryMax=256M", "--property=StandardOutput=null", "--property=StandardError=null",
+             DOCKER, "--host", "unix://" + DOCKER_SOCKET, *args],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        raise DockerMutationFenceError("Docker mutation submission is ambiguous; ownership retained") from None
+    # Only this caller's wait is bounded. Its timeout never kills the managed
+    # Docker client or forgets the daemon request that client still owns.
+    _settle_docker_operation(session, timeout=timeout)
+    return subprocess.CompletedProcess([DOCKER, *args], 0, "", "")
+
+
 def _container(session: str) -> str:
     return CONTAINER_PREFIX + session
 
@@ -182,7 +285,7 @@ def _network(session: str) -> str:
     return NETWORK_PREFIX + session
 
 
-def _remove_owned(kind: str, name: str, session: str, attempt: int = 0) -> None:
+def _remove_owned(kind: str, name: str, session: str, attempt: int = 0, stopped: bool = False) -> None:
     try:
         inspected = subprocess.run(
             [DOCKER, kind, "inspect", name],
@@ -204,15 +307,21 @@ def _remove_owned(kind: str, name: str, session: str, attempt: int = 0) -> None:
     labels = records[0].get("Config", {}).get("Labels", {}) if kind == "container" else records[0].get("Labels", {})
     if not isinstance(labels, dict) or labels.get("partitura.session") != session:
         raise ValueError(f"Docker {kind} session label does not match")
+    if kind == "container" and records[0].get("State", {}).get("Running") is True:
+        if stopped:
+            raise RuntimeError("Docker container remained running after stop; retry teardown")
+        try:
+            result = _docker_mutate(session, ["stop", "--timeout", "10", name], timeout=20)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Docker container stop timed out; retry teardown") from None
+        if result.returncode != 0:
+            raise RuntimeError("Docker container stop failed; retry teardown")
+        # Stop lets worker-init deliver TERM to nested dockerd before Docker's
+        # own bounded kill deadline. Re-inspect ownership after that mutation.
+        return _remove_owned(kind, name, session, attempt, stopped=True)
     action = {"container": "rm", "network": "network rm", "volume": "volume rm"}[kind]
     try:
-        result = subprocess.run(
-            [DOCKER, *action.split(), "-f", name] if kind == "container" else [DOCKER, *action.split(), name],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
+        result = _docker_mutate(session, [*action.split(), name], timeout=30)
     except subprocess.TimeoutExpired:
         # Docker may continue an asynchronous removal after its CLI exits. Keep
         # the lifecycle record so the next teardown rechecks exact ownership.
@@ -224,7 +333,7 @@ def _remove_owned(kind: str, name: str, session: str, attempt: int = 0) -> None:
             time.sleep(0.2)
             # Re-inspect exact session ownership and absence after the first
             # removal's side effects before issuing a bounded retry.
-            return _remove_owned(kind, name, session, attempt + 1)
+            return _remove_owned(kind, name, session, attempt + 1, stopped)
         raise RuntimeError(f"Docker {kind} removal failed; retry teardown")
 
 
@@ -294,18 +403,18 @@ def _sysbox_provision(request: dict[str, Any]) -> dict[str, Any]:
     container = _container(session)
     network = _network(session)
     try:
-        _run(["network", "create", "--internal", "--label", f"partitura.session={session}", network])
+        _docker_mutate(session, ["network", "create", "--internal", "--label", f"partitura.session={session}", network])
         relay_ip = _run(
             ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
         )
         if ipaddress.ip_address(relay_ip).version != 4:
             raise ValueError("sandbox egress proxy requires an IPv4 bridge gateway")
         egress_proxy = f"http://{relay_ip}:{EGRESS_PROXY_PORT}"
-        _run(["volume", "create", "--label", f"partitura.session={session}", f"partitura-mise-{session}"])
+        _docker_mutate(session, ["volume", "create", "--label", f"partitura.session={session}", f"partitura-mise-{session}"])
         volume = json.loads(_run(["volume", "inspect", f"partitura-mise-{session}"]))[0]
         if volume.get("Labels", {}).get("partitura.session") != session:
             raise ValueError("Mise volume session label does not match")
-        _run(
+        _docker_mutate(session,
             [
                 "create",
                 "--name",
@@ -347,7 +456,7 @@ def _sysbox_provision(request: dict[str, Any]) -> dict[str, Any]:
                 SANDBOX_IMAGE,
             ]
         )
-        _run(["start", container])
+        _docker_mutate(session, ["start", container])
         worker_ip = _run(
             ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}', container]
         )
@@ -356,6 +465,8 @@ def _sysbox_provision(request: dict[str, Any]) -> dict[str, Any]:
         )
         if not worker_ip or not gateway_ip or not relay_ip:
             raise RuntimeError("Docker did not assign required network addresses")
+    except DockerMutationFenceError:
+        raise
     except Exception:
         try:
             _sysbox_destroy({"sessionId": session})
@@ -367,6 +478,7 @@ def _sysbox_provision(request: dict[str, Any]) -> dict[str, Any]:
 
 def _sysbox_destroy(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
+    _settle_docker_operation(session)
     _remove_owned("container", _container(session), session)
     _remove_owned("network", _network(session), session)
     _remove_owned("volume", f"partitura-mise-{session}", session)
@@ -375,6 +487,7 @@ def _sysbox_destroy(request: dict[str, Any]) -> dict[str, Any]:
 
 def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
+    _settle_docker_operation(session)
     worker_uid = _worker_uid(request.get("workerUid"))
     workspace = _workspace(request.get("workspacePath"))
     container = _container(session)
@@ -383,17 +496,22 @@ def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
         capture_output=True,
         text=True,
         check=False,
+        timeout=10,
     )
     if result.returncode != 0:
-        return {"exists": False, "running": False}
+        diagnostic = f"{result.stdout}\n{result.stderr}".lower()
+        if "no such" in diagnostic or "not found" in diagnostic:
+            return {"exists": False, "running": False}
+        raise RuntimeError("Docker recovery ownership check failed; ownership retained")
     labels = subprocess.run(
         [DOCKER, "inspect", "--format", "{{json .Config.Labels}}", container],
         capture_output=True,
         text=True,
         check=False,
+        timeout=10,
     )
     if labels.returncode != 0:
-        return {"exists": False, "running": False}
+        raise RuntimeError("Docker recovery ownership check failed; ownership retained")
     label_record = json.loads(labels.stdout)
     if label_record.get("partitura.session") != session:
         raise ValueError("sandbox container session label does not match")
@@ -407,6 +525,7 @@ def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
         capture_output=True,
         text=True,
         check=False,
+        timeout=10,
     )
     if network_info.returncode != 0:
         raise ValueError("sandbox network is missing")
@@ -418,6 +537,7 @@ def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
         capture_output=True,
         text=True,
         check=False,
+        timeout=10,
     )
     if volume_info.returncode != 0:
         raise ValueError("sandbox Mise volume is missing")
@@ -435,7 +555,9 @@ def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
     )
     if not worker_ip or not gateway_ip or not relay_ip:
         raise ValueError("sandbox network addresses are missing")
-    subprocess.run([DOCKER, "restart", container], check=True, capture_output=True)
+    if vm.load(session) is None:
+        _save_docker_owner(session, {"sessionId": session, "runtime": "sysbox", "workerUid": worker_uid, "workspaceHost": str(workspace)})
+    _docker_mutate(session, ["restart", container])
     return {
         "exists": True,
         "running": True,
@@ -521,6 +643,8 @@ def destroy(request: dict[str, Any]) -> dict[str, Any]:
         if record is not None and record["runtime"] == "firecracker":
             vm.destroy(session)
         else:
+            if record is None:
+                _save_docker_owner(session, {"sessionId": session, "runtime": "sysbox"})
             _sysbox_destroy(request)
             vm.state_path(session).unlink(missing_ok=True)
     return {"destroyed": True}
@@ -1021,9 +1145,24 @@ async def _vm_relay(reader, writer, request, record):
         relay_port = server.sockets[0].getsockname()[1]
         relay_ip = bridge_ip
     else:
-        host_port = 2000 + secrets.randbelow(2**30)
-        unix_path = vm.VM_ROOT / vm.key(record["sessionId"]) / ("v.sock_" + str(host_port))
-        server = await asyncio.start_unix_server(client, path=str(unix_path))
+        # The guest accepts this destination as a bounded service port. Bind
+        # explicitly so a random collision never unlinks another live listener.
+        for attempt in range(8):
+            host_port = 2000 + secrets.randbelow(65536 - 2000)
+            unix_path = vm.VM_ROOT / vm.key(record["sessionId"]) / ("v.sock_" + str(host_port))
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(unix_path))
+                listener.listen(socket.SOMAXCONN)
+                listener.setblocking(False)
+                server = await asyncio.start_unix_server(client, sock=listener)
+                break
+            except OSError as error:
+                listener.close()
+                if error.errno != errno.EADDRINUSE:
+                    raise
+        else:
+            raise RuntimeError("no guest relay service port is available")
         os.chmod(unix_path, 0o666)
         relay_ip, relay_port = "127.0.0.1", 0
     try:
