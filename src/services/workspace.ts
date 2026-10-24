@@ -1406,7 +1406,9 @@ export const makeWorkspace = (input: {
           const cloneArgs = [
             "clone",
             "--no-checkout",
-            "--filter=blob:none",
+            // Checkout runs without gateway credentials. Fetch complete blobs
+            // now so it never needs an authenticated promisor download.
+            "--depth=1",
             "--",
             repository.url,
             staging,

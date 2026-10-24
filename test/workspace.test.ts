@@ -1396,6 +1396,80 @@ it.live(
 );
 
 describe("Workspace recovery regressions", () => {
+  it.live(
+    "hydrates private repository blobs before credential-free checkout",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        yield* runGit(
+          ["config", "uploadpack.allowFilter", "true"],
+          fixture.source,
+        );
+        yield* runGit(["checkout", "-b", "requested-ref"], fixture.source);
+        yield* fixtureIo("write requested snapshot", () =>
+          writeFile(join(fixture.source, "README.txt"), "requested snapshot\n"),
+        );
+        yield* runGit(["commit", "-am", "requested snapshot"], fixture.source);
+        yield* runGit(["checkout", "main"], fixture.source);
+        // file:// uses upload-pack and honors partial-clone filtering. Ordinary
+        // local-path clones copy all objects and conceal missing checkout blobs.
+        yield* fixtureIo("configure filtering transport", () =>
+          writeFile(
+            join(fixture.root, "gitconfig"),
+            `[url "file://${fixture.source}"]\n\tinsteadOf = ${fixture.url}\n`,
+          ),
+        );
+        const nativeSpawn = Bun.spawn;
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            vi.spyOn(Bun, "spawn").mockImplementation((command, options) => {
+              if (Array.isArray(command) && command.includes("checkout")) {
+                expect(options?.env?.GIT_CONFIG_VALUE_0).toBeUndefined();
+                // Model the private origin refusing access once the gateway's
+                // ephemeral authentication is gone. Checkout must be offline.
+                return nativeSpawn(
+                  [
+                    "git",
+                    "-c",
+                    "protocol.file.allow=never",
+                    ...command.slice(1),
+                  ],
+                  options,
+                );
+              }
+              return nativeSpawn(command, options);
+            }),
+          ),
+          (spy) => Effect.sync(() => spy.mockRestore()),
+        );
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({
+                name: "fixture[bot]",
+                email: "fixture@example.com",
+              }),
+            getInstallationToken: () => Effect.succeed("ghs_private_fixture"),
+          },
+        });
+        const target = yield* workspace.materialize(
+          "private-blobs",
+          repositoryRecord({
+            id: "private-blobs",
+            url: fixture.url,
+            ref: "requested-ref",
+          }),
+        );
+        expect(
+          yield* fixtureIo("read checked-out blob", () =>
+            readFile(join(target, "README.txt"), "utf8"),
+          ),
+        ).toBe("requested snapshot\n");
+      }),
+  );
+
   it.live("retries cleanly when fetch fails after cloning", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
