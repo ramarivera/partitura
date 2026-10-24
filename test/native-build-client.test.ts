@@ -23,13 +23,16 @@ if(command[0]==="run") {
  if(input.byteLength!==Number(command[5]))process.exit(2);
  if(!new TextDecoder().decode(input.slice(0,20)).includes("git bundle"))process.exit(3);
  const payload="${payload}";
- console.log(JSON.stringify({job:command[1],state:"succeeded",artifactSha256:createHash("sha256").update(payload).digest("hex"),artifactBytes:payload.length}));
+ const receipt={job:command[1],commit:command[2],action:command[4],state:"succeeded",artifactSha256:createHash("sha256").update(payload).digest("hex"),artifactBytes:payload.length,...(config.receiptOverrides??{})};
+ let serialized=JSON.stringify(receipt);
+ if(config.rawArtifactBytes!==undefined)serialized=serialized.replace(/"artifactBytes":[^,}]+/, '"artifactBytes":'+config.rawArtifactBytes);
+ console.log(serialized);
 } else if(command[0]==="artifact") process.stdout.write(config.corrupt?"corrupted":"${payload}");
 else console.log(JSON.stringify({job:command[1],state:"cancellation-requested"}));
 `;
 
-async function setup() {
-  const root = path("private");
+async function setup(rootName = "private") {
+  const root = path(rootName);
   await chmod(root, 0o700);
   const configFile = join(root, "ssh.json");
   const trace = join(root, "trace.jsonl");
@@ -153,6 +156,66 @@ it.live("cancelling during bundle preparation fences remote submission", () =>
       await client.close();
     }
   }),
+);
+
+it.live("rejects native build receipts for another commit or action", () =>
+  Effect.promise(async () => {
+    for (const [index, receiptOverrides] of [
+      { commit: "f".repeat(40) },
+      { action: "native-smoke" },
+    ].entries()) {
+      const fixture = await setup(`private-${index}`);
+      await writeFile(
+        fixture.configFile,
+        JSON.stringify({ trace: fixture.trace, receiptOverrides }),
+      );
+      const client = await createNativeBuildClient(fixture.config);
+      try {
+        const job = await client.start({
+          sessionId: "session-a",
+          workspacePath: fixture.workspace,
+          commit: fixture.commit,
+          pullRequest: 12,
+          action: "archive",
+        });
+        expect((await settled(client, job.job)).state).toBe("failed");
+      } finally {
+        await client.close();
+      }
+    }
+  }),
+);
+
+it.live(
+  "rejects non-finite, fractional, negative, and oversized receipt sizes",
+  () =>
+    Effect.promise(async () => {
+      for (const [index, rawArtifactBytes] of [
+        "1e400",
+        "1.5",
+        "-1",
+        "2147483649",
+      ].entries()) {
+        const fixture = await setup(`private-${index}`);
+        await writeFile(
+          fixture.configFile,
+          JSON.stringify({ trace: fixture.trace, rawArtifactBytes }),
+        );
+        const client = await createNativeBuildClient(fixture.config);
+        try {
+          const job = await client.start({
+            sessionId: "session-a",
+            workspacePath: fixture.workspace,
+            commit: fixture.commit,
+            pullRequest: 12,
+            action: "archive",
+          });
+          expect((await settled(client, job.job)).state).toBe("failed");
+        } finally {
+          await client.close();
+        }
+      }
+    }),
 );
 
 it.live("rejects corrupt artifacts and insecure transport configuration", () =>

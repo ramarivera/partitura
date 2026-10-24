@@ -167,6 +167,13 @@ def destroy_vm(config, job):
         raise ValueError('VM still exists after deletion')
 
 
+def ignore_shutdown_signals():
+    # The first signal enters the cleanup path. Further signals must not
+    # interrupt the VM stop/delete and durable receipt writes.
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, signal.SIG_IGN)
+
+
 def cancel_job(config, job):
     root = Path(config['root'])
     (root / (job + '.cancel')).touch(mode=0o600, exist_ok=True)
@@ -262,6 +269,7 @@ def run_job(config, request):
             failure = error
             receipt = dict(job=job, commit=commit, action=action, state='failed', cause=type(error).__name__)
         finally:
+            ignore_shutdown_signals()
             finished.set()
             watcher.join(timeout=2)
             stop(boot)
