@@ -12,8 +12,8 @@ interface ReadRequest {
 const socketPath = process.env.PARTITURA_SANDBOX_BROKER_SOCKET;
 if (!socketPath) throw new Error("Sandbox broker socket is not configured");
 
-const separator = process.argv.indexOf("--");
-const argv = separator < 0 ? [] : process.argv.slice(separator + 1);
+const commandArgs = process.argv.slice(2);
+const argv = commandArgs[0] === "--" ? commandArgs.slice(1) : commandArgs;
 const sessionId = process.env.PARTITURA_SANDBOX_SESSION_ID;
 const workerUid = process.env.PARTITURA_SANDBOX_WORKER_UID;
 const cwd = process.env.PARTITURA_SANDBOX_CWD;
@@ -34,15 +34,18 @@ const socket = createConnection({ path: socketPath });
 const chunks: Buffer[] = [];
 const waiters: Array<() => void> = [];
 let ended = false;
+const markEnded = () => {
+  ended = true;
+  for (const wake of waiters.splice(0)) wake();
+};
 socket.on("data", (chunk: Buffer) => {
   chunks.push(chunk);
   waiters.shift()?.();
 });
-socket.on("end", () => {
-  ended = true;
-  for (const wake of waiters.splice(0)) wake();
-});
+socket.on("end", markEnded);
+socket.on("close", markEnded);
 socket.on("error", (error) => {
+  markEnded();
   process.stderr.write(`sandbox broker connection failed: ${error.message}\n`);
   process.exitCode = 1;
 });
@@ -91,6 +94,7 @@ const run = async () => {
     }
     await writeFrame("C");
   })();
+  void inputPump.catch(() => undefined);
 
   while (true) {
     const header = await readExact(5);
@@ -98,7 +102,6 @@ const run = async () => {
     const length = header.readUInt32BE(1);
     if (kind === "X") {
       process.exitCode = length;
-      process.stdin.pause();
       break;
     }
     if ((kind !== "O" && kind !== "E") || length > 4 * 1024 * 1024)
@@ -106,14 +109,15 @@ const run = async () => {
     const data = await readExact(length);
     (kind === "O" ? process.stdout : process.stderr).write(data);
   }
-  void inputPump.catch(() => undefined);
   socket.end();
 };
 
-await run().catch((error: unknown) => {
-  process.stderr.write(
-    `sandbox worker failed: ${error instanceof Error ? error.message : String(error)}\n`,
-  );
-  process.exitCode = 1;
-  socket.destroy();
-});
+await run()
+  .catch((error: unknown) => {
+    process.stderr.write(
+      `sandbox worker failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = 1;
+    socket.destroy();
+  })
+  .finally(() => process.stdin.destroy());
