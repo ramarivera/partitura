@@ -1234,7 +1234,10 @@ const mockToolsGateway = LinearGateway.of({
         });
   },
   updateIssue: () => Effect.void,
-  workspaceRead: () => Effect.succeed({}),
+  workspaceRead: (input: {
+    readonly operation: string;
+    readonly input: unknown;
+  }) => Effect.succeed({ operation: input.operation, input: input.input }),
   workspaceWrite: (input: { readonly operation: string }) =>
     Effect.sync(() => {
       workspaceWriteCalls.push(input);
@@ -2051,6 +2054,30 @@ describe("SessionAuthority host-tool mutation gate", () => {
           const listener = hostToolListener;
           expect(listener).toBeDefined();
           if (listener === undefined) return;
+
+          const readTool = registeredHostTools.find(
+            (tool) => tool.name === "linear_workspace_read",
+          );
+          expect(readTool?.parameters).toMatchObject({
+            required: ["operation", "input"],
+            properties: { input: { type: "object" } },
+          });
+          const workspaceRead = yield* listener({
+            id: "call-workspace-read",
+            toolCallId: "tool-workspace-read",
+            toolName: "linear_workspace_read",
+            arguments: { operation: "get_issue", input: { id: "issue-1" } },
+          });
+          expect(workspaceRead.isError).not.toBe(true);
+          expect(workspaceRead.content).toEqual([
+            {
+              type: "text",
+              text: JSON.stringify({
+                operation: "get_issue",
+                input: { id: "issue-1" },
+              }),
+            },
+          ]);
 
           const allowed = yield* listener({
             id: "call-allowed",

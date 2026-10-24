@@ -89,6 +89,9 @@ const readBounded = async (response: Response, limit: number) => {
 export const startGitHubGitBroker = (input: {
   readonly repository: RepositoryRecord;
   readonly token?: string;
+  readonly tokenForRequest?: (
+    signal: AbortSignal,
+  ) => Promise<string | undefined>;
   readonly bindHost?: string;
   readonly fetch?: (
     input: string | URL | Request,
@@ -108,6 +111,7 @@ export const startGitHubGitBroker = (input: {
   const upstreamFetch = input.fetch ?? globalThis.fetch;
   const bindHost = input.bindHost ?? "127.0.0.1";
   const expected = Buffer.from(bearer);
+  const lifetime = new AbortController();
   let revoked = false;
   const server = Bun.serve({
     hostname: bindHost,
@@ -166,22 +170,31 @@ export const startGitHubGitBroker = (input: {
         upstream.searchParams.set("service", advertisedService);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 120_000);
+      const signal = AbortSignal.any([
+        controller.signal,
+        lifetime.signal,
+        request.signal,
+      ]);
       try {
         const body =
           request.method === "POST"
             ? await boundedBody(request, MAX_REQUEST_BYTES)
             : undefined;
+        const token = input.tokenForRequest
+          ? await input.tokenForRequest(signal)
+          : input.token;
+        signal.throwIfAborted();
         const response = await upstreamFetch(upstream, {
           method: request.method,
           redirect: "manual",
-          signal: controller.signal,
+          signal,
           headers: {
             accept:
               "application/x-git-upload-pack-advertisement, application/x-git-upload-pack-result, application/x-git-receive-pack-result, */*",
-            ...(input.token === undefined
+            ...(token === undefined
               ? {}
               : {
-                  authorization: `Basic ${Buffer.from(`x-access-token:${input.token}`).toString("base64")}`,
+                  authorization: `Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
                 }),
             ...(request.method === "POST"
               ? {
@@ -245,6 +258,7 @@ export const startGitHubGitBroker = (input: {
     gitConfigFor,
     stop: () => {
       revoked = true;
+      lifetime.abort();
       expected.fill(0);
       server.stop(true);
     },

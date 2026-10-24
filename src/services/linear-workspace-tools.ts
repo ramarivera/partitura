@@ -8,7 +8,7 @@ export const LINEAR_WORKSPACE_READ_TOOL: RpcHostToolDefinition = {
   parameters: {
     type: "object",
     additionalProperties: false,
-    required: ["operation"],
+    required: ["operation", "input"],
     properties: {
       operation: {
         type: "string",
@@ -26,11 +26,17 @@ export const LINEAR_WORKSPACE_READ_TOOL: RpcHostToolDefinition = {
           "list_issue_labels",
         ],
       },
-      id: { type: "string", minLength: 1, maxLength: 256 },
-      term: { type: "string", minLength: 1, maxLength: 512 },
-      teamId: { type: "string", minLength: 1, maxLength: 256 },
-      first: { type: "integer", minimum: 1, maximum: 50 },
-      after: { type: "string", minLength: 1, maxLength: 512 },
+      input: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string", minLength: 1, maxLength: 256 },
+          term: { type: "string", minLength: 1, maxLength: 512 },
+          teamId: { type: "string", minLength: 1, maxLength: 256 },
+          first: { type: "integer", minimum: 1, maximum: 50 },
+          after: { type: "string", minLength: 1, maxLength: 512 },
+        },
+      },
     },
   },
 };
@@ -82,7 +88,7 @@ export const LINEAR_WORKSPACE_TOOLS = [
 export const LINEAR_WORKSPACE_READS = {
   get_issue: {
     document:
-      "query($id: String!) { issue(id: $id) { id identifier title description url priority estimate dueDate createdAt updatedAt teamId stateId assigneeId delegateId projectId cycleId labelIds } }",
+      "query($id: String!) { issue(id: $id) { id identifier title description url priority estimate dueDate createdAt updatedAt team { id } state { id } assignee { id } delegate { id } project { id } cycle { id } labelIds } }",
     allowed: ["id"],
     required: ["id"],
     variables: (input: Record<string, string | number>) => ({
