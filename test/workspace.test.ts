@@ -26,6 +26,7 @@ import {
   WorkspaceId,
 } from "../src/domain/ids.js";
 import type { RepositoryRecord } from "../src/domain/models.js";
+import { acquireCloneLock } from "../src/services/clone-lock.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { buildGitHubExtraHeader } from "../src/services/github-app.js";
 import { WorkspaceRepo } from "../src/services/store/repositories.js";
@@ -1336,7 +1337,7 @@ describe("Workspace recovery regressions", () => {
         yield* fixtureIo("list workspace root", () =>
           readdir(fixture.workspaceRoot),
         ),
-      ).toEqual([]);
+      ).toEqual([".clone-locks"]);
       const target = yield* workspace.materialize("atomic-session", {
         ...repository,
         ref: "HEAD",
@@ -1397,6 +1398,61 @@ describe("Workspace recovery regressions", () => {
             readFile(join(fixture.workspaceRoot, stale, "partial.txt"), "utf8"),
           ),
         ).toBe("incomplete");
+      }),
+  );
+
+  it.live(
+    "reclaims unlocked clone instances and preserves a live gateway lock",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const activeOwner = "a".repeat(32);
+        const deadOwner = "b".repeat(32);
+        const lock = yield* Effect.acquireRelease(
+          fixtureIo("lock live clone", async () => {
+            await mkdir(fixture.workspaceRoot, { recursive: true });
+            const lock = await acquireCloneLock(
+              fixture.workspaceRoot,
+              activeOwner,
+            );
+            if (lock === undefined) throw new Error("Initial lock missing");
+            return lock;
+          }),
+          (lock) => Effect.promise(() => lock.release()),
+        );
+        const prefix = `.${safeSessionKey("instances")}-clone-v2-`;
+        const active = `${prefix}${activeOwner}-active`;
+        const dead = `${prefix}${deadOwner}-dead00`;
+        yield* fixtureIo("seed clone instances", async () => {
+          for (const name of [active, dead])
+            await mkdir(join(fixture.workspaceRoot, name));
+        });
+        const make = () =>
+          makeWorkspace({
+            workspaceRoot: fixture.workspaceRoot,
+            repo: { listRepositories: () => Effect.succeed([]) },
+            githubApp: undefined,
+          });
+        const repository = repositoryRecord({
+          id: "instances",
+          url: fixture.url,
+          ref: "HEAD",
+        });
+        const first = yield* make();
+        yield* first.materialize("first-instance", repository);
+        const names = yield* fixtureIo("read preserved clone", () =>
+          readdir(fixture.workspaceRoot),
+        );
+        expect(names).toContain(active);
+        expect(names).not.toContain(dead);
+        yield* Effect.promise(() => lock.release());
+        const restarted = yield* make();
+        yield* restarted.materialize("restart-instance", repository);
+        expect(
+          yield* fixtureIo("read recovered instance", () =>
+            readdir(fixture.workspaceRoot),
+          ),
+        ).not.toContain(active);
       }),
   );
 

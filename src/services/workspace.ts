@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import {
   lstat,
@@ -22,6 +22,7 @@ import {
 import type { OrganizationId } from "../domain/ids.js";
 import type { RepositoryRecord } from "../domain/models.js";
 import { isWithin } from "../util/paths.js";
+import { acquireCloneLock } from "./clone-lock.js";
 import { GatewayConfig } from "./config.js";
 import {
   buildGitHubExtraHeader,
@@ -836,6 +837,27 @@ export const makeWorkspace = (input: {
                   let removed = 0;
                   for await (const entry of entries) {
                     if (++scanned > 10_000 || removed >= 100) break;
+                    const lockedOwner =
+                      /^\.[a-f0-9]{32}-clone-v2-([a-f0-9]{32})-[A-Za-z0-9]+$/u.exec(
+                        entry.name,
+                      );
+                    if (lockedOwner !== null && entry.isDirectory()) {
+                      const ownerId = lockedOwner[1];
+                      if (ownerId === undefined) continue;
+                      const lock = await acquireCloneLock(root, ownerId);
+                      if (lock === undefined) continue;
+                      try {
+                        await removeWorkerWorkspace(
+                          join(root, entry.name),
+                          root,
+                          workerUid,
+                        );
+                        removed++;
+                      } finally {
+                        await lock.release();
+                      }
+                      continue;
+                    }
                     const owner =
                       /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
                         entry.name,
@@ -1203,13 +1225,30 @@ export const makeWorkspace = (input: {
 
       yield* Effect.scoped(
         Effect.gen(function* () {
+          const cloneOwner = randomBytes(16).toString("hex");
+          yield* Effect.acquireRelease(
+            Effect.tryPromise({
+              try: async () => {
+                const lock = await acquireCloneLock(canonicalRoot, cloneOwner);
+                if (lock === undefined)
+                  throw new Error("Clone owner collision");
+                return lock;
+              },
+              catch: workspaceFailure(
+                "acquire clone ownership",
+                "git_failed",
+                sessionId,
+              ),
+            }),
+            (lock) => Effect.promise(() => lock.release()),
+          );
           const staging = yield* Effect.acquireRelease(
             Effect.tryPromise({
               try: () =>
                 mkdtemp(
                   join(
                     canonicalRoot,
-                    `.${safeSessionKey(sessionId)}-clone-${hostKey}-${process.pid}-`,
+                    `.${safeSessionKey(sessionId)}-clone-v2-${cloneOwner}-`,
                   ),
                 ),
               catch: workspaceFailure(
