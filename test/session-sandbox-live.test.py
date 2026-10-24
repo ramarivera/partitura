@@ -515,10 +515,12 @@ timeout 120 /bin/sh -ec '
             while True:
                 try:
                     denied = await self.gateway_fetch(peer_relay, "/api/auth/websocket-ticket", token, "POST")
-                    break
+                    if denied["status"] != 503:
+                        break
                 except (AssertionError, json.JSONDecodeError):
-                    await asyncio.sleep(0.2)
-        self.assertIn(denied["status"], (401, 403))
+                    pass
+                await asyncio.sleep(0.2)
+        self.assertIn(denied["status"], (401, 403), denied)
 
     async def gateway_bound_listener(self, session, env):
         # Real Git/MCP listeners bind the address returned by provision. A
