@@ -151,7 +151,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PARTITURA_WORKER_UID=1003", joined)
         self.assertIn("SYSBOX_HONOR_CAPS=FALSE", joined)
         self.assertIn("src=" + str(workspace), joined)
-        self.assertIn("src=partitura-mise-session-3,dst=/mise,rw", joined)
+        self.assertIn("src=partitura-mise-session-3,dst=/mise,readonly=false", joined)
         self.assertNotIn("/var/run/docker.sock", joined)
         self.assertEqual(
             next(args[-1] for args in calls if args[:2] == ["inspect", "--format"]),
