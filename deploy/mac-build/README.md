@@ -1,101 +1,180 @@
-# Restricted native build transport
+# Isolated macOS build jobs
 
-This source is not installed or live-qualified. The gateway client and forced
-command tests use real local processes with fake SSH/Tart endpoints. They don't
-prove a signed archive, simulator run, or Mac deployment.
+Partitura owns source transfer, one disposable Tart VM per job, artifact transfer,
+cancellation and cleanup. It doesn't know a repository's build system, toolchain
+version, signing process or secret manager. The generic base includes Mise and
+cached Node/Python runtimes. It doesn't require the operator's Mise configuration,
+toolbox checkout or fnox infrastructure.
+The native integration isn't deployed or live-qualified yet.
 
-`broker.py` runs outside checkouts as an SSH forced command for a dedicated
-unprivileged build account. It accepts only the following commands, with exact
-space-separated arguments and no shell evaluation:
+## Repository contract
 
-- `run <job32hex> <commit40hex> <pr> <archive|native-smoke> <bundleBytes>`
-- `status <job32hex>`
-- `artifact <job32hex>`
-- `cancel <job32hex>`
+Commit `.partitura/native-build.sh` in the repository. Partitura checks out the
+requested commit inside an unprivileged guest and runs:
 
-Source arrives as a Git bundle on stdin. The host stores at most 1 GiB and never
-extracts or executes it. Each job clones a configured sealed macOS Tart base,
-without host mounts, graphics, audio, USB, or clipboard. A fixed installed guest
-runner executes as `previewrunner`, verifies its own hash and the sealed Onyxio
-qualifier, checks out the exact commit, installs dependencies, and invokes one
-fixed task. `archive` uses `--preview-signing` and has no upload path.
-`native-smoke` runs `mise run smoke:boot:native` inside the guest.
+```sh
+mise exec -- /bin/bash .partitura/native-build.sh "$action"
+```
 
-The guest receives only the scoped agent and dedicated preview identities
-already required by the Onyxio qualifier. Code in that guest can read its own
-scoped identities. The sealed base must exclude operator, release and production
-identities. No operator home, keychain, SSH agent, or host directory is shared.
+An action is a lowercase name containing letters, digits and hyphens, such as
+`build`, `test`, or `archive`. The repository script decides which actions it
+supports and exits nonzero for unknown actions. The repository's `mise.toml`
+selects tool versions and overrides the generic defaults. Cached versions need no
+download. The repository owns additional dependency installation, toolchain checks
+and the actual build. The checked-out history is shallow at the
+requested commit, so tasks needing older history must fetch it themselves.
 
-One kernel lock serializes jobs. A persisted `active-vm` fence blocks subsequent
-jobs after a crash. Cancellation creates a tombstone even before submission. A
-live broker watches that tombstone; if its owner died, a new cancel request takes
-the lock and removes only the VM named by that job's fence. Cleanup failure keeps
-the fence and blocks later builds. Abrupt host loss still needs recovery after
-the host returns. The job command bounds guest execution to 45 minutes.
+The script receives `CI=1`, `PARTITURA_JOB_ID`, `PARTITURA_COMMIT`,
+`PARTITURA_PULL_REQUEST` and `PARTITURA_ARTIFACT_DIR`. Put outputs to retrieve in
+`PARTITURA_ARTIFACT_DIR`. Partitura adds a `result.json` receipt after a successful
+task, archives that directory without extracting it on the gateway, and verifies
+the transferred bytes against the host's size and SHA-256 receipt.
 
-Artifacts are opaque archives, bounded to 2 GiB. The gateway verifies their size
-and SHA-256 before copying bytes through the session uid into its workspace.
-It never extracts guest archives or opens workspace destinations as root.
-Session ownership is checked for status, artifact access and cancellation.
-Gateway restart recovery cancels recorded in-flight jobs before accepting new
-requests. Private broker logs and credential values aren't returned to workers.
+For a dependency-free task:
 
-## Deployment inputs
+```sh
+#!/bin/bash
+set -euo pipefail
+case "$1" in
+  test) printf '%s\n' "$PARTITURA_COMMIT" > "$PARTITURA_ARTIFACT_DIR/commit.txt" ;;
+  *) exit 2 ;;
+esac
+```
 
-The gateway needs a root-owned mode 0400 SSH config, selected by
-`NATIVE_BUILD_SSH_CONFIG_FILE`, and a private writable scratch directory selected
-by `NATIVE_BUILD_SCRATCH_ROOT`. The config defines the fixed `partitura-native`
-alias, dedicated identity and pinned `UserKnownHostsFile`. The target and private
-key belong in encrypted fnox source. Workers receive neither file. Keep strict
-host-key checking and disable agent/port forwarding. Removing that one authorized
-public key revokes the transport without changing the operator's keys.
+A project may install or use its preferred tools from this script. Project
+credentials require an explicitly configured, scoped delivery method. Partitura
+never implicitly inherits an operator keychain, home, SSH agent, signing identity
+or secret-manager identity. A reusable generic base must contain no project keys.
+Don't share a project-specific base across unrelated repositories.
 
-The installed host config is `/Library/Partitura/NativeBuild/config.json`.
-All its ancestors, the config, and the signed Tart executable must be root-owned
-and not group/other writable. `root` and `tartHome` must be canonical mode 0700
-directories owned by the dedicated account. Config has exactly these fields:
+## Host setup and automation
+
+The host needs an Apple silicon Mac supported by Tart, working SSH connectivity,
+Python 3, enough disk and memory, and a clean macOS base compatible with its Tart
+version. A macOS image and restricted SSH transport are required infrastructure;
+The guest needs selected Apple Command Line Tools or Xcode for Git, clang and
+make. A full Xcode installation and a particular SDK version are repository
+requirements, rather than Partitura requirements.
+
+The host account defaults to `partitura-build`. The guest account defaults to
+`partitura`. Both are unprivileged. The selected base, guest account and guest home
+are configuration inputs, rather than repository-specific names. The base holds
+the generic Partitura runner, qualification script, Mise and cached common
+runtimes. Its guest runner, qualifier and Mise binary are root-owned mode 0555.
+No host directories, graphics, audio, USB devices or clipboard are shared.
+
+Host preparation must finish before enabling jobs. The automation validates the
+selected base and executable pins, installs the generic guest code, prepares the
+restricted account and private storage, and records the sealed base hash and
+qualification receipt. Protected account, SSH policy and credential changes still
+require deployment approval. Host-specific paths, authorized public key, source
+image provenance, accepted Apple licenses and resource capacity must be supplied
+or checked explicitly. The installer must fail clearly for missing prerequisites;
+a successful source check alone doesn't prove host preparation or a usable VM.
+
+The toolbox deployment is optional fleet integration. The standalone host setup
+doesn't depend on the operator's toolbox, Mise configuration, fnox, or knowledge
+of a particular repository. It installs the pinned portable Mise binary into the
+guest and prepares the common tool cache there.
+Start from [settings.example.json](settings.example.json) in a private scratch
+directory. Its `REVIEWED_*` strings are required inputs, not valid defaults.
+Record a full Partitura commit and the hashes of its broker, guest runner,
+launcher, installer and qualifier. Record the signed Tart executable's hash and
+the selected source VM's tree hash. `host_setup.tree_sha256()` defines that tree
+hash, including relative paths, file modes and contents. Use the same clean source
+for qualification and record its macOS image provenance and accepted Apple
+licenses. A previously configured consumer VM isn't a clean source.
+
+The standalone sequence is:
+
+1. Download the pinned portable Mise asset with
+   `deploy/build-tools/fetch-mise.sh`. It checks the upstream SHA-256 and leaves
+   the host's own Mise installation untouched.
+2. Run `bootstrap-host.sh --runtime-root PATH --tart-home PATH --account NAME`
+   for its read-only plan. After approval, add `--apply` to create the account
+   and private storage.
+3. Run `prepare-base.sh --help`, then its preflight with the source VM name and
+   hash, preparation Tart home, runner, qualifier, guest user and exact Mise,
+   Node and Python inputs. Supply `--dedicated-tart-home` and
+   `--dedicated-account` for the broker's private destination. After approval,
+   add `--apply`. It prepares and qualifies a clone, stops it, promotes it into
+   the dedicated account's storage, and writes the destination hash and receipt.
+   The source VM stays intact.
+4. Copy the resulting base hash and receipt path into the private settings JSON.
+   Set its authorized public key and `enabled` only for the approved installation.
+   Run `python3 deploy/mac-build/host_setup.py --config PATH --check`. Exit 2
+   means prerequisites passed and managed host files need installation. Other
+   nonzero exits identify a failed prerequisite.
+5. Run the same module with `--stage-host PRIVATE_STAGE_PATH`. Check its staged
+   launcher with `python3 PRIVATE_STAGE_PATH/native_host.py --stage
+   PRIVATE_STAGE_PATH --account NAME --tart-sha256 HASH --check`. The approved
+   root installation uses those same arguments with `--apply` instead of
+   `--check` through the host's sudo route.
+6. Run the original `host_setup.py --config PATH --check` again. Require exit 0,
+   then run the acceptance checks below before enabling gateway native tools.
+
+All script paths above are relative to the pinned Partitura checkout unless
+they name the private stage. `--help` lists each script's full required inputs.
+The base needs a working Tart guest agent and noninteractive guest sudo during
+preparation. Apple image acquisition, license acceptance and the administrator's
+sudo authentication are explicit host prerequisites. None comes from Toolbox,
+fnox or a consumer repository. The setup scripts fail when prerequisites or
+pins are missing; they don't silently install a different image or toolchain.
+
+## Transport configuration
+
+The gateway uses a private SSH config selected by `NATIVE_BUILD_SSH_CONFIG_FILE`
+and a private writable directory selected by `NATIVE_BUILD_SCRATCH_ROOT`. The SSH
+config defines the fixed `partitura-native` alias, dedicated identity and pinned
+`UserKnownHostsFile`. Use strict host-key checking and disable agent and port
+forwarding. Choose your own encrypted secret storage; workers receive neither
+the config nor its private key. Revoking that one authorized key revokes the
+transport without changing the operator's keys.
+
+Install `broker.py` root:wheel 0555 outside checkouts. Its config is
+`/Library/Partitura/NativeBuild/config.json`; all ancestors and the verified Tart
+executable must be root-owned and not group/other writable. `root` and `tartHome`
+are canonical mode-0700 directories owned by the dedicated build account.
 
 ```json
 {
   "tart": "/Library/Partitura/NativeBuild/tart.app/Contents/MacOS/tart",
   "tartSha256": "REVIEWED_EXECUTABLE_SHA256",
-  "base": "onyxio-native-macos-base",
-  "root": "/Users/onyxio-build/dev/agentic-scratchpads/partitura/native-build",
-  "tartHome": "/Volumes/ExtSSD/partitura-native/tart",
+  "base": "partitura-macos-base",
+  "root": "/Users/partitura-build/dev/agentic-scratchpads/partitura/native-build",
+  "tartHome": "/Volumes/Builds/partitura/tart",
+  "guestUser": "partitura",
+  "guestHome": "/Users/partitura",
   "guestRunnerSha256": "REVIEWED_GUEST_RUNNER_SHA256",
-  "qualifierSha256": "REVIEWED_ONYXIO_QUALIFIER_SHA256"
+  "qualifierSha256": "REVIEWED_GENERIC_QUALIFIER_SHA256"
 }
 ```
 
-Install `broker.py` root:wheel 0555 outside checkouts. Install `guest-run.sh`
-as `/Library/Partitura/NativeBuild/run.sh`, root:wheel 0555 **inside the sealed
-guest**, then record its SHA-256 in the host config. Provision the exact reviewed
-Onyxio qualifier at `/Library/ONYXIO/NativePreview/qualify.sh`, with its sealed
-fnox binary/config and independent identities. Refreshing a hash alone doesn't
-qualify an old base. Re-run the qualifier before sealing it.
+The SSH forced command accepts only these requests with exact arguments and no
+shell evaluation:
 
-The native task contract inspected here is Onyxio PR 232 at
-`d96c82a6e7b0f88d2fb3f3e390564234309c7e33`. Current Onyxio main refuses native PR
-signing. Do not change that refusal or route builds through an operator checkout.
-The requested commit must contain the reviewed preview-signing consumer before
-native archive acceptance can pass.
+- `run <job32hex> <commit40hex> <pr> <action> <bundleBytes>`
+- `status <job32hex>`
+- `artifact <job32hex>`
+- `cancel <job32hex>`
 
-## Host approval and acceptance
+Source arrives as an opaque Git bundle on stdin, bounded to 1 GiB. The host never
+extracts or executes repository code. The fixed guest runner validates itself and
+the generic base qualifier before importing source. Jobs run for at most 45
+minutes. Artifact archives are bounded to 2 GiB.
 
-The source alone doesn't grant permission to create a host login or SSH rule.
-Activation requires approval for the dedicated `onyxio-build` account, its
-root-owned forced-command key configuration, and its isolated Tart storage/base.
-Use a managed host deployment. The account must have no admin membership,
-password login, shell access through the gateway key, forwarding, or PTY.
-Don't add gateway keys to the operator account.
+One host lock serializes jobs. A persisted `active-vm` fence blocks subsequent
+jobs after a crash. Cancellation creates a tombstone even before submission.
+Cleanup deletes only that job's clone. Failed cleanup keeps the fence and blocks
+new jobs until recovery establishes that the clone is gone. Host power loss
+requires recovery after the host returns. The gateway records ownership and
+cancels its interrupted jobs during restart recovery.
 
-After approval, verify account/group state, effective `sshd -T` match settings,
-installed hashes/modes, signed Tart, scoped-key positive/negative checks, and
-absence of host shares. Then run an actual archive and simulator smoke through
-Partitura. Verify artifact hash/source commit and cleanup, denial of arbitrary
-commands, cross-session denial, cancellation while running, and crash recovery.
-Keep acceptance open until those live paths pass.
+## Acceptance
 
-Host and gateway artifact retention/quota still needs deployment qualification.
-The module caches one verified artifact per job; repeated retrieval reuses it.
-Don't claim unattended disk management from the transfer size limits.
+After approved installation, verify account and SSH restrictions, exact installed
+hashes/modes, base provenance and qualification, no host shares, a generic
+repository task and artifact receipt, cross-session denial, cancellation and crash
+recovery. Then test a consumer repository's workflow separately. A successful
+consumer build doesn't prove that host setup works without that consumer's tools.
+Keep native acceptance open until the full deployed path passes.

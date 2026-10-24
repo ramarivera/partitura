@@ -1292,6 +1292,9 @@ const withAuthority = <A, E>(
   options?: {
     readonly afterShutdown?: (db: SqliteClientShape["db"]) => void;
     readonly config?: ReadonlyArray<readonly [string, string]>;
+    readonly configOverride?:
+      | ((config: GatewayConfig["Service"]) => GatewayConfig["Service"])
+      | undefined;
     readonly withLinearGateway?: boolean;
     readonly githubApp?: GitHubAppTokenService;
     readonly workerUid?: string;
@@ -1342,8 +1345,15 @@ const withAuthority = <A, E>(
         options?.withLinearGateway === true
           ? Layer.succeed(LinearGateway, mockToolsGateway)
           : (Layer.empty as Layer.Layer<LinearGateway>);
+      const gatewayConfig =
+        options?.configOverride === undefined
+          ? GatewayConfig.layer
+          : Layer.effect(
+              GatewayConfig,
+              GatewayConfig.pipe(Effect.map(options.configOverride)),
+            ).pipe(Layer.provide(GatewayConfig.layer));
       const dependencies = Layer.mergeAll(
-        GatewayConfig.layer,
+        gatewayConfig,
         TokenCrypto.layer,
         AgentSettingsRepo.layer,
         InstallationRepo.layer,
@@ -1408,6 +1418,26 @@ const install = (organizationId: OrganizationId): Installation => ({
 });
 
 describe("run settings startup snapshots", () => {
+  it.effect("refuses a directly supplied Sysbox config without a broker", () =>
+    Effect.gen(function* () {
+      const result = yield* Effect.result(
+        withAuthority(() => Effect.void, {
+          configOverride: (config) => ({
+            ...config,
+            workerSandboxMode: "sysbox",
+            sessionSandboxBrokerSocketPath: undefined,
+          }),
+        }),
+      );
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result))
+        expect(String(result.failure)).toContain(
+          "native execution is forbidden",
+        );
+      expect(workerSpawnInputs).toHaveLength(0);
+    }),
+  );
+
   it.effect("reuses the frozen settings snapshot on a worker retry", () =>
     withAuthority(() =>
       Effect.gen(function* () {
@@ -3758,6 +3788,17 @@ const seedDriverRun = (
         '[core]\nrepositoryformatversion = 0\n[http "https://github.com/"]\nextraheader = AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0\n',
       ),
     );
+    const initialized = yield* Effect.sync(() =>
+      Bun.spawnSync({
+        cmd: ["/usr/bin/git", "init", "--quiet", cwd],
+        env: {
+          PATH: "/usr/bin:/bin",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+      }),
+    );
+    expect(initialized.exitCode).toBe(0);
     yield* runs.create({
       sessionId: testSessionId,
       organizationId: testOrganizationId,
@@ -3794,10 +3835,20 @@ const withT3Authority = <A, E>(
   task: Parameters<typeof withAuthority<A, E>>[0],
   server: FakeT3Server,
   workerUid?: string,
+  sandboxMode = false,
 ) =>
   withAuthority(task, {
     withLinearGateway: true,
     ...(workerUid === undefined ? {} : { workerUid }),
+    ...(sandboxMode
+      ? {
+          configOverride: (config: GatewayConfig["Service"]) => ({
+            ...config,
+            workerSandboxMode: "sysbox" as const,
+            sessionSandboxBrokerSocketPath: "/nonexistent-sandbox-broker.sock",
+          }),
+        }
+      : {}),
     config: [
       ["T3_BASE_URL", server.baseUrl.toString()],
       ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
@@ -4203,33 +4254,35 @@ describe("AgentDriver authority integration", () => {
       }),
   );
   it.live(
-    "fails closed before contacting T3 when per-session uid isolation is active",
+    "fails closed before contacting remote T3 when uid or container isolation is active",
     () =>
       Effect.gen(function* () {
         const server = yield* t3Server;
-        yield* withT3Authority(
-          () =>
-            Effect.gen(function* () {
-              yield* seedDriverRun("t3");
-              const result = yield* (yield* SessionAuthority)
-                .processSession(testSessionId)
-                .pipe(Effect.result);
-              expect(Result.isFailure(result)).toBe(true);
-              if (Result.isFailure(result))
-                expect(result.failure.message).toContain(
-                  "shared T3 daemon cannot serve isolated worker workspaces",
-                );
-              expect(server.threads.size).toBe(0);
-              expect(server.projectMutations).toHaveLength(0);
-              expect(workerSpawnInputs).toHaveLength(0);
-              expect(
-                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
-                  .state,
-              ).toBe("orphaned");
-            }),
-          server,
-          "10001",
-        );
+        for (const sandboxMode of [false, true])
+          yield* withT3Authority(
+            () =>
+              Effect.gen(function* () {
+                yield* seedDriverRun("t3");
+                const result = yield* (yield* SessionAuthority)
+                  .processSession(testSessionId)
+                  .pipe(Effect.result);
+                expect(Result.isFailure(result)).toBe(true);
+                if (Result.isFailure(result))
+                  expect(result.failure.message).toContain(
+                    "shared T3 daemon cannot serve isolated worker workspaces",
+                  );
+                expect(server.threads.size).toBe(0);
+                expect(server.projectMutations).toHaveLength(0);
+                expect(workerSpawnInputs).toHaveLength(0);
+                expect(
+                  Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                    .state,
+                ).toBe("orphaned");
+              }),
+            server,
+            sandboxMode ? undefined : "10001",
+            sandboxMode,
+          );
       }),
   );
   it.live(
@@ -4296,6 +4349,12 @@ describe("AgentDriver authority integration", () => {
               );
               expect(workspaceGitConfig).not.toContain("AUTHORIZATION");
               expect(workspaceGitConfig).not.toContain("ghs_launch");
+              expect(workspaceGitConfig).toMatch(
+                /\[url "http:\/\/127\.0\.0\.1:\d+\/git\/[A-Za-z0-9_-]+\/org\/repo"\]/u,
+              );
+              expect(workspaceGitConfig).toContain(
+                "insteadOf = https://github.com/org/repo",
+              );
               expect(JSON.stringify(server.requests)).not.toContain(minted);
               expect(JSON.stringify(server.requests)).not.toContain(
                 "ghs_launch",

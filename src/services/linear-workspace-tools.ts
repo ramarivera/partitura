@@ -41,49 +41,6 @@ export const LINEAR_WORKSPACE_READ_TOOL: RpcHostToolDefinition = {
   },
 };
 
-export const LINEAR_WORKSPACE_WRITE_TOOL: RpcHostToolDefinition = {
-  name: "linear_workspace_write",
-  label: "Linear: workspace write",
-  description:
-    "Create or update workspace issues, comments, projects, project updates, initiatives, cycles, milestones, documents, and issue labels. This tool has no delete, archive, or trash operations. Each operation accepts only documented writable fields.",
-  parameters: {
-    type: "object",
-    additionalProperties: false,
-    required: ["operation", "input"],
-    properties: {
-      operation: {
-        type: "string",
-        enum: [
-          "create_issue",
-          "update_issue",
-          "create_comment",
-          "create_project",
-          "update_project",
-          "create_project_update",
-          "update_project_update",
-          "create_initiative",
-          "update_initiative",
-          "create_cycle",
-          "update_cycle",
-          "create_project_milestone",
-          "update_project_milestone",
-          "create_document",
-          "update_document",
-          "create_issue_label",
-          "update_issue_label",
-        ],
-      },
-      id: { type: "string", minLength: 1 },
-      input: { type: "object", additionalProperties: true },
-    },
-  },
-};
-
-export const LINEAR_WORKSPACE_TOOLS = [
-  LINEAR_WORKSPACE_READ_TOOL,
-  LINEAR_WORKSPACE_WRITE_TOOL,
-] as const;
-
 /** Query names, arguments, and selected entity fields follow @linear/sdk 89.0.0. */
 export const LINEAR_WORKSPACE_READS = {
   get_issue: {
@@ -433,6 +390,41 @@ export const LINEAR_WORKSPACE_MUTATIONS = {
 } as const;
 
 export type LinearWorkspaceMutation = keyof typeof LINEAR_WORKSPACE_MUTATIONS;
+
+const describeMutationFields = () =>
+  Object.entries(LINEAR_WORKSPACE_MUTATIONS)
+    .map(([operation, definition]) => {
+      const required = new Set<string>(definition.required);
+      const fields = definition.allowed
+        .map((field) => `${field}${required.has(field) ? " (required)" : ""}`)
+        .join(", ");
+      return `${operation}: ${fields}`;
+    })
+    .join("; ");
+
+export const LINEAR_WORKSPACE_WRITE_TOOL: RpcHostToolDefinition = {
+  name: "linear_workspace_write",
+  label: "Linear: workspace write",
+  description: `Create or update workspace issues, comments, projects, project updates, initiatives, cycles, milestones, documents, and issue labels. This tool has no delete, archive, or trash operations. Allowed and required input fields by operation: ${describeMutationFields()}.`,
+  parameters: {
+    type: "object",
+    additionalProperties: false,
+    required: ["operation", "input"],
+    properties: {
+      operation: {
+        type: "string",
+        enum: Object.keys(LINEAR_WORKSPACE_MUTATIONS),
+      },
+      id: { type: "string", minLength: 1 },
+      input: { type: "object", additionalProperties: true },
+    },
+  },
+};
+
+export const LINEAR_WORKSPACE_TOOLS = [
+  LINEAR_WORKSPACE_READ_TOOL,
+  LINEAR_WORKSPACE_WRITE_TOOL,
+] as const;
 
 export const validateLinearWorkspaceMutationInput = (
   operation: LinearWorkspaceMutation,

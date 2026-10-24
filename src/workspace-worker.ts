@@ -19,6 +19,7 @@ import {
   materializeMcpAgentDb,
   removeMcpAgentDbFile,
 } from "./services/mcp-oauth.js";
+import { seedWorkerBuildTools } from "./services/worker-build-tools.js";
 import {
   seedWorkerProfileFiles,
   type WorkerProfileManifest,
@@ -101,6 +102,7 @@ switch (action) {
   case "tool-directories": {
     for (const name of [".omp-home", ".omp-tmp"])
       await mkdir(join(cwd, name), { recursive: true, mode: 0o700 });
+    await seedWorkerBuildTools(cwd);
     await mkdir(join(cwd, ".git", "info"), { recursive: true });
     const excludePath = join(cwd, ".git", "info", "exclude");
     const existing = await readFile(excludePath, "utf8").catch(

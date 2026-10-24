@@ -11,6 +11,7 @@ import {
   Effect,
   Fiber,
   Layer,
+  Logger,
   Result,
   Schema,
 } from "effect";
@@ -262,10 +263,223 @@ describe("retention", () => {
             )
             .all(),
         ).toEqual([
-          { session_id: "orphan", active: 1 },
+          { session_id: "orphan", active: 0 },
           { session_id: "sandbox", active: 0 },
         ]);
       }).pipe(withDatabase),
+  );
+
+  it.live(
+    "fences an unpublished sandbox identity when broker cleanup fails",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        insertRun(db, "orphan", "failed");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('orphan', 21002, 1)",
+        ).run();
+        const privatePath = join(root, "private-workspace");
+        const secret = "retention-private-token";
+        const logs: Array<string> = [];
+        const logger = Logger.make((entry) => logs.push(JSON.stringify(entry)));
+        const beforeRetireSession = vi.fn(async () => {
+          throw new Error(`failed at ${privatePath} with token=${secret}`);
+        });
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          beforeRetireSession,
+        })
+          .sweep(now)
+          .pipe(Effect.provide(Logger.layer([logger])));
+        expect(beforeRetireSession).toHaveBeenCalledWith("orphan");
+        expect(result.skippedWorkspaces).toBe(1);
+        const logged = logs.join("\n");
+        expect(logged).toContain("retention.deletion_claim_retained");
+        expect(logged).toContain("orphan");
+        expect(logged).toContain("Error");
+        expect(logged).not.toContain(privatePath);
+        expect(logged).not.toContain(secret);
+        expect(
+          db
+            .query(
+              "SELECT state, canonical_path FROM workspace WHERE session_id='orphan'",
+            )
+            .get(),
+        ).toMatchObject({ state: "deleting" });
+        const claim = db
+          .query<{ canonical_path: string }, []>(
+            "SELECT canonical_path FROM workspace WHERE session_id='orphan'",
+          )
+          .get();
+        expect(claim?.canonical_path).not.toContain(`${root}/`);
+        expect(
+          db
+            .query(
+              "SELECT active FROM worker_identity WHERE session_id='orphan'",
+            )
+            .get(),
+        ).toEqual({ active: 1 });
+      }).pipe(withDatabase),
+  );
+
+  it.live("retires a published workspace whose run path wasn't persisted", () =>
+    Effect.gen(function* () {
+      const { db } = yield* SqliteClient;
+      const root = testPath("root");
+      const workspace = testPath("root/published");
+      insertRun(db, "published", "failed");
+      db.query(
+        "INSERT INTO workspace VALUES ('published', ?, 'repo-id', 'https://example.test/repo', 'main', 'ready', 1, 1)",
+      ).run(workspace);
+      db.query(
+        "INSERT INTO worker_identity VALUES ('published', 21002, 1)",
+      ).run();
+      const beforeRetireSession = vi.fn(async () => {
+        expect(db.inTransaction).toBe(false);
+        expect(
+          db
+            .query(
+              "SELECT canonical_path, repository_id, state FROM workspace WHERE session_id='published'",
+            )
+            .get(),
+        ).toEqual({
+          canonical_path: workspace,
+          repository_id: "repo-id",
+          state: "deleting",
+        });
+      });
+      const removeWorkspace = vi.fn((path: string) => {
+        expect(path).toBe(workspace);
+      });
+      const result = yield* makeRetention({
+        db,
+        workspaceRoot: root,
+        policy,
+        webhookReplayWindowMs: 100,
+        beforeRetireSession,
+        removeWorkspace,
+      }).sweep(now);
+      expect(result.workspaces).toBe(1);
+      expect(beforeRetireSession).toHaveBeenCalledOnce();
+      expect(removeWorkspace).toHaveBeenCalledOnce();
+      expect(
+        db.query("SELECT * FROM workspace WHERE session_id='published'").all(),
+      ).toEqual([]);
+      expect(
+        db
+          .query(
+            "SELECT active FROM worker_identity WHERE session_id='published'",
+          )
+          .get(),
+      ).toEqual({ active: 0 });
+    }).pipe(withDatabase),
+  );
+
+  it.live(
+    "keeps an orphan identity fenced when uid cleanup fails, then retries it",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        insertRun(db, "orphan", "failed");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('orphan', 21002, 1)",
+        ).run();
+        const seal = vi
+          .spyOn(workerSecurity, "sealWorkerUidWorkspacesSync")
+          .mockImplementation(() => {
+            throw new Error("injected uid seal failure");
+          });
+        const retention = makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          beforeRetireSession: async () => {},
+        });
+        expect((yield* retention.sweep(now)).skippedWorkspaces).toBe(1);
+        expect(
+          db
+            .query(
+              "SELECT active FROM worker_identity WHERE session_id='orphan'",
+            )
+            .get(),
+        ).toEqual({ active: 1 });
+        expect(
+          db
+            .query("SELECT state FROM workspace WHERE session_id='orphan'")
+            .get(),
+        ).toEqual({ state: "deleting" });
+        seal.mockRestore();
+        expect((yield* retention.sweep(now)).skippedWorkspaces).toBe(0);
+        expect(
+          db
+            .query(
+              "SELECT active FROM worker_identity WHERE session_id='orphan'",
+            )
+            .get(),
+        ).toEqual({ active: 0 });
+        expect(
+          db.query("SELECT * FROM workspace WHERE session_id='orphan'").all(),
+        ).toEqual([]);
+      }).pipe(withDatabase),
+  );
+
+  it.live(
+    "prevents a concurrent resume while an orphan sandbox is being destroyed",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const runs = yield* RunRepo;
+        const root = testPath("root");
+        const session = Schema.decodeUnknownSync(SessionId)("orphan");
+        insertRun(db, "orphan", "canceled");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('orphan', 21002, 1)",
+        ).run();
+        const started = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const retention = makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          beforeRetireSession: async () => {
+            started.resolve();
+            await release.promise;
+          },
+        });
+        const deletion = yield* retention
+          .sweep(now)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.gen(function* () {
+          yield* Effect.promise(() => started.promise);
+          expect(yield* runs.reopen(session)).toBe(false);
+          expect(
+            db
+              .query(
+                "SELECT active FROM worker_identity WHERE session_id='orphan'",
+              )
+              .get(),
+          ).toEqual({ active: 1 });
+        }).pipe(Effect.ensuring(Effect.sync(() => release.resolve())));
+        expect((yield* Fiber.join(deletion)).workspaces).toBe(0);
+        expect(
+          db
+            .query(
+              "SELECT active FROM worker_identity WHERE session_id='orphan'",
+            )
+            .get(),
+        ).toEqual({ active: 0 });
+        expect(
+          db.query("SELECT * FROM workspace WHERE session_id='orphan'").all(),
+        ).toEqual([]);
+        expect(yield* runs.reopen(session)).toBe(true);
+      }).pipe(Effect.provide(RunRepo.layer), withDatabase),
   );
 
   it.live(

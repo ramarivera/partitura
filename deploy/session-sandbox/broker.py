@@ -174,8 +174,8 @@ def provision(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("PARTITURA_GATEWAY_NETWORK_CONTAINER must name the network owner")
     container = _container(session)
     network = _network(session)
-    _run(["network", "create", "--internal", "--label", f"partitura.session={session}", network])
     try:
+        _run(["network", "create", "--internal", "--label", f"partitura.session={session}", network])
         relay_ip = _run(
             ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
         )
@@ -352,6 +352,7 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         "T3CODE_TELEMETRY_ENABLED", "DISABLE_AUTOUPDATER",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "CLIPROXYAPI_BASE_URL", "CLIPROXYAPI_API_KEY",
+        "PI_CLAUDE_DRIVER", "PI_CLAUDE_AUTH", "PI_CLAUDE_EXECUTABLE",
     }
     if set(env) - allowed_env:
         raise ValueError("environment contains unsupported variables")

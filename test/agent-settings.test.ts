@@ -168,6 +168,34 @@ describe("per-run settings resolution", () => {
     expect(result.sources.model).toBe("project-label");
   });
 
+  it("normalizes issue and project labels before matching and fallback", () => {
+    const result = resolveRunSettings({
+      settings: base,
+      issueLabels: [" MODEL:T3ONLY ", " DRIVER:OMP "],
+      projectLabels: [" Model:SAFE ", " MODE:AUTO ", " EFFORT:HIGH "],
+      environment: {
+        driver: "t3",
+        ompModel: null,
+        t3Model: null,
+        effort: null,
+        mode: "approval-required",
+      },
+    });
+    expect(result).toMatchObject({
+      driver: "omp",
+      modelAlias: "safe",
+      ompModel: "cliproxyapi/gpt-6-sol",
+      effort: "high",
+      runtimeMode: "auto",
+      sources: {
+        driver: "issue-label",
+        model: "project-label",
+        effort: "project-label",
+        mode: "project-label",
+      },
+    });
+  });
+
   it("selects an organization model default for the effective driver", () => {
     const settings = validateAgentSettings({
       defaults: { ompModel: "safe", t3Model: "t3only" },

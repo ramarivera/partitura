@@ -21,7 +21,7 @@ MAX_BUNDLE = 1024 * 1024 * 1024
 MAX_ARTIFACT = 2 * MAX_BUNDLE
 JOB = r'[a-f0-9]{32}'
 COMMIT = r'[a-f0-9]{40}'
-RUN = re.compile(rf'run ({JOB}) ({COMMIT}) ([1-9][0-9]{{0,7}}) (archive|native-smoke) ([1-9][0-9]{{0,9}})')
+RUN = re.compile(rf'run ({JOB}) ({COMMIT}) ([1-9][0-9]{{0,7}}) ([a-z][a-z0-9-]{{0,63}}) ([1-9][0-9]{{0,9}})')
 READ = re.compile(rf'(status|artifact|cancel) ({JOB})')
 
 
@@ -52,7 +52,7 @@ def sealed(path):
 
 def load_config():
     config = json.loads(sealed(CONFIG).read_text())
-    if set(config) != {'tart', 'tartSha256', 'base', 'root', 'tartHome', 'guestRunnerSha256', 'qualifierSha256'}:
+    if set(config) != {'tart', 'tartSha256', 'base', 'root', 'tartHome', 'guestRunnerSha256', 'qualifierSha256', 'guestUser', 'guestHome'}:
         raise ValueError('invalid installed configuration')
     tart = sealed(config['tart'])
     if hashlib.sha256(tart.read_bytes()).hexdigest() != config['tartSha256']:
@@ -62,6 +62,10 @@ def load_config():
             raise ValueError('invalid installed digest')
     if not re.fullmatch('[a-z0-9][a-z0-9-]{1,80}', config['base']):
         raise ValueError('invalid sealed base name')
+    if not re.fullmatch('[a-z][a-z0-9_-]{0,30}', config['guestUser']) or config['guestUser'] == 'root':
+        raise ValueError('invalid guest user')
+    if config['guestHome'] != '/Users/' + config['guestUser']:
+        raise ValueError('invalid guest home')
     for key in ('root', 'tartHome'):
         path = Path(config[key])
         info = path.lstat()
@@ -108,6 +112,25 @@ def owned(arguments, environment, timeout, **kwargs):
         stop(child)
 
 
+def prepare_clone(config, vm):
+    """Tart preserves sealed file modes; only the disposable clone may change."""
+    directory = Path(config['tartHome']) / 'vms' / vm
+    if directory.resolve() != directory:
+        raise ValueError('unsafe disposable VM directory')
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError('unsafe disposable VM owner')
+    for name in ('config.json', 'disk.img', 'nvram.bin'):
+        descriptor = os.open(directory / name, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise ValueError('unsafe disposable VM file')
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode) | stat.S_IWUSR)
+        finally:
+            os.close(descriptor)
+
+
 def bounded_output(arguments, environment, destination, timeout):
     child = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
     size = 0
@@ -152,7 +175,7 @@ def record(directory, **receipt):
 
 
 def environment_for(config):
-    return {'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'TART_HOME': config['tartHome']}
+    return {'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'TART_HOME': config['tartHome'], 'TART_NO_AUTO_PRUNE': '1'}
 
 
 def destroy_vm(config, job):
@@ -162,7 +185,13 @@ def destroy_vm(config, job):
         owned([config['tart'], 'stop', vm], environment, 45, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass  # An already stopped VM still needs deletion and its readback.
-    owned([config['tart'], 'delete', vm], environment, 45, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        owned([config['tart'], 'delete', vm], environment, 45, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        # Tart reports an error for an already absent VM, including a clone
+        # that failed before creating it. The filesystem readback is decisive.
+        if os.path.lexists(Path(config['tartHome']) / 'vms' / vm):
+            raise
     if os.path.lexists(Path(config['tartHome']) / 'vms' / vm):
         raise ValueError('VM still exists after deletion')
 
@@ -214,8 +243,15 @@ def run_job(config, request):
         directory.mkdir(mode=0o700)
         record(directory, job=job, commit=commit, action=action, state='receiving')
         bundle = directory / 'source.bundle'
-        with bundle.open('xb') as output:
-            receive(sys.stdin.buffer, output, length)
+        try:
+            with bundle.open('xb') as output:
+                receive(sys.stdin.buffer, output, length)
+        except BaseException as error:
+            try:
+                bundle.unlink(missing_ok=True)
+                record(directory, job=job, commit=commit, action=action, state='failed', cause=type(error).__name__)
+            finally:
+                raise
         if cancelled.exists():
             bundle.unlink()
             record(directory, job=job, commit=commit, action=action, state='cancelled')
@@ -241,6 +277,7 @@ def run_job(config, request):
             durable_write(active, job + '\n')
             clone_attempted = True
             owned([tart, 'clone', config['base'], vm], environment, 180, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            prepare_clone(config, vm)
             boot = subprocess.Popen([tart, 'run', vm, '--no-graphics', '--no-audio', '--no-usb-accessories', '--no-clipboard'], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             ready = False
             for _ in range(60):
@@ -258,8 +295,8 @@ def run_job(config, request):
             # The fixed installed guest runner verifies its own sealed qualifier,
             # receives a Git bundle, and never uses host mounts or credentials.
             with bundle.open('rb') as source:
-                owned([tart, 'exec', '-i', vm, '/usr/bin/sudo', '-n', '-u', 'previewrunner', '/usr/bin/env', '-i', 'HOME=/Users/previewrunner', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', '/bin/bash', '/Library/Partitura/NativeBuild/run.sh', job, commit, pr, action, config['guestRunnerSha256'], config['qualifierSha256']], environment, 2700, stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            size = bounded_output([tart, 'exec', vm, '/usr/bin/sudo', '-n', '-u', 'previewrunner', '/usr/bin/tar', '-C', '/Users/previewrunner/dev/agentic-scratchpads/partitura/' + job, '-cf', '-', 'artifacts'], environment, directory / 'artifacts.tar', 180)
+                owned([tart, 'exec', '-i', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/env', '-i', 'HOME=' + config['guestHome'], 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', '/bin/bash', '/Library/Partitura/NativeBuild/run.sh', job, commit, pr, action, config['guestRunnerSha256'], config['qualifierSha256']], environment, 2700, stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            size = bounded_output([tart, 'exec', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/tar', '-C', config['guestHome'] + '/dev/agentic-scratchpads/partitura/' + job, '-cf', '-', 'artifacts'], environment, directory / 'artifacts.tar', 180)
             digest = hashlib.sha256()
             with (directory / 'artifacts.tar').open('rb') as artifact:
                 for block in iter(lambda: artifact.read(65536), b''):

@@ -180,6 +180,11 @@ export const startGitHubGitBroker = (input: {
           request.method === "POST"
             ? await boundedBody(request, MAX_REQUEST_BYTES)
             : undefined;
+        const gitProtocol = request.headers.get("git-protocol");
+        const contentEncoding = request.headers
+          .get("content-encoding")
+          ?.trim()
+          .toLowerCase();
         const token = input.tokenForRequest
           ? await input.tokenForRequest(signal)
           : input.token;
@@ -191,6 +196,9 @@ export const startGitHubGitBroker = (input: {
           headers: {
             accept:
               "application/x-git-upload-pack-advertisement, application/x-git-upload-pack-result, application/x-git-receive-pack-result, */*",
+            ...(gitProtocol === "version=2"
+              ? { "git-protocol": gitProtocol }
+              : {}),
             ...(token === undefined
               ? {}
               : {
@@ -201,6 +209,9 @@ export const startGitHubGitBroker = (input: {
                   "content-type":
                     request.headers.get("content-type") ??
                     "application/x-git-upload-pack-request",
+                  ...(contentEncoding === "gzip"
+                    ? { "content-encoding": "gzip" }
+                    : {}),
                 }
               : {}),
           },
@@ -232,7 +243,10 @@ export const startGitHubGitBroker = (input: {
   }
   const host = bindHost.includes(":") ? `[${bindHost}]` : bindHost;
   const baseUrl = `http://${host}:${port}/git/${bearer}/${owner}/${repository}`;
-  const remote = `https://github.com/${owner}/${repository}`;
+  // Match the repository's configured URL exactly. Rewriting the prefix
+  // without a trailing .git leaves that suffix in the broker path, where it
+  // looks like a different repository.
+  const remote = input.repository.url;
   const gitConfigFor = (relayBaseUrl: string) => {
     const endpoint = new URL(relayBaseUrl);
     if (

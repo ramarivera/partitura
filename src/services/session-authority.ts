@@ -411,6 +411,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const mcpProxies = new Map<SessionId, () => void>();
       const sandboxHandles = new Map<SessionId, SessionSandboxHandle>();
       const sandboxRelays = new Map<SessionId, SessionSandboxRelay[]>();
+      const gitBrokers = new Map<SessionId, { readonly stop: () => void }>();
       // One pool per gateway: launched T3 daemons never share a port.
       let t3PortPool: T3PortPool | undefined;
       const t3Ports = (launch: T3LaunchConfig): T3PortPool => {
@@ -425,10 +426,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         for (const relay of sandboxRelays.get(sessionId) ?? []) relay.stop();
         sandboxRelays.delete(sessionId);
       };
+      const stopGitBroker = (sessionId: SessionId) => {
+        gitBrokers.get(sessionId)?.stop();
+        gitBrokers.delete(sessionId);
+      };
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           for (const sessionId of sandboxHandles.keys())
             stopSandboxRelays(sessionId);
+          for (const sessionId of gitBrokers.keys()) stopGitBroker(sessionId);
           for (const stop of mcpProxies.values()) stop();
           mcpProxies.clear();
         }),
@@ -445,6 +451,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const workerIdentities = yield* WorkerIdentityRepo;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      if (
+        config.workerSandboxMode === "sysbox" &&
+        config.sessionSandboxBrokerSocketPath === undefined
+      )
+        return yield* new RpcSpawnError({
+          message:
+            "Sysbox workers require SESSION_SANDBOX_BROKER_SOCKET; native execution is forbidden",
+        });
       type NativeBuildClient = Awaited<
         ReturnType<
           typeof import("./native-build-client.js").createNativeBuildClient
@@ -1358,6 +1372,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const dropWorker = (sessionId: SessionId) =>
         Effect.gen(function* () {
           stopMcpProxy(sessionId);
+          stopGitBroker(sessionId);
           yield* cancelSessionNativeBuilds(sessionId);
           const state = (yield* Ref.get(workersRef)).get(sessionId);
           if (state !== undefined) {
@@ -1898,7 +1913,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   name: "native_build_start",
                   label: "Native build: start",
                   description:
-                    "Start the configured isolated native build for this commit and pull request.",
+                    "Run the repository's .partitura/native-build.sh action in an isolated macOS VM for this commit and pull request.",
                   parameters: {
                     type: "object",
                     additionalProperties: false,
@@ -1915,7 +1930,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                       },
                       action: {
                         type: "string",
-                        enum: ["archive", "native-smoke"],
+                        pattern: "^[a-z][a-z0-9-]{0,63}$",
                       },
                     },
                   },
@@ -2060,8 +2075,8 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                       if (
                         typeof raw.commit !== "string" ||
                         typeof raw.pullRequest !== "number" ||
-                        (raw.action !== "archive" &&
-                          raw.action !== "native-smoke")
+                        typeof raw.action !== "string" ||
+                        !/^[a-z][a-z0-9-]{0,63}$/u.test(raw.action)
                       )
                         return fail("Invalid native build request");
                       const started = await client.start({
@@ -2579,9 +2594,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         cwd: string,
         environment: Record<string, string>,
         refreshWorkspaceCredentials: boolean,
+        sandbox: { readonly handle: SessionSandboxHandle } | undefined,
       ): Effect.fn.Return<
         void,
-        DatabaseError | RowDecodeError | NixEnvironmentError | WorkspaceError
+        | DatabaseError
+        | RowDecodeError
+        | NixEnvironmentError
+        | RpcSpawnError
+        | WorkspaceError
       > {
         if (Option.isSome(run.repositoryId)) {
           const repository = yield* workspaceRepo.getRepository(
@@ -2631,7 +2651,38 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 cwd,
               );
             }
+            stopGitBroker(run.sessionId);
+            const broker = yield* workspace.openGitBroker(
+              run.sessionId,
+              repository.value,
+              sandbox?.handle.gatewayAddress,
+            );
+            if (broker === undefined) {
+              yield* workspace.clearGitBrokerConfig(run.sessionId, cwd);
+            } else {
+              gitBrokers.set(run.sessionId, broker);
+              const relay =
+                sandbox === undefined
+                  ? undefined
+                  : yield* openSandboxRelay(
+                      run.sessionId,
+                      "gateway",
+                      broker.port,
+                    );
+              yield* workspace.configureGitBroker(
+                run.sessionId,
+                cwd,
+                broker,
+                relay?.baseUrl,
+              );
+            }
+          } else {
+            stopGitBroker(run.sessionId);
+            yield* workspace.clearGitBrokerConfig(run.sessionId, cwd);
           }
+        } else {
+          stopGitBroker(run.sessionId);
+          yield* workspace.clearGitBrokerConfig(run.sessionId, cwd);
         }
       });
 
@@ -2714,13 +2765,19 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           const settingsIssueLabels = legacySessionLabels
             ? labels.filter(
                 (label) =>
-                  !label.startsWith(organizationSettings.labelPrefixes.driver),
+                  !label
+                    .trim()
+                    .toLowerCase()
+                    .startsWith(organizationSettings.labelPrefixes.driver),
               )
             : labels;
           const settingsProjectLabels = legacySessionLabels
             ? projectLabels.filter(
                 (label) =>
-                  !label.startsWith(organizationSettings.labelPrefixes.driver),
+                  !label
+                    .trim()
+                    .toLowerCase()
+                    .startsWith(organizationSettings.labelPrefixes.driver),
               )
             : projectLabels;
           const resolved = resolveRunSettings({
@@ -2807,7 +2864,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           if (t3Config.connection._tag === "Remote") {
             // One shared daemon can't reach mode-0700 per-uid workspaces
             // without collapsing session isolation.
-            if (uid !== undefined)
+            if (uid !== undefined || config.workerSandboxMode === "sysbox")
               return yield* new RpcSpawnError({
                 message:
                   "A shared T3 daemon cannot serve isolated worker workspaces; set T3_MODE=launch",
@@ -2889,6 +2946,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               cwd,
               environment,
               refreshWorkspaceCredentials,
+              sandbox,
             );
             yield* Effect.tryPromise({
               try: () => workspaceProcess(cwd, "tool-directories", null),
@@ -3036,7 +3094,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           const worker = yield* openDriverWorker(driver, {
             sessionKey: run.sessionId,
             title: `Linear ${Option.getOrElse(run.issueId, () => run.sessionId)}`,
-            workspace: { _tag: "Directory", path: cwd },
+            workspace: {
+              _tag: "Directory",
+              path: sandboxHandles.get(run.sessionId)?.workspace ?? cwd,
+            },
             runtimeMode: effective.runtimeMode,
             ...(Option.isSome(saved) ? { resume: { ref: saved.value } } : {}),
           }).pipe(Effect.provideService(Scope.Scope, scope));
@@ -3119,6 +3180,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           cwd,
           environment,
           refreshWorkspaceCredentials,
+          sandbox,
         );
         const listMcp: Effect.Effect<
           ReadonlyArray<McpServerRecord>,
@@ -3382,6 +3444,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           Effect.onError(() =>
             Effect.gen(function* () {
               stopMcpProxy(args[0].sessionId);
+              stopGitBroker(args[0].sessionId);
               stopSandboxRelays(args[0].sessionId);
               yield* bestEffort(
                 `destroy failed sandbox for ${args[0].sessionId}`,

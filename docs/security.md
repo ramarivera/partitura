@@ -236,11 +236,14 @@ gateway under the session's worker uid, with the same `setpriv` flags, env
 allowlist and model-credential injection as an OMP worker. Its `HOME` and T3
 state directory are inside the session's mode-0700 workspace. Settings are
 written as the worker uid by `src/workspace-worker.ts` and hold no credential.
-The daemon binds `127.0.0.1` only. Its bearer is issued per launch, as the
-worker uid, against that daemon's own state, so another daemon rejects it.
-Before sending the bearer, at launch and on every reconnect, the gateway checks
+For native launches the daemon binds `127.0.0.1`. Its bearer is issued per launch,
+as the worker uid, against that daemon's own state, so another daemon rejects it.
+Before sending the bearer for a native launch, at launch and on every reconnect, the gateway checks
 `/proc/net/tcp{,6}` and requires every listener on the daemon's port to belong
-to the session uid. A port held by any other uid fails the launch. The daemon's
+to the session uid. A port held by any other uid fails the launch. In Sysbox mode,
+the daemon binds `0.0.0.0` inside its session container. The per-session internal
+network and relay peer check replace the host listener-ownership check; the
+gateway connects through that session's relay. The daemon's
 startup pairing code is discarded from logs. Remote mode, one daemon shared by
 every session, is refused while uid isolation is active. See
 `docs/agent-drivers.md`.

@@ -588,6 +588,62 @@ describe("Workspace", () => {
   );
 
   it.live(
+    "replaces stale broker rewrites for each worker launch and clears them",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const id = sessionId("github-broker-rewrite");
+        const record = repositoryRecord({
+          id: "github-broker-rewrite",
+          url: "https://github.com/octo-org/private-repo.git",
+        });
+        const target = join(fixture.workspaceRoot, safeSessionKey(id));
+        yield* fixtureIo("workspace target creation", () =>
+          mkdir(target, { recursive: true }),
+        );
+        yield* runGit(["init"], target);
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({ name: "bot", email: "bot@example.test" }),
+            getInstallationToken: () => Effect.succeed("fresh-token"),
+          },
+        });
+        const first = yield* Effect.acquireRelease(
+          workspace.openGitBroker(id, record),
+          (broker) => Effect.sync(() => broker?.stop()),
+        );
+        expect(first).toBeDefined();
+        if (first === undefined) return;
+        yield* workspace.configureGitBroker(id, target, first);
+        expect(yield* readGitConfig(first.gitConfigKey, target)).toBe(
+          record.url,
+        );
+
+        const second = yield* Effect.acquireRelease(
+          workspace.openGitBroker(id, record),
+          (broker) => Effect.sync(() => broker?.stop()),
+        );
+        expect(second).toBeDefined();
+        if (second === undefined) return;
+        yield* workspace.configureGitBroker(id, target, second);
+        expect(
+          yield* readGitConfig(first.gitConfigKey, target),
+        ).toBeUndefined();
+        expect(yield* readGitConfig(second.gitConfigKey, target)).toBe(
+          record.url,
+        );
+
+        yield* workspace.clearGitBrokerConfig(id, target);
+        expect(
+          yield* readGitConfig(second.gitConfigKey, target),
+        ).toBeUndefined();
+      }),
+  );
+
+  it.live(
     "never writes the bot identity into a repository enclosing a non-checkout target",
     () =>
       Effect.gen(function* () {

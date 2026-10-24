@@ -1,4 +1,6 @@
 import { createConnection, isIPv4 } from "node:net";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Effect, Schema } from "effect";
 
 export class SandboxBrokerError extends Schema.TaggedError<SandboxBrokerError>()(
@@ -57,6 +59,15 @@ interface BrokerResponse {
 
 const SESSION_ID = /^[a-zA-Z0-9_-]{1,96}$/u;
 
+const sandboxWorkerScript = fileURLToPath(
+  new URL(
+    import.meta.url.endsWith(".ts")
+      ? "../session-sandbox-exec.ts"
+      : "./session-sandbox-exec.js",
+    import.meta.url,
+  ),
+);
+
 export const sandboxContainerName = (sessionId: string): string => {
   if (!SESSION_ID.test(sessionId))
     throw new Error("Invalid sandbox session id");
@@ -110,15 +121,22 @@ export const sandboxWorkerLaunch = (
     throw new Error("Sandbox worker command cannot be empty");
   if (!cwd.startsWith("/"))
     throw new Error("Sandbox worker cwd must be absolute");
-  const wrapper = new URL("../session-sandbox-exec.js", import.meta.url)
-    .pathname;
   const normalizedWorkspace = cwd.endsWith("/") ? cwd.slice(0, -1) : cwd;
   const mapWorkspace = (value: string) =>
     value === normalizedWorkspace || value.startsWith(`${normalizedWorkspace}/`)
       ? `/workspace${value.slice(normalizedWorkspace.length)}`
       : value;
   return {
-    command: [process.execPath, wrapper, "--", ...command.map(mapWorkspace)],
+    command: [
+      process.execPath,
+      `--cwd=${dirname(sandboxWorkerScript)}`,
+      "--config=/dev/null",
+      "--no-env-file",
+      "--no-install",
+      sandboxWorkerScript,
+      "--",
+      ...command.map(mapWorkspace),
+    ],
     env: {
       PARTITURA_SANDBOX_BROKER_SOCKET: brokerSocketPath,
       PARTITURA_SANDBOX_SESSION_ID: sessionId,

@@ -175,7 +175,7 @@ export const startLinearMcpServer = (input: {
     error: () => new Response("Linear MCP request failed", { status: 502 }),
   });
   return {
-    url: `http://127.0.0.1:${server.port}/mcp`,
+    url: new URL("/mcp", server.url).toString(),
     authorizationHeader: `Bearer ${bearer}`,
     stop: () => {
       lifetime.abort();

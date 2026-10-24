@@ -6,14 +6,35 @@ FROM docker:${DOCKER_VERSION}-dind AS docker
 
 FROM node:26.8.1-bookworm-slim AS node
 
-FROM rust:1.98.1-bookworm AS rust-tools
-ARG MISE_VERSION=2026.10.15
-ARG FNOX_VERSION=1.42.0
+FROM oven/bun:1.3.14 AS mise-tools
+ARG TARGETARCH
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends cmake libudev-dev \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
-RUN cargo install mise --version "${MISE_VERSION}" --locked
-RUN cargo install fnox --version "${FNOX_VERSION}" --locked
+COPY deploy/build-tools/fetch-mise.sh /usr/local/bin/fetch-mise
+RUN chmod 0755 /usr/local/bin/fetch-mise \
+  && case "${TARGETARCH}" in \
+       amd64) platform=linux-x64 ;; \
+       arm64) platform=linux-arm64 ;; \
+       *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
+  && install -d /usr/local/bin \
+  && fetch-mise "${platform}" /usr/local/bin/mise
+COPY deploy/build-tools/mise.toml /opt/partitura/build-tools/mise.toml
+ENV MISE_DATA_DIR=/opt/partitura/mise
+ENV MISE_TRUSTED_CONFIG_PATHS=/opt/partitura/build-tools
+ENV MISE_YES=1
+WORKDIR /opt/partitura/build-tools
+RUN /usr/local/bin/mise install \
+  && install -d /opt/partitura/bin \
+  && node_bin="$(/usr/local/bin/mise which node)" \
+  && node_root="${node_bin%/bin/node}" \
+  && ln -s "$node_bin" /opt/partitura/bin/node \
+  && ln -s "$node_root/lib/node_modules/npm/bin/npm-cli.js" /opt/partitura/bin/npm \
+  && ln -s "$node_root/lib/node_modules/npm/bin/npx-cli.js" /opt/partitura/bin/npx \
+  && ln -s "$(/usr/local/bin/mise which python)" /opt/partitura/bin/python \
+  && ln -s "$(/usr/local/bin/mise which python3)" /opt/partitura/bin/python3 \
+  && chmod -R go-w /opt/partitura
 
 FROM oven/bun:1.3.14 AS worker-extensions
 WORKDIR /opt/omp-extensions
@@ -35,7 +56,7 @@ ARG T3_VERSION=0.1.2
 ARG CODEX_VERSION=0.156.1
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PATH="/mise/shims:/mise/bin:/opt/t3:/opt/codex/bin:/opt/claude/bin:/usr/local/bin:/usr/bin:/bin"
+ENV PATH="/opt/partitura/bin:/mise/shims:/mise/bin:/opt/t3:/opt/codex/bin:/opt/claude/bin:/usr/local/bin:/usr/bin:/bin"
 ENV DOCKER_HOST=unix:///run/docker.sock
 ENV DOCKER_DATA_ROOT=/workspace/.omp-home/docker
 ENV MISE_DATA_DIR=/mise
@@ -55,13 +76,15 @@ COPY --from=docker /usr/local/bin/runc /usr/local/bin/runc
 COPY --from=docker /usr/local/bin/docker-proxy /usr/local/bin/docker-proxy
 COPY --from=docker /usr/local/bin/docker-init /usr/local/bin/docker-init
 COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
-COPY --from=rust-tools /usr/local/cargo/bin/mise /usr/local/bin/mise
-COPY --from=rust-tools /usr/local/cargo/bin/fnox /usr/local/bin/fnox
+COPY --from=mise-tools /usr/local/bin/mise /usr/local/bin/mise
+COPY --from=mise-tools /opt/partitura/bin /opt/partitura/bin
+COPY --from=mise-tools /opt/partitura/mise/installs /opt/partitura/mise/installs
 COPY --from=worker-extensions /opt/omp-extensions /opt/omp-extensions
 COPY --from=app-build /app/dist /app/dist
 COPY deploy/agent-clis/install-agent-clis.sh /usr/local/bin/install-agent-clis
 COPY deploy/agent-clis/claude-cliproxy /usr/local/bin/claude-cliproxy
 COPY deploy/session-sandbox/worker-init.sh /usr/local/bin/worker-init
+COPY deploy/session-sandbox/seed-mise-installs.sh /usr/local/bin/seed-mise-installs
 RUN TARGETARCH="${TARGETARCH}" install-agent-clis \
       "claude=${CLAUDE_VERSION}" "codex=${CODEX_VERSION}" "t3=${T3_VERSION}" \
   && case "${TARGETARCH}" in \
@@ -73,7 +96,7 @@ RUN TARGETARCH="${TARGETARCH}" install-agent-clis \
        "https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}/${asset}" \
        --output /usr/local/bin/omp \
   && echo "${checksum}  /usr/local/bin/omp" | sha256sum --check --strict \
-  && chmod 0755 /usr/local/bin/omp /usr/local/bin/worker-init \
+  && chmod 0755 /usr/local/bin/omp /usr/local/bin/worker-init /usr/local/bin/seed-mise-installs \
   && ln -s /opt/claude/bin/claude /usr/local/bin/claude \
   && ln -s /opt/codex/bin/codex /usr/local/bin/codex \
   && ln -s /opt/t3/t3 /usr/local/bin/t3 \
@@ -82,5 +105,6 @@ RUN TARGETARCH="${TARGETARCH}" install-agent-clis \
   && chmod 0755 /usr/local/bin/claude-cliproxy \
   && chown -Rh root:root /opt/claude /opt/codex /opt/t3 /opt/omp-extensions \
   && chmod -R go-w /opt/claude /opt/codex /opt/t3 /opt/omp-extensions \
+  && chmod -R go-w /opt/partitura/mise/installs \
   && install -d -m 0755 /mise /workspace/.omp-home
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/worker-init"]

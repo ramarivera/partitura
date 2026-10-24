@@ -15,6 +15,25 @@ import {
 import { removeWorkerWorkspace } from "./workspace-process.js";
 
 const terminal = "state IN ('succeeded','failed','canceled')";
+const safeFailureCause = (error: unknown): string => {
+  if (!(error instanceof Error)) return `non-error rejection (${typeof error})`;
+  const name = /^[A-Za-z][A-Za-z0-9_]{0,63}$/u.test(error.name)
+    ? error.name
+    : "Error";
+  const code =
+    "code" in error &&
+    typeof error.code === "string" &&
+    /^[A-Za-z0-9_.-]{1,64}$/u.test(error.code)
+      ? error.code
+      : undefined;
+  return code === undefined ? name : `${name} (${code})`;
+};
+const orphanFencePath = (root: string, sessionId: string) =>
+  resolve(
+    root,
+    "..",
+    `.retention-orphan-${createHash("sha256").update(sessionId).digest("hex")}`,
+  );
 
 export const makeWorkspaceRetention = (input: {
   readonly db: Database;
@@ -76,6 +95,12 @@ export const makeWorkspaceRetention = (input: {
                   uid: number | undefined;
                   identityUid: number | undefined;
                 }> = [];
+                const orphanJobs: Array<{
+                  sessionId: string;
+                  uid: number;
+                  root: string;
+                  fencePath: string;
+                }> = [];
                 // Match Workspace.materialize, which persists canonical paths. A missing
                 // root means there is no workspace to remove, but data may still expire.
                 let root: string | undefined;
@@ -111,14 +136,24 @@ export const makeWorkspaceRetention = (input: {
                   { session_id: string; workspace_path: string },
                   [number, number]
                 >(
-                  `SELECT session_id, workspace_path FROM agent_run WHERE ${terminal}
-         AND (updated_at<? OR EXISTS (SELECT 1 FROM workspace w WHERE w.session_id=agent_run.session_id AND w.state='deleting')) AND workspace_path IS NOT NULL
-         AND (lease_expires_at IS NULL OR lease_expires_at<=?)`,
+                  `SELECT r.session_id, COALESCE(r.workspace_path, w.canonical_path) AS workspace_path
+                   FROM agent_run r LEFT JOIN workspace w ON w.session_id=r.session_id
+                   WHERE r.${terminal}
+                   AND (r.updated_at<? OR w.state='deleting')
+                   AND COALESCE(r.workspace_path, w.canonical_path) IS NOT NULL
+                   AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?)`,
                 );
                 // Bind both cutoffs explicitly; the workspace grace is based on terminal update time.
                 const rows = candidates.all(now - input.workspaceTtlMs, now);
                 for (const row of rows) {
                   const path = resolve(row.workspace_path);
+                  // Synthetic orphan claims are retried by the identity path
+                  // below, not treated as filesystem workspaces.
+                  if (
+                    root !== undefined &&
+                    path === orphanFencePath(root, row.session_id)
+                  )
+                    continue;
                   if (jobs.length >= input.maxWorkspaces) break;
                   const shared = referencePaths.some(
                     (reference) =>
@@ -191,11 +226,12 @@ export const makeWorkspaceRetention = (input: {
                   // change is needed. Reopen, lease acquisition and uid recycling
                   // refuse this state until removal and finalization succeed.
                   db.query(`INSERT INTO workspace(session_id, canonical_path, repository_id, repository_url, repository_ref, state, created_at, updated_at)
-              SELECT session_id, workspace_path, COALESCE(repository_id,''), '', '', 'deleting', ?, ? FROM agent_run WHERE session_id=?
+              VALUES (?, ?, '', '', '', 'deleting', ?, ?)
               ON CONFLICT(session_id) DO UPDATE SET state='deleting', updated_at=excluded.updated_at`).run(
-                    now,
-                    now,
                     row.session_id,
+                    path,
+                    now,
+                    now,
                   );
                   jobs.push({
                     sessionId: row.session_id,
@@ -205,7 +241,60 @@ export const makeWorkspaceRetention = (input: {
                     identityUid: uid,
                   });
                 }
-                return { jobs, skippedWorkspaces };
+                // A sandboxed identity can be allocated before its workspace is
+                // published. Give those sessions the same durable resume fence as
+                // workspace deletion, using a per-session path outside the root so
+                // it can't fence unrelated workspaces.
+                if (
+                  input.beforeRetireSession !== undefined &&
+                  root !== undefined
+                ) {
+                  const orphans = db
+                    .query<{ session_id: string; uid: number }, [number]>(
+                      `SELECT i.session_id, i.uid FROM worker_identity i JOIN agent_run r ON r.session_id=i.session_id
+                       WHERE i.active=1 AND r.${terminal}
+                       AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?)
+                       AND r.workspace_path IS NULL
+                       AND (NOT EXISTS (SELECT 1 FROM workspace w WHERE w.session_id=i.session_id)
+                            OR EXISTS (SELECT 1 FROM workspace w WHERE w.session_id=i.session_id AND w.state='deleting'))`,
+                    )
+                    .all(now);
+                  for (const orphan of orphans) {
+                    const fencePath = orphanFencePath(root, orphan.session_id);
+                    const existingFence = db
+                      .query<
+                        { canonical_path: string; state: string },
+                        [string]
+                      >(
+                        "SELECT canonical_path, state FROM workspace WHERE session_id=?",
+                      )
+                      .get(orphan.session_id);
+                    // A workspace row with its own real path is handled by the
+                    // workspace deletion job above. Retry only our synthetic
+                    // orphan fence here, preserving any published path/metadata.
+                    if (
+                      existingFence !== null &&
+                      (existingFence.state !== "deleting" ||
+                        existingFence.canonical_path !== fencePath)
+                    )
+                      continue;
+                    db.query(`INSERT INTO workspace(session_id, canonical_path, repository_id, repository_url, repository_ref, state, created_at, updated_at)
+                        VALUES (?, ?, '', '', '', 'deleting', ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET state='deleting', updated_at=excluded.updated_at`).run(
+                      orphan.session_id,
+                      fencePath,
+                      now,
+                      now,
+                    );
+                    orphanJobs.push({
+                      sessionId: orphan.session_id,
+                      uid: orphan.uid,
+                      root,
+                      fencePath,
+                    });
+                  }
+                }
+                return { jobs, orphanJobs, skippedWorkspaces };
               })
               .immediate(),
           "Retention.claim",
@@ -225,12 +314,22 @@ export const makeWorkspaceRetention = (input: {
                 );
               else await input.removeWorkspace(job.path);
             },
-            catch: () =>
+            catch: (error) =>
               new DatabaseError({
                 message: "Retention workspace removal failed",
+                cause: safeFailureCause(error),
               }),
           }).pipe(Effect.uninterruptible, Effect.result);
           if (Result.isFailure(removed)) {
+            yield* Effect.logWarning(
+              "Retention cleanup failed; deletion claim retained",
+            ).pipe(
+              Effect.annotateLogs({
+                event: "retention.deletion_claim_retained",
+                sessionId: job.sessionId,
+                cause: removed.failure.cause ?? "unknown",
+              }),
+            );
             skippedWorkspaces++;
             continue;
           }
@@ -266,6 +365,89 @@ export const makeWorkspaceRetention = (input: {
           );
           if (finalized) workspaces++;
           else skippedWorkspaces++;
+        }
+        for (const job of claimed.orphanJobs) {
+          const cleaned = yield* Effect.tryPromise({
+            try: () =>
+              input.beforeRetireSession?.(job.sessionId) ?? Promise.resolve(),
+            catch: (error) =>
+              new DatabaseError({
+                message: "Retention sandbox cleanup failed",
+                cause: safeFailureCause(error),
+              }),
+          }).pipe(Effect.uninterruptible, Effect.result);
+          if (Result.isFailure(cleaned)) {
+            yield* Effect.logWarning(
+              "Retention cleanup failed; deletion claim retained",
+            ).pipe(
+              Effect.annotateLogs({
+                event: "retention.deletion_claim_retained",
+                sessionId: job.sessionId,
+                cause: cleaned.failure.cause ?? "unknown",
+              }),
+            );
+            skippedWorkspaces++;
+            continue;
+          }
+          const finalized = yield* tryDb(
+            () =>
+              db
+                .transaction(() => {
+                  const current = db
+                    .query<
+                      {
+                        uid: number;
+                        state: string;
+                        lease_expires_at: number | null;
+                        workspace_path: string | null;
+                      },
+                      [string]
+                    >(
+                      `SELECT i.uid, r.state, r.lease_expires_at, r.workspace_path
+                       FROM worker_identity i JOIN agent_run r ON r.session_id=i.session_id
+                       WHERE i.session_id=? AND i.active=1`,
+                    )
+                    .get(job.sessionId);
+                  if (
+                    current === null ||
+                    current.uid !== job.uid ||
+                    !["succeeded", "failed", "canceled"].includes(
+                      current.state,
+                    ) ||
+                    (current.lease_expires_at !== null &&
+                      current.lease_expires_at > now) ||
+                    current.workspace_path !== null ||
+                    db
+                      .query(
+                        "SELECT 1 FROM workspace WHERE session_id=? AND state='deleting' AND canonical_path=?",
+                      )
+                      .get(job.sessionId, job.fencePath) === null ||
+                    db
+                      .query(
+                        "SELECT 1 FROM worker_identity WHERE uid=? AND active=1 AND session_id<>?",
+                      )
+                      .get(job.uid, job.sessionId) !== null
+                  )
+                    return false;
+                  if (
+                    !retireWorkerIdentitySync(
+                      db,
+                      job.sessionId,
+                      job.uid,
+                      job.root,
+                      true,
+                    )
+                  )
+                    return false;
+                  db.query(
+                    "DELETE FROM workspace WHERE session_id=? AND state='deleting'",
+                  ).run(job.sessionId);
+                  return true;
+                })
+                .immediate(),
+            "Retention.finalizeOrphan",
+          );
+          if (!finalized) skippedWorkspaces++;
         }
         return yield* tryDb(() => {
           const root = canonicalRoot;

@@ -61,8 +61,9 @@ This example doesn't enable Funnel or configure a public ingress.
    Only the sidecar receives the Tailscale key. Its native
    `TS_AUTHKEY=file:/run/secrets/ts_authkey` support avoids exporting the key value.
    `TS_AUTHKEY_FILE` in `.env` selects the **host file**, not a containerboot option.
-   The gateway reads `TOKEN_ENCRYPTION_KEY_FILE` directly. Preserve the image's
-   entrypoint and default command; no shell export of the encryption key is needed.
+   The gateway reads `TOKEN_ENCRYPTION_KEY_FILE` directly. Compose preserves the
+   image entrypoint and wraps its normal `bun dist/index.js` command with a small
+   health supervisor; no shell export of the encryption key is needed.
 4. Set `TS_HOSTNAME`, `PUBLIC_URL` and `LINEAR_ALLOWED_ORGANIZATION_IDS` in `.env`.
    Production startup requires the allowed organization list. Configure
    `GATEWAY_ADMIN_ORGANIZATION_IDS` and `GITHUB_APP_ALLOWED_OWNERS_JSON` as described
@@ -174,10 +175,11 @@ deployment, so no userspace override is supplied.
 
 ## Hardening and worker identities
 
-Both containers use `no-new-privileges`. The gateway keeps the image's root
-supervisor and entrypoint, with exactly CHOWN, DAC_OVERRIDE, KILL, SETUID, SETGID
-and SETPCAP after `cap_drop: ALL`. Workers drop to uid/gid 1001 through `setpriv`,
-with no supplementary groups, capabilities or privilege escalation. See
+Both containers use `no-new-privileges`. The gateway keeps the image entrypoint
+and runs a Bun supervisor as PID 1, with exactly CHOWN, DAC_OVERRIDE, KILL,
+SETUID, SETGID and SETPCAP after `cap_drop: ALL`. The supervisor starts the
+gateway app and forwards shutdown signals. Workers drop to uid/gid 1001 through
+`setpriv`, with no supplementary groups, capabilities or privilege escalation. See
 [gateway security](security.md) for the authoritative worker and workspace policy.
 The entrypoint locks `/app/data` and `/app/logs` to root-owned mode 0700;
 `/app/workspaces` stays a separate writable volume. Never force `user: bun` or
@@ -213,11 +215,16 @@ LocalAPI socket into workers. Separate identities require separate namespaces.
 - TUN/iptables errors: check the Linux VM/host's TUN and netfilter support. This
   example uses upstream Tailscale, without Toolbox's host-specific iptables/MTU
   patches. For stalled large transfers check path MTU and ICMP handling first.
-- Recreate the gateway whenever replacing the sidecar container. An existing
-  gateway can stay attached to the old namespace after an independent sidecar
-  replacement. Run the same full Compose invocation with `up -d --force-recreate`
-  for both services. `depends_on.restart: true` helps with explicit Compose updates;
-  Docker restart policies don't provide general dependency recovery.
+- The gateway supervisor polls the sidecar's loopback `/healthz` every five
+  seconds. If the endpoint stops responding for at least 60 seconds, it
+  gracefully stops the gateway app. The gateway's `unless-stopped` policy
+  restarts the container, which attaches it to the sidecar's current network
+  namespace. Any HTTP response counts as reachable, even an unhealthy status;
+  that avoids restarting the gateway when Tailscale is logged out but the
+  namespace is still current. A brief connection failure also doesn't restart
+  the app. Docker's `depends_on.restart: true` still covers explicit Compose
+  updates. If the supervisor isn't running, recreate both services with the
+  same full Compose invocation and `up -d --force-recreate`.
 
 ## Image provenance and verification
 

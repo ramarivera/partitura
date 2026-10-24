@@ -131,6 +131,31 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             "partitura-session-session-3",
         )
 
+    def test_provision_cleans_up_when_network_creation_fails(self):
+        settings = {
+            "SANDBOX_IMAGE": "registry.example/partitura-worker@sha256:" + "a" * 64,
+            "GATEWAY_CONTAINER": "gateway",
+            "GATEWAY_NETWORK": "gateway-network",
+            "GATEWAY_NETWORK_CONTAINER": "tailscale-owner",
+        }
+        with (
+            patch.object(broker, "_workspace", return_value=Path("/workspaces/session-8")),
+            patch.object(broker, "_run", side_effect=RuntimeError("network create failed")) as run,
+            patch.object(broker, "destroy") as destroy,
+            patch.multiple(broker, **settings),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "network create failed"):
+                broker.provision(
+                    {
+                        "sessionId": "session-8",
+                        "workspacePath": "/app/workspaces/session-8",
+                        "workerUid": "1008",
+                    }
+                )
+
+        self.assertEqual(run.call_args.args[0][:2], ["network", "create"])
+        destroy.assert_called_once_with({"sessionId": "session-8"})
+
     def test_maps_logical_workspace_into_host_volume_and_rejects_escape(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
             root = Path(directory)
@@ -262,6 +287,9 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                             "T3CODE_NO_BROWSER": "true",
                             "T3CODE_TELEMETRY_ENABLED": "false",
                             "NIX_SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+                            "PI_CLAUDE_DRIVER": "claude-cliproxy",
+                            "PI_CLAUDE_AUTH": "credential-ref",
+                            "PI_CLAUDE_EXECUTABLE": "/usr/local/bin/claude",
                         },
                     },
                 )
@@ -279,6 +307,9 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads(create_body)["User"], "1001:1001")
             self.assertIn("HTTP_PROXY=http://172.19.0.1:3128", json.loads(create_body)["Env"])
             self.assertIn("T3CODE_HOME=/workspace/.omp-home/t3", json.loads(create_body)["Env"])
+            self.assertIn("PI_CLAUDE_DRIVER=claude-cliproxy", json.loads(create_body)["Env"])
+            self.assertIn("PI_CLAUDE_AUTH=credential-ref", json.loads(create_body)["Env"])
+            self.assertIn("PI_CLAUDE_EXECUTABLE=/usr/local/bin/claude", json.loads(create_body)["Env"])
             self.assertIn("POST /v1.41/exec/0123456789abcdef/start", requests[2][0])
             self.assertIn("GET /v1.41/exec/0123456789abcdef/json", requests[3][0])
 

@@ -4,6 +4,8 @@ Description=Partitura sandbox broker socket
 [Socket]
 ListenStream=/run/partitura-sandbox/broker.sock
 Accept=true
+# 64 workers × 16 broker connections each (exec, egress, relays and retries).
+MaxConnections=1024
 SocketMode=0660
 SocketUser=root
 SocketGroup=root

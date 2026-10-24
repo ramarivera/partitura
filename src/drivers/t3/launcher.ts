@@ -280,7 +280,8 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
     if (owners.length === 0) return "free";
     return owners.every((uid) => uid === expectedUid) ? "owned" : "foreign";
   };
-  // Isolation depends on the ownership check; only native dev may skip it.
+  // Native uid isolation requires listener ownership. Sandbox daemons bind
+  // inside the per-session network and use its peer-checked relay instead.
   if (
     input.sandbox === undefined &&
     input.workerUid !== undefined &&

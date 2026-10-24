@@ -20,6 +20,11 @@ default driver. No gateway restart is required. A persisted session ref keeps
 its driver across retries and follow-up turns; changing labels doesn't migrate
 an existing conversation between runtimes.
 
+The authority freezes the run's settings when its first worker starts, after
+repository selection. A run waiting for repository selection uses the defaults
+and labels available at dispatch. Retries and follow-up turns reuse the frozen
+settings, even if an administrator changes the defaults or issue labels.
+
 ## Repository routing
 
 Before selecting a repository, the authority fetches the current Linear issue's
@@ -51,8 +56,9 @@ Both modes take `T3_PROVIDER_INSTANCE` and `T3_MODEL`. Launch mode accepts only
 
 For a T3 run the authority prepares the workspace exactly as for OMP: it
 allocates the session uid, chowns the workspace (mode 0700), prepends the
-repository's Nix PATH, and on resume re-mints the repository-scoped GitHub App
-credential into `.git/config`. Then it:
+repository's Nix PATH, and connects the workspace's GitHub remote to a
+session-scoped Git broker URL. The broker keeps installation credentials in the
+gateway and revokes the URL when the session ends. Then it:
 
 1. Writes `$T3CODE_HOME/userdata/settings.json` and the Codex `config.toml` as
    the worker uid through `src/workspace-worker.ts` (`t3-config`). State lives

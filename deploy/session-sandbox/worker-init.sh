@@ -3,6 +3,7 @@ set -eu
 
 data_root=${DOCKER_DATA_ROOT:-/workspace/.omp-home/docker}
 worker_uid=${PARTITURA_WORKER_UID:-}
+mise_data=${MISE_DATA_DIR:-/mise}
 case "$worker_uid" in
   ''|*[!0-9]*) echo "PARTITURA_WORKER_UID must be numeric" >&2; exit 64 ;;
 esac
@@ -11,8 +12,14 @@ if [ "$worker_uid" = "0" ]; then
   exit 64
 fi
 mkdir -p "$data_root" /run/docker
-chown "$worker_uid:$worker_uid" "$data_root" /mise
-chmod 0700 "$data_root" /mise
+chown "$worker_uid:$worker_uid" "$data_root" "$mise_data"
+chmod 0700 "$data_root" "$mise_data"
+
+# The session volume owns Mise's install index. Only the image-owned runtime
+# directories are shared; custom versions remain writable in this volume.
+/usr/local/bin/seed-mise-installs "$mise_data" /opt/partitura/mise/installs
+chown "$worker_uid:$worker_uid" \
+  "$mise_data/installs" "$mise_data/installs/node" "$mise_data/installs/python"
 export DOCKER_HOST=unix:///run/docker.sock
 
 dockerd \

@@ -58,14 +58,24 @@ before each connection; the broker rejects a hostname if any answer is not
 globally routable. Keep this value in the deployment source of truth and apply
 it to the broker service environment, not the gateway container.
 
-Build the worker image from `Dockerfile.worker`. It pins Bun, Node, Docker,
-Mise, fnox, OMP, Claude Code, T3, and Codex versions. `worker-init.sh` starts
-one nested Docker daemon per Sysbox container, stores its data under the
-session workspace, and keeps its socket at `/run/docker.sock` inside that
-container. The broker never mounts the host Docker socket. The outer session
-proxy variables are present before `dockerd` starts, so inner Docker image
-pulls use the same exact-host egress policy. Keep `/workspace` and `/mise`
-session-specific; Docker data and Mise state are removed with the session.
+Build the worker image from `Dockerfile.worker`. It pins Bun, Docker, Mise,
+Node, Python, OMP, Claude Code, T3, and Codex versions. Node 24.22.1 and
+Python 3.13.17 come from `deploy/build-tools/mise.toml`; the image keeps their
+root-owned installs under `/opt/partitura/mise/installs`. Stable `node`, `npm`,
+`npx`, `python`, and `python3` links in `/opt/partitura/bin` make those
+versions available on `PATH` before a repository supplies its own Mise config.
+Use `mise exec` to run repository-pinned versions. At startup,
+`worker-init.sh` creates session-owned links in `/mise/installs`, so Mise can
+use those immutable runtimes while repository-specific versions install into
+the writable `/mise` volume. The volume also holds `/mise/cache`; Mise config
+stays under `/workspace/.omp-home/mise/config`. No writable cache is shared
+between sessions, and the `/mise` volume is removed with its session.
+
+`worker-init.sh` also starts one nested Docker daemon per Sysbox container and
+stores its data under the session workspace. The socket stays at
+`/run/docker.sock` inside that container. The broker never mounts the host
+Docker socket. The outer session proxy variables are present before `dockerd`
+starts, so inner Docker image pulls use the same exact-host egress policy.
 
 For launched T3 sessions, the gateway MCP endpoint also receives a
 session-owned broker relay into the gateway's configured Docker network. T3's

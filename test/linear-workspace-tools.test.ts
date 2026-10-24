@@ -1,12 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "@effect/vitest";
 import {
   LINEAR_WORKSPACE_MUTATIONS,
   LINEAR_WORKSPACE_READS,
+  LINEAR_WORKSPACE_WRITE_TOOL,
   prepareLinearWorkspaceRead,
   validateLinearWorkspaceMutationInput,
 } from "../src/services/linear-workspace-tools.js";
 
 describe("Linear workspace tools", () => {
+  it("documents the allowed and required fields from the mutation registry", () => {
+    for (const [operation, definition] of Object.entries(
+      LINEAR_WORKSPACE_MUTATIONS,
+    )) {
+      const required = new Set<string>(definition.required);
+      expect(LINEAR_WORKSPACE_WRITE_TOOL.description).toContain(
+        `${operation}:`,
+      );
+      for (const field of definition.allowed)
+        expect(LINEAR_WORKSPACE_WRITE_TOOL.description).toContain(
+          `${field}${required.has(field) ? " (required)" : ""}`,
+        );
+    }
+  });
+
   it("exposes only fixed read operations with bounded documented inputs", () => {
     expect(Object.keys(LINEAR_WORKSPACE_READS)).toEqual([
       "get_issue",

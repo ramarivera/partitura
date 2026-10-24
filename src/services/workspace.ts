@@ -929,6 +929,17 @@ export const makeWorkspace = (input: {
       cwd: string | undefined,
       sessionId: string,
     ) => runGit(args, cwd, sessionId, input.gitTimeoutMs);
+    const hasGitRepository = (
+      target: string,
+      sessionId: string,
+    ): Effect.Effect<boolean, WorkspaceError> =>
+      runGitOutput(["rev-parse", "--git-dir"], target, sessionId).pipe(
+        Effect.as(true),
+        Effect.catchIf(
+          (error) => error.message.includes("not a git repository"),
+          () => Effect.succeed(false),
+        ),
+      );
     const resolve = Effect.fn("Workspace.resolve")(function* (
       context: unknown,
     ): Effect.fn.Return<RepositoryResolution, DatabaseError | RowDecodeError> {
@@ -991,6 +1002,61 @@ export const makeWorkspace = (input: {
       // Git broker URL at launch, never a credential in repository config.
       yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
     });
+
+    const clearGitBrokerConfig = Effect.fn("Workspace.clearGitBrokerConfig")(
+      function* (
+        sessionId: string,
+        target: string,
+      ): Effect.fn.Return<void, WorkspaceError> {
+        const hasGitDir = yield* hasGitRepository(target, sessionId);
+        if (!hasGitDir) return;
+        const entries = yield* runGitOutput(
+          [
+            "config",
+            "--local",
+            "--get-regexp",
+            "^url\\.http://[^[:space:]]*/git/[A-Za-z0-9_-]+/[^/[:space:]]+/[^/[:space:]]+\\.insteadOf$",
+          ],
+          target,
+          sessionId,
+          input.gitTimeoutMs,
+          undefined,
+          true,
+        );
+        const keys = entries
+          .split(/\r?\n/u)
+          .map((entry) => entry.slice(0, entry.indexOf(" ")))
+          .filter((key) => key.length > 0);
+        yield* Effect.forEach(
+          keys,
+          (key) =>
+            git(["config", "--local", "--unset-all", key], target, sessionId),
+          { discard: true },
+        );
+      },
+    );
+
+    const configureGitBroker = Effect.fn("Workspace.configureGitBroker")(
+      function* (
+        sessionId: string,
+        target: string,
+        broker: ReturnType<typeof startGitHubGitBroker>,
+        relayBaseUrl?: string,
+      ): Effect.fn.Return<void, WorkspaceError> {
+        const hasGitDir = yield* hasGitRepository(target, sessionId);
+        if (!hasGitDir) return;
+        const config =
+          relayBaseUrl === undefined
+            ? { key: broker.gitConfigKey, value: broker.gitConfigValue }
+            : broker.gitConfigFor(relayBaseUrl);
+        yield* clearGitBrokerConfig(sessionId, target);
+        yield* git(
+          ["config", "--local", "--replace-all", config.key, config.value],
+          target,
+          sessionId,
+        );
+      },
+    );
 
     const openGitBroker = Effect.fn("Workspace.openGitBroker")(function* (
       sessionId: string,
@@ -1110,7 +1176,10 @@ export const makeWorkspace = (input: {
       sessionId: string,
       target: string,
     ): Effect.Effect<void, never> =>
-      unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
+      Effect.andThen(
+        unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs),
+        clearGitBrokerConfig(sessionId, target).pipe(Effect.ignore),
+      );
 
     const materialize = Effect.fn("Workspace.materialize")(function* (
       sessionId: string,
@@ -1409,6 +1478,8 @@ export const makeWorkspace = (input: {
       materialize,
       refreshGitHubExtraHeader,
       openGitBroker,
+      configureGitBroker,
+      clearGitBrokerConfig,
       clearGitHubExtraHeader,
     };
   });

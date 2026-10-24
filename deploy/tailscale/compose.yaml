@@ -42,6 +42,7 @@ services:
       context: ../..
     image: partitura:tailscale
     restart: unless-stopped
+    command: [bun, /usr/local/bin/gateway-supervisor.ts, bun, dist/index.js]
     network_mode: service:tailscale
     depends_on:
       tailscale:

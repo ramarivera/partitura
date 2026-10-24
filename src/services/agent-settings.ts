@@ -279,6 +279,12 @@ export const resolveRunSettings = (input: {
   };
 }): EffectiveRunSettings => {
   const warnings: string[] = [];
+  const issueLabels = input.issueLabels
+    .map((label) => label.trim().toLowerCase())
+    .filter(Boolean);
+  const projectLabels = input.projectLabels
+    .map((label) => label.trim().toLowerCase())
+    .filter(Boolean);
   const values: Record<
     SettingName,
     { value: string | null; source: SettingSource }
@@ -313,8 +319,8 @@ export const resolveRunSettings = (input: {
     },
   };
   for (const [labels, source] of [
-    [input.projectLabels, "project-label"],
-    [input.issueLabels, "issue-label"],
+    [projectLabels, "project-label"],
+    [issueLabels, "issue-label"],
   ] as const) {
     for (const key of ["driver", "model", "effort", "mode"] as const) {
       const prefix = input.settings.labelPrefixes[key];
@@ -386,7 +392,7 @@ export const resolveRunSettings = (input: {
     if (modelSource === "issue-label") {
       const projectModels = [
         ...new Set(
-          input.projectLabels
+          projectLabels
             .filter((label) =>
               label.startsWith(input.settings.labelPrefixes.model),
             )
