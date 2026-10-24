@@ -194,6 +194,22 @@ gateway's process environment and files. Use Docker for this boundary. Per-sessi
 uids isolate discretionary filesystem access; workers still share the container's
 network, kernel and global process visibility. This isn't a network sandbox.
 
+## Optional session containers
+
+`WORKER_SANDBOX_MODE=sysbox` runs each OMP worker or launched T3 daemon in a
+separate container through a host broker. Its workspace and Mise volume belong
+to that session. The worker gets image-local tool paths and run-created proxy
+settings; inherited gateway proxy and Mise settings are discarded. Host runtime
+installation and live isolation qualification remain separate requirements.
+See [the broker deployment contract](../deploy/session-sandbox/README.md).
+
+UID release requires successful broker teardown, including after a gateway
+restart. Retention destroys the sandbox before deleting its workspace under the
+durable deletion claim. Failure preserves the workspace and identity for retry.
+Native process-only orphan retirement is disabled in Sysbox mode. An orphan
+without a published workspace stays reserved until explicit broker-backed
+cleanup establishes that no sandbox remains.
+
 ## Repository age identities
 
 `WORKER_REPOSITORY_AGE_KEYS_JSON_FILE` points to a gateway-only secret whose JSON
