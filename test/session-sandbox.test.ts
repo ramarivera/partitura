@@ -5,6 +5,7 @@ import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 import {
   makeSessionSandboxRuntime,
+  sandboxBrokerRequestTimeoutMs,
   sandboxContainerName,
   sandboxEnvironment,
   sandboxWorkerLaunch,
@@ -15,6 +16,12 @@ import { testPaths } from "./fixtures/paths.js";
 const paths = testPaths();
 
 describe("session sandbox", () => {
+  it("allows bounded Docker lifecycle operations to finish", () => {
+    expect(sandboxBrokerRequestTimeoutMs("provision")).toBe(15 * 60_000);
+    expect(sandboxBrokerRequestTimeoutMs("recover")).toBe(5 * 60_000);
+    expect(sandboxBrokerRequestTimeoutMs("destroy")).toBe(5 * 60_000);
+  });
+
   it("maps only workspace paths into the container", () => {
     expect(
       sandboxEnvironment("/app/workspaces/session-1", {
@@ -95,6 +102,7 @@ describe("session sandbox", () => {
         makeSessionSandboxRuntime(socketPath).provision(
           "session-2",
           "/app/workspaces/session-2",
+          "1002",
         ),
       );
       expect(handle).toEqual({
@@ -135,7 +143,10 @@ describe("session sandbox", () => {
           })}\n`,
         );
       });
-      socket.on("end", () => controlClosed?.());
+      socket.on("end", () => {
+        controlClosed?.();
+        socket.end();
+      });
     });
     await new Promise<void>((resolve) => server.listen(socketPath, resolve));
     try {
@@ -155,6 +166,32 @@ describe("session sandbox", () => {
       });
       relay.stop();
       await closed;
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      await unlink(socketPath).catch(() => undefined);
+    }
+  });
+
+  it("fails immediately when the broker closes before replying", async () => {
+    const socketPath = paths("sandbox-closed.sock");
+    await mkdir(dirname(socketPath), { recursive: true });
+    const server = createServer((socket) => socket.end());
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    try {
+      await expect(
+        Effect.runPromise(
+          makeSessionSandboxRuntime(socketPath).openRelay(
+            "session-closed",
+            "gateway",
+            41999,
+          ),
+        ),
+      ).rejects.toMatchObject({
+        operation: "relay",
+        message: "Sandbox relay request failed",
+      });
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),

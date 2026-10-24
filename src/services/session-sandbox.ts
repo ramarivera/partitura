@@ -29,13 +29,25 @@ export type SandboxBrokerRequest =
       readonly operation: "provision";
       readonly sessionId: string;
       readonly workspacePath: string;
+      readonly workerUid: string;
     }
   | { readonly operation: "destroy"; readonly sessionId: string }
   | {
       readonly operation: "recover";
       readonly sessionId: string;
       readonly workspacePath: string;
+      readonly workerUid: string;
     };
+
+const BROKER_REQUEST_TIMEOUT_MS = {
+  provision: 15 * 60_000,
+  destroy: 5 * 60_000,
+  recover: 5 * 60_000,
+} as const;
+
+export const sandboxBrokerRequestTimeoutMs = (
+  operation: SandboxBrokerRequest["operation"],
+): number => BROKER_REQUEST_TIMEOUT_MS[operation];
 
 interface BrokerResponse {
   readonly ok: boolean;
@@ -130,7 +142,11 @@ const requestBroker = (
       }
     });
     socket.on("error", reject);
-    socket.setTimeout(5_000, () =>
+    socket.on("close", () => {
+      if (!data.includes("\n"))
+        reject(new Error("Sandbox broker closed before replying"));
+    });
+    socket.setTimeout(sandboxBrokerRequestTimeoutMs(request.operation), () =>
       socket.destroy(new Error("Sandbox broker request timed out")),
     );
   });
@@ -139,6 +155,7 @@ export interface SessionSandboxRuntime {
   readonly provision: (
     sessionId: string,
     workspacePath: string,
+    workerUid: string,
   ) => Effect.Effect<SessionSandboxHandle, SandboxBrokerError>;
   readonly destroy: (
     sessionId: string,
@@ -146,6 +163,7 @@ export interface SessionSandboxRuntime {
   readonly recover: (
     sessionId: string,
     workspacePath: string,
+    workerUid: string,
   ) => Effect.Effect<
     {
       readonly exists: boolean;
@@ -227,6 +245,16 @@ const openBrokerRelay = (
       settled = true;
       reject(error);
     });
+    socket.on("end", () => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("Sandbox broker closed before replying"));
+    });
+    socket.on("close", () => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("Sandbox broker closed before replying"));
+    });
     socket.setTimeout(5_000, () => {
       if (settled) return;
       settled = true;
@@ -239,7 +267,7 @@ export const makeSessionSandboxRuntime = (
   socketPath: string,
 ): SessionSandboxRuntime => ({
   provision: Effect.fn("SessionSandbox.provision")(
-    function* (sessionId, workspacePath) {
+    function* (sessionId, workspacePath, workerUid) {
       const operation = "provision" as const;
       const result = yield* Effect.tryPromise({
         try: () =>
@@ -247,6 +275,7 @@ export const makeSessionSandboxRuntime = (
             operation,
             sessionId,
             workspacePath,
+            workerUid,
           }),
         catch: () =>
           new SandboxBrokerError({
@@ -314,11 +343,16 @@ export const makeSessionSandboxRuntime = (
       );
   }),
   recover: Effect.fn("SessionSandbox.recover")(
-    function* (sessionId, workspacePath) {
+    function* (sessionId, workspacePath, workerUid) {
       const operation = "recover" as const;
       const result = yield* Effect.tryPromise({
         try: () =>
-          requestBroker(socketPath, { operation, sessionId, workspacePath }),
+          requestBroker(socketPath, {
+            operation,
+            sessionId,
+            workspacePath,
+            workerUid,
+          }),
         catch: () =>
           new SandboxBrokerError({
             message: "Sandbox broker request failed",

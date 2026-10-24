@@ -23,13 +23,17 @@ NETWORK_PREFIX = "partitura-network-"
 SANDBOX_IMAGE = os.environ.get("PARTITURA_SANDBOX_IMAGE", "")
 GATEWAY_CONTAINER = os.environ.get("PARTITURA_GATEWAY_CONTAINER", "")
 GATEWAY_NETWORK = os.environ.get("PARTITURA_GATEWAY_NETWORK", "")
-WORKSPACE_ROOT = Path(os.environ.get("PARTITURA_WORKSPACE_ROOT", "/app/workspaces")).resolve()
+GATEWAY_NETWORK_CONTAINER = os.environ.get(
+    "PARTITURA_GATEWAY_NETWORK_CONTAINER", GATEWAY_CONTAINER
+)
+WORKSPACE_ROOT = Path(os.environ.get("PARTITURA_WORKSPACE_ROOT", "/app/workspaces"))
+WORKSPACE_HOST_ROOT = os.environ.get("PARTITURA_WORKSPACE_HOST_ROOT", "")
 DOCKER = os.environ.get("PARTITURA_DOCKER", "/usr/bin/docker")
 DOCKER_SOCKET = os.environ.get("PARTITURA_DOCKER_SOCKET", "/var/run/docker.sock")
 MEMORY_LIMIT = os.environ.get("PARTITURA_SANDBOX_MEMORY", "8g")
 CPU_LIMIT = os.environ.get("PARTITURA_SANDBOX_CPUS", "4")
 PIDS_LIMIT = int(os.environ.get("PARTITURA_SANDBOX_PIDS", "2048"))
-DISK_LIMIT = os.environ.get("PARTITURA_SANDBOX_DISK", "20g")
+EGRESS_PROXY_PORT = 3128
 EGRESS_HOSTS = frozenset(
     host.strip().lower()
     for host in os.environ.get("PARTITURA_SANDBOX_EGRESS_HOSTS", "").split(",")
@@ -43,15 +47,46 @@ def _session(value: Any) -> str:
     return value
 
 
+def _worker_uid(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{0,4}", value):
+        raise ValueError("worker uid must be a non-root numeric uid")
+    return value
+
+
 def _workspace(value: Any) -> Path:
     if not isinstance(value, str) or not value.startswith("/"):
         raise ValueError("workspace path must be absolute")
     candidate = Path(value)
-    resolved = candidate.resolve(strict=True)
-    if resolved != candidate or not resolved.is_relative_to(WORKSPACE_ROOT):
-        raise ValueError("workspace must be canonical and inside the configured root")
-    if candidate.is_symlink() or not candidate.is_dir():
-        raise ValueError("workspace must be a real directory")
+    logical_root = WORKSPACE_ROOT
+    if (
+        str(candidate) != value
+        or not logical_root.is_absolute()
+        or str(logical_root) != os.path.normpath(str(logical_root))
+    ):
+        raise ValueError("workspace path and logical root must be canonical")
+    try:
+        relative = candidate.relative_to(logical_root)
+    except ValueError as error:
+        raise ValueError("workspace must be inside the configured logical root") from error
+    if relative == Path(".") or any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError("workspace must be a strict child of the logical root")
+    if not WORKSPACE_HOST_ROOT:
+        raise ValueError("PARTITURA_WORKSPACE_HOST_ROOT must map the gateway workspace volume")
+    host_root = Path(WORKSPACE_HOST_ROOT)
+    if not host_root.is_absolute():
+        raise ValueError("PARTITURA_WORKSPACE_HOST_ROOT must be absolute")
+    resolved_root = host_root.resolve(strict=True)
+    if resolved_root != host_root or not resolved_root.is_dir():
+        raise ValueError("host workspace root must be a canonical directory")
+    mapped = resolved_root.joinpath(*relative.parts)
+    current = resolved_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("workspace path cannot contain symlinks")
+    resolved = mapped.resolve(strict=True)
+    if resolved != mapped or not resolved.is_relative_to(resolved_root) or not mapped.is_dir():
+        raise ValueError("mapped workspace must be a real directory under host root")
     return resolved
 
 
@@ -68,6 +103,35 @@ def _container(session: str) -> str:
 
 def _network(session: str) -> str:
     return NETWORK_PREFIX + session
+
+
+def _remove_owned(kind: str, name: str, session: str) -> None:
+    inspected = subprocess.run(
+        [DOCKER, kind, "inspect", name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if inspected.returncode != 0:
+        diagnostic = f"{inspected.stdout}\n{inspected.stderr}".lower()
+        if "no such" in diagnostic or "not found" in diagnostic:
+            return
+        raise RuntimeError(f"Docker {kind} ownership check failed")
+    records = json.loads(inspected.stdout)
+    if not isinstance(records, list) or len(records) != 1:
+        raise RuntimeError(f"Docker {kind} ownership record is invalid")
+    labels = records[0].get("Config", {}).get("Labels", {}) if kind == "container" else records[0].get("Labels", {})
+    if not isinstance(labels, dict) or labels.get("partitura.session") != session:
+        raise ValueError(f"Docker {kind} session label does not match")
+    action = {"container": "rm", "network": "network rm", "volume": "volume rm"}[kind]
+    result = subprocess.run(
+        [DOCKER, *action.split(), "-f", name] if kind == "container" else [DOCKER, *action.split(), name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Docker {kind} removal failed; retry teardown")
 
 
 async def _docker_api_json(
@@ -98,6 +162,7 @@ async def _docker_api_json(
 
 def provision(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
+    worker_uid = _worker_uid(request.get("workerUid"))
     workspace = _workspace(request.get("workspacePath"))
     if not SANDBOX_IMAGE:
         raise ValueError("PARTITURA_SANDBOX_IMAGE must be pinned by the host operator")
@@ -105,10 +170,22 @@ def provision(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("PARTITURA_GATEWAY_CONTAINER must name the gateway container")
     if not GATEWAY_NETWORK:
         raise ValueError("PARTITURA_GATEWAY_NETWORK must name the gateway's Docker network")
+    if not GATEWAY_NETWORK_CONTAINER:
+        raise ValueError("PARTITURA_GATEWAY_NETWORK_CONTAINER must name the network owner")
     container = _container(session)
     network = _network(session)
-    _run(["network", "create", "--internal", network])
+    _run(["network", "create", "--internal", "--label", f"partitura.session={session}", network])
     try:
+        relay_ip = _run(
+            ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
+        )
+        if ipaddress.ip_address(relay_ip).version != 4:
+            raise ValueError("sandbox egress proxy requires an IPv4 bridge gateway")
+        egress_proxy = f"http://{relay_ip}:{EGRESS_PROXY_PORT}"
+        _run(["volume", "create", "--label", f"partitura.session={session}", f"partitura-mise-{session}"])
+        volume = json.loads(_run(["volume", "inspect", f"partitura-mise-{session}"]))[0]
+        if volume.get("Labels", {}).get("partitura.session") != session:
+            raise ValueError("Mise volume session label does not match")
         _run(
             [
                 "create",
@@ -118,6 +195,8 @@ def provision(request: dict[str, Any]) -> dict[str, Any]:
                 f"partitura.session={session}",
                 "--label",
                 f"partitura.workspace={workspace}",
+                "--label",
+                f"partitura.worker_uid={worker_uid}",
                 "--runtime=sysbox-runc",
                 "--network",
                 network,
@@ -127,10 +206,17 @@ def provision(request: dict[str, Any]) -> dict[str, Any]:
                 CPU_LIMIT,
                 "--pids-limit",
                 str(PIDS_LIMIT),
-                "--storage-opt",
-                f"size={DISK_LIMIT}",
-                "--cap-drop=ALL",
+                "--env",
+                "SYSBOX_HONOR_CAPS=FALSE",
+                "--env",
+                f"PARTITURA_WORKER_UID={worker_uid}",
                 "--security-opt=no-new-privileges",
+                "--env",
+                f"HTTP_PROXY={egress_proxy}",
+                "--env",
+                f"HTTPS_PROXY={egress_proxy}",
+                "--env",
+                f"NO_PROXY=localhost,127.0.0.1,::1,host.docker.internal,{relay_ip}",
                 "--mount",
                 f"type=bind,src={workspace},dst=/workspace,rw",
                 "--mount",
@@ -147,30 +233,30 @@ def provision(request: dict[str, Any]) -> dict[str, Any]:
             ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}', container]
         )
         gateway_ip = _run(
-            ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_CONTAINER]
-        )
-        relay_ip = _run(
-            ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
+            ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_NETWORK_CONTAINER]
         )
         if not worker_ip or not gateway_ip or not relay_ip:
             raise RuntimeError("Docker did not assign required network addresses")
     except Exception:
-        subprocess.run([DOCKER, "rm", "-f", container], capture_output=True)
-        subprocess.run([DOCKER, "network", "rm", network], capture_output=True)
+        try:
+            destroy({"sessionId": session})
+        except Exception as cleanup_error:
+            raise RuntimeError("sandbox provisioning failed; retry teardown") from cleanup_error
         raise
     return {"container": container, "workspace": "/workspace", "workerAddress": worker_ip, "gatewayAddress": gateway_ip, "relayAddress": relay_ip}
 
 
 def destroy(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
-    subprocess.run([DOCKER, "rm", "-f", _container(session)], check=False, capture_output=True)
-    subprocess.run([DOCKER, "network", "rm", _network(session)], check=False, capture_output=True)
-    subprocess.run([DOCKER, "volume", "rm", f"partitura-mise-{session}"], check=False, capture_output=True)
+    _remove_owned("container", _container(session), session)
+    _remove_owned("network", _network(session), session)
+    _remove_owned("volume", f"partitura-mise-{session}", session)
     return {"destroyed": True}
 
 
 def recover(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
+    worker_uid = _worker_uid(request.get("workerUid"))
     workspace = _workspace(request.get("workspacePath"))
     container = _container(session)
     result = subprocess.run(
@@ -194,20 +280,36 @@ def recover(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("sandbox container session label does not match")
     if label_record.get("partitura.workspace") != str(workspace):
         raise ValueError("sandbox container workspace does not match")
+    if label_record.get("partitura.worker_uid") != worker_uid:
+        raise ValueError("sandbox container worker uid does not match")
     network = _network(session)
     network_info = subprocess.run(
-        [DOCKER, "network", "inspect", "--format", "{{json .IPAM.Config}}", network],
+        [DOCKER, "network", "inspect", network],
         capture_output=True,
         text=True,
         check=False,
     )
     if network_info.returncode != 0:
         raise ValueError("sandbox network is missing")
+    network_record = json.loads(network_info.stdout)[0]
+    if network_record.get("Labels", {}).get("partitura.session") != session:
+        raise ValueError("sandbox network session label does not match")
+    volume_info = subprocess.run(
+        [DOCKER, "volume", "inspect", f"partitura-mise-{session}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if volume_info.returncode != 0:
+        raise ValueError("sandbox Mise volume is missing")
+    volume_record = json.loads(volume_info.stdout)[0]
+    if volume_record.get("Labels", {}).get("partitura.session") != session:
+        raise ValueError("sandbox Mise volume session label does not match")
     worker_ip = _run(
         ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}', container]
     )
     gateway_ip = _run(
-        ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_CONTAINER]
+        ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_NETWORK_CONTAINER]
     )
     relay_ip = _run(
         ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
@@ -246,6 +348,9 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         "BUN_INSTALL_CACHE_DIR", "BUN_RUNTIME_TRANSPILER_CACHE_PATH", "PI_CODING_AGENT_DIR",
         "PI_PACKAGE_DIR", "OMP_SKIP_UPDATE_CHECK", "NO_COLOR", "FNOX_AGE_KEY_FILE",
         "MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_CONFIG_DIR", "MISE_TRUSTED_CONFIG_PATHS",
+        "NIX_SSL_CERT_FILE", "T3CODE_HOME", "T3CODE_NO_BROWSER",
+        "T3CODE_TELEMETRY_ENABLED", "DISABLE_AUTOUPDATER",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "CLIPROXYAPI_BASE_URL", "CLIPROXYAPI_API_KEY",
     }
     if set(env) - allowed_env:
@@ -294,7 +399,9 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                     raise ValueError("invalid input frame")
                 docker_writer.write(await reader.readexactly(length))
                 await docker_writer.drain()
-        except (asyncio.IncompleteReadError, ConnectionError):
+        except asyncio.IncompleteReadError:
+            pass
+        except ConnectionError:
             docker_writer.close()
             return
         raw_socket = docker_writer.transport.get_extra_info("socket")
@@ -306,22 +413,40 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
     async def output_loop() -> None:
         while True:
-            header = await docker_reader.readexactly(8)
+            try:
+                header = await docker_reader.readexactly(8)
+            except asyncio.IncompleteReadError as error:
+                if not error.partial:
+                    return
+                raise ValueError("Docker returned a truncated exec frame") from error
             kind = header[:1]
             length = int.from_bytes(header[4:], "big")
             if kind not in (b"\x01", b"\x02") or length > 4 * 1024 * 1024:
                 raise ValueError("Docker returned an invalid exec frame")
-            data = await docker_reader.readexactly(length)
+            try:
+                data = await docker_reader.readexactly(length)
+            except asyncio.IncompleteReadError as error:
+                raise ValueError("Docker returned a truncated exec payload") from error
             writer.write((b"O" if kind == b"\x01" else b"E") + len(data).to_bytes(4, "big") + data)
             await writer.drain()
 
     inputs = asyncio.create_task(input_loop())
-    await output_loop()
-    if not inputs.done():
-        inputs.cancel()
-    await asyncio.gather(inputs, return_exceptions=True)
-    docker_writer.close()
-    await docker_writer.wait_closed()
+    outputs = asyncio.create_task(output_loop())
+    try:
+        done, _ = await asyncio.wait(
+            {inputs, outputs}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            task.result()
+        if inputs in done:
+            await outputs
+    finally:
+        for task in (inputs, outputs):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(inputs, outputs, return_exceptions=True)
+        docker_writer.close()
+        await docker_writer.wait_closed()
     exit_info = await _docker_api_json("GET", f"/exec/{exec_id}/json")
     code = exit_info.get("ExitCode", 1)
     if not isinstance(code, int) or code < 0 or code > 255:
@@ -345,14 +470,17 @@ async def _stream_relay(
         ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}', container]
     )
     gateway_ip = _run(
-        ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_CONTAINER]
+        ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{GATEWAY_NETWORK}").IPAddress}}}}', GATEWAY_NETWORK_CONTAINER]
     )
     relay_ip = _run(
         ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Gateway}}", network]
     )
     target_ip = gateway_ip if target == "gateway" else worker_ip
+    expected_peer = worker_ip if target == "gateway" else gateway_ip
     if not all(ipaddress.ip_address(value).version == 4 for value in (worker_ip, gateway_ip, relay_ip)):
         raise ValueError("relay requires IPv4 Docker addresses")
+    active_writers: set[asyncio.StreamWriter] = set()
+    active_tasks: set[asyncio.Task[Any]] = set()
 
     async def pipe(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
         try:
@@ -370,24 +498,33 @@ async def _stream_relay(
     async def relay_client(
         client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
     ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            active_tasks.add(task)
+        active_writers.add(client_writer)
+        target_writer: asyncio.StreamWriter | None = None
         peer = client_writer.get_extra_info("peername")
-        if not isinstance(peer, tuple) or peer[0] != worker_ip:
-            client_writer.close()
-            await client_writer.wait_closed()
-            return
         try:
+            if not isinstance(peer, tuple) or peer[0] != expected_peer:
+                return
             target_reader, target_writer = await asyncio.open_connection(target_ip, port)
+            active_writers.add(target_writer)
+            await asyncio.gather(
+                pipe(client_reader, target_writer),
+                pipe(target_reader, client_writer),
+            )
         except OSError:
+            pass
+        finally:
+            active_writers.discard(client_writer)
             client_writer.close()
+            if target_writer is not None:
+                active_writers.discard(target_writer)
+                target_writer.close()
+                await target_writer.wait_closed()
             await client_writer.wait_closed()
-            return
-        await asyncio.gather(
-            pipe(client_reader, target_writer),
-            pipe(target_reader, client_writer),
-        )
-        target_writer.close()
-        client_writer.close()
-        await asyncio.gather(target_writer.wait_closed(), client_writer.wait_closed(), return_exceptions=True)
+            if task is not None:
+                active_tasks.discard(task)
 
     server = await asyncio.start_server(relay_client, relay_ip, 0)
     relay_port = server.sockets[0].getsockname()[1]
@@ -399,6 +536,12 @@ async def _stream_relay(
         await reader.read()
     finally:
         server.close()
+        for active_writer in active_writers:
+            active_writer.close()
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
         await server.wait_closed()
 
 
@@ -418,6 +561,8 @@ async def _stream_egress(
     )
     if not all(ipaddress.ip_address(value).version == 4 for value in (worker_ip, relay_ip)):
         raise ValueError("egress proxy requires IPv4 Docker addresses")
+    active_writers: set[asyncio.StreamWriter] = set()
+    active_tasks: set[asyncio.Task[Any]] = set()
 
     async def pipe(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
         try:
@@ -435,54 +580,63 @@ async def _stream_egress(
     async def proxy_client(
         client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
     ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            active_tasks.add(task)
+        active_writers.add(client_writer)
+        remote_writer: asyncio.StreamWriter | None = None
         peer = client_writer.get_extra_info("peername")
-        if not isinstance(peer, tuple) or peer[0] != worker_ip:
-            client_writer.close()
-            await client_writer.wait_closed()
-            return
         try:
-            header = await asyncio.wait_for(client_reader.readuntil(b"\r\n\r\n"), timeout=5)
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
-            client_writer.close()
-            await client_writer.wait_closed()
-            return
-        if len(header) > 8192:
-            client_writer.write(b"HTTP/1.1 413 Request Too Large\r\nConnection: close\r\n\r\n")
+            if not isinstance(peer, tuple) or peer[0] != worker_ip:
+                return
+            try:
+                header = await asyncio.wait_for(client_reader.readuntil(b"\r\n\r\n"), timeout=5)
+            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+                return
+            if len(header) > 8192:
+                client_writer.write(b"HTTP/1.1 413 Request Too Large\r\nConnection: close\r\n\r\n")
+                await client_writer.drain()
+                return
+            first = header.split(b"\r\n", 1)[0].decode("ascii", "ignore")
+            match = re.fullmatch(r"CONNECT ([A-Za-z0-9.-]+):443 HTTP/1\.[01]", first)
+            host = match.group(1).lower() if match else ""
+            if not host or host not in EGRESS_HOSTS:
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                await client_writer.drain()
+                return
+            try:
+                answers = await asyncio.get_running_loop().getaddrinfo(
+                    host, 443, type=socket.SOCK_STREAM
+                )
+                addresses = {answer[4][0] for answer in answers}
+                if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+                    raise ValueError("host resolved to a non-public address")
+                remote_reader, remote_writer = await asyncio.open_connection(sorted(addresses)[0], 443)
+                active_writers.add(remote_writer)
+            except (OSError, ValueError):
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                await client_writer.drain()
+                return
+            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await client_writer.drain()
-            client_writer.close()
-            return
-        first = header.split(b"\r\n", 1)[0].decode("ascii", "ignore")
-        match = re.fullmatch(r"CONNECT ([A-Za-z0-9.-]+):443 HTTP/1\.[01]", first)
-        host = match.group(1).lower() if match else ""
-        if not host or host not in EGRESS_HOSTS:
-            client_writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
-            await client_writer.drain()
-            client_writer.close()
-            return
-        try:
-            answers = await asyncio.get_running_loop().getaddrinfo(
-                host, 443, type=socket.SOCK_STREAM
+            await asyncio.gather(
+                pipe(client_reader, remote_writer),
+                pipe(remote_reader, client_writer),
             )
-            addresses = {answer[4][0] for answer in answers}
-            if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
-                raise ValueError("host resolved to a non-public address")
-            remote_reader, remote_writer = await asyncio.open_connection(sorted(addresses)[0], 443)
-        except (OSError, ValueError):
-            client_writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
-            await client_writer.drain()
+        finally:
+            active_writers.discard(client_writer)
             client_writer.close()
-            return
-        client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await client_writer.drain()
-        await asyncio.gather(
-            pipe(client_reader, remote_writer),
-            pipe(remote_reader, client_writer),
-        )
-        remote_writer.close()
-        client_writer.close()
-        await asyncio.gather(remote_writer.wait_closed(), client_writer.wait_closed(), return_exceptions=True)
+            if remote_writer is not None:
+                active_writers.discard(remote_writer)
+                remote_writer.close()
+                await remote_writer.wait_closed()
+            await client_writer.wait_closed()
+            if task is not None:
+                active_tasks.discard(task)
 
-    server = await asyncio.start_server(proxy_client, relay_ip, 0, limit=8192)
+    server = await asyncio.start_server(
+        proxy_client, relay_ip, EGRESS_PROXY_PORT, limit=8192
+    )
     proxy_port = server.sockets[0].getsockname()[1]
     writer.write((json.dumps({"ok": True, "result": {"address": relay_ip, "port": proxy_port}}) + "\n").encode())
     await writer.drain()
@@ -490,6 +644,12 @@ async def _stream_egress(
         await reader.read()
     finally:
         server.close()
+        for active_writer in active_writers:
+            active_writer.close()
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
         await server.wait_closed()
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
