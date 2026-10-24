@@ -1690,7 +1690,12 @@ describe("pure invariants", () => {
                 expect(latest).toEqual(Option.none());
               } else {
                 expect(latest).toEqual(
-                  Option.some({ body, kind, payload: { marker } }),
+                  Option.some({
+                    id: input.id,
+                    body,
+                    kind,
+                    payload: { marker },
+                  }),
                 );
               }
 

@@ -248,6 +248,7 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
         "RunInputRepo.latestActionableInput",
       )(function* (sessionId: SessionId): Effect.fn.Return<
         Option.Option<{
+          readonly id: string;
           readonly body: string;
           readonly kind: InputKind;
           readonly payload: unknown;
@@ -259,10 +260,15 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
           () =>
             db
               .query<
-                { body: string; kind: InputKind; payload_json: string },
+                {
+                  id: string;
+                  body: string;
+                  kind: InputKind;
+                  payload_json: string;
+                },
                 [string]
               >(`
-                SELECT body, kind, payload_json FROM run_input
+                SELECT id, body, kind, payload_json FROM run_input
                 WHERE session_id=? AND kind!='stop'
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
@@ -278,7 +284,12 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
               message: "Invalid JSON in run_input.payload_json",
             }),
         });
-        return Option.some({ body: row.body, kind: row.kind, payload });
+        return Option.some({
+          id: row.id,
+          body: row.body,
+          kind: row.kind,
+          payload,
+        });
       });
 
       const listSessionsWithPendingInputs = Effect.fn(

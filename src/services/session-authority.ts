@@ -3747,13 +3747,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 const resumedOption = yield* runRepo.get(sessionId);
                 if (Option.isNone(resumedOption)) return;
                 const resumed = resumedOption.value;
-                const retryPayload = yield* runInputRepo
-                  .latestActionableInput(sessionId)
-                  .pipe(
-                    Effect.map((input) =>
-                      Option.isSome(input) ? input.value.payload : null,
-                    ),
-                  );
+                const latestActionable =
+                  yield* runInputRepo.latestActionableInput(sessionId);
+                const retryPayload = Option.isSome(latestActionable)
+                  ? latestActionable.value.payload
+                  : null;
+                // Projections use a global key, and attempt numbers reset on
+                // reopening. Scope notices and driver commands to this input.
+                const retryKey = `retry:${sessionId}:${Option.isSome(latestActionable) ? latestActionable.value.id : "saved"}:${resumed.attempt}`;
                 let retryInput:
                   | {
                       readonly kind: "created" | "prompted" | "stop";
@@ -3761,8 +3762,6 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     }
                   | undefined;
                 if (Option.isNone(resumed.ompSessionFile)) {
-                  const latestActionable =
-                    yield* runInputRepo.latestActionableInput(sessionId);
                   if (Option.isNone(latestActionable)) {
                     return yield* Effect.fail(
                       new InterruptedRunNoActionableInputError({
@@ -3794,13 +3793,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 );
                 yield* projector.thought(
                   sessionId,
-                  `retry:${resumed.attempt}`,
+                  retryKey,
                   `Retrying the interrupted Partitura run (attempt ${resumed.attempt}).`,
                 );
                 if (Option.isSome(resumed.ompSessionFile)) {
                   yield* worker.followUp(
                     "Continue the interrupted Linear task from the saved session state.",
-                    `retry:${resumed.attempt}`,
+                    retryKey,
                   );
                 } else {
                   if (retryInput === undefined) {
@@ -3822,14 +3821,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   );
                   const agentInvoked = yield* worker.prompt(
                     retryPrompt,
-                    `retry:${resumed.attempt}`,
+                    retryKey,
                   );
                   if (!agentInvoked) {
-                    yield* finishLocalCommand(
-                      sessionId,
-                      worker,
-                      `retry:${resumed.attempt}`,
-                    );
+                    yield* finishLocalCommand(sessionId, worker, retryKey);
                   }
                 }
               }

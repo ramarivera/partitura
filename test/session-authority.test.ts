@@ -72,6 +72,7 @@ import {
   AgentSettingsRepo,
   InstallationRepo,
   McpServerRepo,
+  ProjectionRepo,
   PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
@@ -663,6 +664,66 @@ describe("SessionAuthority behavior invariants", () => {
       }),
     ),
   );
+  it.live(
+    "persists independent retry notices for concurrent interrupted sessions",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runs = yield* RunRepo;
+          const inputs = yield* RunInputRepo;
+          const projections = yield* ProjectionRepo;
+          yield* InstallationRepo.use((repo) =>
+            repo.put(install(testOrganizationId)),
+          );
+          for (const name of ["retry-session-a", "retry-session-b"]) {
+            const sessionId = Schema.decodeUnknownSync(SessionId)(name);
+            const inputId = Schema.decodeUnknownSync(InputId)(`${name}-prompt`);
+            yield* runs.create({
+              sessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            yield* inputs.enqueue({
+              id: inputId,
+              sessionId,
+              kind: "prompted",
+              body: `Continue ${name}`,
+              payload: {},
+            });
+            yield* inputs.markProcessed(inputId);
+            const cwd = testPath(name);
+            yield* Effect.promise(() => mkdir(cwd, { recursive: true }));
+            yield* runs.update(sessionId, {
+              state: "orphaned",
+              workspacePath: Option.some(cwd),
+            });
+            yield* authority.processSession(sessionId);
+            const thought = projectorThoughts.find(
+              (item) =>
+                item.sessionId === sessionId &&
+                item.text.startsWith("Retrying"),
+            );
+            expect(thought).toBeDefined();
+            if (thought === undefined) throw new Error("missing retry notice");
+            // Persist the actual authority-produced key and payload through the
+            // real outbox. Its global primary key must accept both sessions.
+            yield* projections.enqueue({
+              sourceKey: Schema.decodeUnknownSync(SourceKey)(thought.sourceKey),
+              sessionId,
+              activityType: "thought",
+              payloadHash: name,
+              payload: { sessionId, text: thought.text },
+            });
+          }
+          expect(workerPrompts).toEqual([
+            "Continue retry-session-a",
+            "Continue retry-session-b",
+          ]);
+        }),
+      ),
+  );
+
   it.live("renders a prompted template when retrying an orphaned run", () =>
     withAuthority(() =>
       Effect.gen(function* () {
@@ -1018,6 +1079,11 @@ const projectorEvents: Array<{
   readonly sequence: number;
   readonly event: RpcEvent;
 }> = [];
+const projectorThoughts: Array<{
+  readonly sessionId: string;
+  readonly sourceKey: string;
+  readonly text: string;
+}> = [];
 const projectorElicitations: Array<{
   readonly sessionId: string;
   readonly sourceKey: string;
@@ -1065,7 +1131,11 @@ const signalElicitation = (): void => {
 
 let terminalFailure: DatabaseError | undefined;
 const mockProjector = ActivityProjector.of({
-  thought: () => Effect.succeed(true),
+  thought: (sessionId, sourceKey, text) =>
+    Effect.sync(() => {
+      projectorThoughts.push({ sessionId, sourceKey, text });
+      return true;
+    }),
   deviation: () => Effect.succeed(true),
   elicitation: (sessionId, sourceKey, text, options) =>
     Effect.sync(() => {
@@ -1284,6 +1354,7 @@ const withAuthority = <A, E>(
     | McpOAuth
     | TokenCrypto
     | PromptTemplateRepo
+    | ProjectionRepo
     | WorkspaceRepo
     | NixEnvironment
     | GitHubApp
@@ -1323,6 +1394,7 @@ const withAuthority = <A, E>(
       workerStopBlock = undefined;
       projectionExpected = 0;
       projectorEvents.length = 0;
+      projectorThoughts.length = 0;
       projectorElicitations.length = 0;
       workerSpawnInputs.length = 0;
       workerPrompts.length = 0;
@@ -1361,6 +1433,7 @@ const withAuthority = <A, E>(
         McpServerRepo.layer,
         McpOAuth.layer,
         PromptTemplateRepo.layer,
+        ProjectionRepo.layer,
         RunEventRepo.layer,
         RunInputRepo.layer,
         RunRepo.layer,
