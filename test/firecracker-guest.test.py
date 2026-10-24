@@ -47,6 +47,19 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
+    async def test_shutdown_requires_session_secret_and_signals_only_init(self):
+        with patch.object(guest.os, "kill") as kill:
+            reader, writer = await self.connect({"operation": "shutdown", "token": "b" * 64})
+            self.assertFalse(json.loads(await reader.readline())["ok"])
+            writer.close()
+            await writer.wait_closed()
+            kill.assert_not_called()
+            reader, writer = await self.connect({"operation": "shutdown"})
+            self.assertTrue(json.loads(await reader.readline())["ok"])
+            writer.close()
+            await writer.wait_closed()
+            kill.assert_called_once_with(1, guest.signal.SIGTERM)
+
     def test_exec_rejects_symlink_escape_and_unapproved_environment(self):
         request = {"workerUid": str(self.uid), "argv": ["true"], "cwd": str(self.workspace)}
         (self.workspace / "escape").symlink_to("/etc", target_is_directory=True)

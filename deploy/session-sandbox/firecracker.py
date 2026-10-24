@@ -19,6 +19,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any
 
 STATE_ROOT = Path(os.environ.get("PARTITURA_SANDBOX_STATE_ROOT", "/var/lib/partitura-sandbox"))
@@ -236,6 +237,18 @@ async def command(record: dict[str, Any], request: dict[str, Any]) -> dict[str, 
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+def stop_for_recovery(record: dict[str, Any]) -> None:
+    session = record["sessionId"]
+    if not running(session):
+        return
+    asyncio.run(command(record, {"operation": "shutdown"}))
+    deadline = time.monotonic() + 45
+    while running(session):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Firecracker graceful shutdown timed out; ownership retained")
+        time.sleep(0.1)
 
 
 async def ready(record: dict[str, Any]) -> None:

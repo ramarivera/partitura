@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, AsyncMock, Mock
 
@@ -47,6 +48,19 @@ class FirecrackerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "KVM unavailable"):
                 broker.provision(self.request)
             sysbox.assert_not_called()
+
+    def test_recovery_waits_for_authenticated_graceful_shutdown(self):
+        command = AsyncMock(return_value={"ok": True})
+        with patch.object(vm, "running", side_effect=[True, True, False]), patch.object(vm, "command", command), patch.object(vm.time, "sleep"):
+            vm.stop_for_recovery(self.record)
+        command.assert_awaited_once_with(self.record, {"operation": "shutdown"})
+        with patch.object(vm, "running", return_value=False), patch.object(vm, "command", command):
+            vm.stop_for_recovery(self.record)
+        self.assertEqual(command.await_count, 1)
+        with patch.object(vm, "running", return_value=True), patch.object(vm, "command", AsyncMock(return_value={"ok": True})), patch.object(vm, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 46]), sleep=Mock())), patch.object(vm.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "ownership retained"):
+                vm.stop_for_recovery(self.record)
+            run.assert_not_called()
 
     def test_explicit_sysbox_is_persisted_by_same_owner(self):
         with patch.object(broker, "_workspace", return_value=Path("/host/session")), patch.object(broker, "_sysbox_provision", return_value={"container": "opaque"}):

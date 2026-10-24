@@ -630,8 +630,9 @@ def recover(request: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("sandbox recovery ownership or runtime does not match")
         if runtime == "sysbox":
             return {**_sysbox_recover(request), "runtime": runtime}
-        # Always restart to terminate orphan execs while preserving the same disk.
-        subprocess.run(["/usr/bin/systemctl", "stop", vm.unit(session)], check=True, capture_output=True, timeout=30)
+        # Let PID 1 stop Docker and flush completed writes before retiring all
+        # orphan execs. A hard VMM stop can lose ext4 delayed-allocation data.
+        vm.stop_for_recovery(record)
         vm.start(session)
         vm.start_workspace(session)
         return {"runtime": runtime, "exists": True, "running": True, "container": _container(session),

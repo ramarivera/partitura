@@ -28,7 +28,10 @@ docker_pid=$!
 /usr/local/bin/partitura-guest-agent &
 agent_pid=$!
 shutdown() {
+  trap '' TERM INT HUP
   kill -TERM "$agent_pid" "$docker_pid" 2>/dev/null || true
+  wait "$docker_pid" 2>/dev/null || true
+  wait "$agent_pid" 2>/dev/null || true
   sync
   python3 -c 'import ctypes; ctypes.CDLL(None).reboot(0x4321fedc)'
 }

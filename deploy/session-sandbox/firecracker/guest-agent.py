@@ -167,6 +167,10 @@ class Agent:
             operation = request.get("operation")
             if operation == "ping":
                 await send_json(writer, {"ok": True})
+            elif operation == "shutdown":
+                await send_json(writer, {"ok": True})
+                # PID 1 stops Docker and syncs the private disk before reboot.
+                os.kill(1, signal.SIGTERM)
             elif operation == "exec":
                 await stream_exec(reader, writer, request, self.uid)
             elif operation == "mount-workspace":
