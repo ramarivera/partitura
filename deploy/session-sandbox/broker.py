@@ -323,7 +323,10 @@ def _remove_owned(kind: str, name: str, session: str, attempt: int = 0, stopped:
         return _remove_owned(kind, name, session, attempt, stopped=True)
     action = {"container": "rm", "network": "network rm", "volume": "volume rm"}[kind]
     try:
-        result = _docker_mutate(session, [*action.split(), name], timeout=30)
+        # Sysbox may spend over a minute reverting the container's shifted
+        # filesystem before Docker removal completes. Stay inside the gateway's
+        # five-minute teardown budget without abandoning the durable owner.
+        result = _docker_mutate(session, [*action.split(), name], timeout=120 if kind == "container" else 30)
     except subprocess.TimeoutExpired:
         # Docker may continue an asynchronous removal after its CLI exits. Keep
         # the lifecycle record so the next teardown rechecks exact ownership.

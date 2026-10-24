@@ -341,7 +341,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(run.call_count, expected_calls)
                 self.assertEqual(run.call_args_list[0].kwargs["timeout"], 10)
                 if expected_calls == 2:
-                    self.assertEqual(run.call_args_list[1].kwargs["timeout"], 30)
+                    self.assertEqual(run.call_args_list[1].kwargs["timeout"], 120)
 
     def test_destroy_rechecks_ownership_before_retrying_async_container_kill(self):
         owned = SimpleNamespace(returncode=0, stdout=json.dumps([{"Config": {"Labels": {"partitura.session": "session-2"}}}]), stderr="")
