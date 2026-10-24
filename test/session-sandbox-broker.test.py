@@ -47,6 +47,32 @@ class CaptureWriter:
 
 
 class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
+    def test_private_egress_requires_exact_host_and_address_pins(self):
+        with patch.object(broker, "EGRESS_HOSTS", frozenset({"model.example", "packages.example"})):
+            pins = broker.private_egress_addresses('{"model.example":["100.81.163.26"]}')
+            with patch.object(broker, "PRIVATE_EGRESS_ADDRESSES", pins):
+                self.assertEqual(broker.egress_addresses("model.example", {"100.81.163.26"}), ["100.81.163.26"])
+                self.assertEqual(broker.egress_addresses("packages.example", {"1.1.1.1"}), ["1.1.1.1"])
+                for host, addresses in [
+                    ("packages.example", {"100.81.163.26"}),
+                    ("other.example", {"100.81.163.26"}),
+                    ("model.example", {"100.81.163.27"}),
+                    ("model.example", {"100.81.163.26", "127.0.0.1"}),
+                    ("model.example", {"1.1.1.1"}),
+                    ("model.example", set()),
+                ]:
+                    with self.assertRaises(ValueError):
+                        broker.egress_addresses(host, addresses)
+            with patch.object(broker, "PRIVATE_EGRESS_ADDRESSES", {}):
+                with self.assertRaises(ValueError):
+                    broker.egress_addresses("model.example", {"100.81.163.26"})
+            for address in ["127.0.0.1", "::1", "169.254.169.254", "0.0.0.0", "224.0.0.1", "1.1.1.1"]:
+                with self.assertRaises(ValueError):
+                    broker.private_egress_addresses(json.dumps({"model.example": [address]}))
+            for raw in ['[]', '{"other.example":["100.81.163.26"]}', '{"model.example":[]}', '{"model.example":"100.81.163.26"}']:
+                with self.assertRaises(ValueError):
+                    broker.private_egress_addresses(raw)
+
     def setUp(self):
         # Existing Docker protocol tests isolate the daemon seam. Dedicated
         # lifetime tests below exercise the real durable mutation owner.

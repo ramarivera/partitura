@@ -186,9 +186,18 @@ the exact comma-separated HTTPS hostnames workers need, including
 `cliproxyapi.ai.roxasroot.net` for the configured model proxy and any package
 registries used by worker tools. It defaults to an empty list, so worker
 egress stays closed until an operator sets the allowlist. Review DNS results
-before each connection; the broker rejects a hostname if any answer is not
-globally routable. Keep this value in the deployment source of truth and apply
-it to the broker service environment, not the gateway container.
+before each connection; by default the broker rejects a hostname if any answer
+isn't globally routable. An operator can explicitly approve a private HTTPS
+service by setting `PARTITURA_SANDBOX_PRIVATE_EGRESS_ADDRESSES_JSON` to an object
+mapping an already-allowed hostname to exact IP addresses. It defaults to `{}`.
+Pinned hosts must resolve entirely within their approved address set, and the
+proxy connects to the validated address without resolving it again. CIDRs,
+loopback, link-local, metadata, multicast, unspecified, and reserved addresses
+are refused. CONNECT remains limited to port 443. This is a protected access
+grant, so review and approve it before deployment. Keep both settings in the
+deployment source of truth and apply them to the broker service environment,
+not the gateway container. A changed service address requires a reviewed pin
+update; it doesn't broaden access automatically.
 
 Build the worker image from `Dockerfile.worker`. It pins Bun, Docker, Mise,
 Node, Python, OMP, Claude Code, T3, and Codex versions. Node 24.22.1 and

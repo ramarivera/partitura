@@ -55,6 +55,42 @@ EGRESS_HOSTS = frozenset(
 )
 
 
+def private_egress_addresses(raw: str) -> dict[str, frozenset[str]]:
+    """Root-configured exact address pins, never a blanket private-network grant."""
+    mapping = json.loads(raw)
+    if not isinstance(mapping, dict):
+        raise ValueError("private egress pins must be an object")
+    result = {}
+    for host, values in mapping.items():
+        if host not in EGRESS_HOSTS or not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+            raise ValueError("private egress pins require an allowed hostname and addresses")
+        addresses = frozenset(str(ipaddress.ip_address(value)) for value in values)
+        for value in addresses:
+            address = ipaddress.ip_address(value)
+            if address.is_global or address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified or address.is_reserved:
+                raise ValueError("private egress pin is not an eligible private address")
+        result[host] = addresses
+    return result
+
+
+PRIVATE_EGRESS_ADDRESSES = private_egress_addresses(
+    os.environ.get("PARTITURA_SANDBOX_PRIVATE_EGRESS_ADDRESSES_JSON", "{}")
+)
+
+
+def egress_addresses(host: str, addresses: set[str]) -> list[str]:
+    if host not in EGRESS_HOSTS or not addresses:
+        raise ValueError("egress target is not allowed")
+    normalized = {str(ipaddress.ip_address(value)) for value in addresses}
+    pinned = PRIVATE_EGRESS_ADDRESSES.get(host)
+    if pinned is not None:
+        if not normalized.issubset(pinned):
+            raise ValueError("egress DNS differs from approved address pins")
+    elif any(not ipaddress.ip_address(value).is_global for value in normalized):
+        raise ValueError("host resolved to a non-public address")
+    return sorted(normalized)
+
+
 def _firewall_tag() -> str:
     invocation = os.environ.get("INVOCATION_ID", "")
     if not re.fullmatch(r"[a-f0-9]{32}", invocation):
@@ -1021,10 +1057,8 @@ async def _stream_egress(
                 answers = await asyncio.get_running_loop().getaddrinfo(
                     host, 443, type=socket.SOCK_STREAM
                 )
-                addresses = {answer[4][0] for answer in answers}
-                if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
-                    raise ValueError("host resolved to a non-public address")
-                remote_reader, remote_writer = await asyncio.open_connection(sorted(addresses)[0], 443)
+                addresses = egress_addresses(host, {answer[4][0] for answer in answers})
+                remote_reader, remote_writer = await asyncio.open_connection(addresses[0], 443)
                 active_writers.add(remote_writer)
             except (OSError, ValueError):
                 client_writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
