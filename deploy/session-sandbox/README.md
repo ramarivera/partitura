@@ -131,6 +131,14 @@ use, and keep workspace and volume retention running. `exec` can only target
 the named session container and `/workspace`; it does not accept Docker options
 or arbitrary host paths.
 
+Each Sysbox Docker mutation runs in a broker-owned transient systemd unit.
+The same session record stores its unit identity before submission. A request
+timeout leaves the Docker client running; recovery and teardown retain ownership
+until its normal successful exit is recorded. Missing or failed operation
+evidence fails closed and needs operator investigation. Running containers get
+a bounded graceful stop before removal so nested Docker can exit. There is no
+second session database or independent container inventory to reconcile.
+
 The gateway is not attached to worker networks. `relay` starts one fixed-target
 TCP forwarder on the host side of the session bridge. It accepts connections
 from the worker IP for gateway-bound relays and from the gateway network owner
