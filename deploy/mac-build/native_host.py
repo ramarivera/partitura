@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
-INSTALL_HOST_SHA256 = "9341c65e84d082747b01f35fd2ba4c4c5c2b1feb58ffc0a3dae59e71fd4651f4"
+INSTALL_HOST_SHA256 = "65f93ca9b8fc59f0659ad568195e5519aac38969ca15d2bd4631bf1b2448ba0a"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 STAGED_FILES = {
     '/Library/Partitura/NativeBuild/broker.py': 'broker.py',

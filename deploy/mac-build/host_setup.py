@@ -500,7 +500,7 @@ def sshd_effective(settings: dict, run=subprocess.run) -> dict[str, str]:
         timeout=15,
     )
     return {
-        key: value
+        key.lower(): value
         for line in result.stdout.splitlines()
         if len(parts := line.split(None, 1)) == 2
         for key, value in [parts]

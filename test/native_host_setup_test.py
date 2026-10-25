@@ -143,7 +143,9 @@ class NativeHostSetupTests(unittest.TestCase):
         def run(arguments, **kwargs):
             calls.append((arguments, kwargs))
             return subprocess.CompletedProcess(
-                arguments, 0, stdout=expected if "-T" in arguments else "", stderr=""
+                arguments, 0,
+                stdout="\n".join(line[0].upper() + line[1:] for line in expected.splitlines()) if "-T" in arguments else "",
+                stderr=""
             )
 
         with patch.object(Path, "read_text", return_value="Include /etc/ssh/sshd_config.d/*"):
@@ -200,6 +202,17 @@ class NativeHostSetupTests(unittest.TestCase):
         )
         self.assertIn('"$preflight/sshd_config"', installer)
         self.assertIn("sshd -T -f", installer)
+
+    def test_sshd_keyword_normalization_preserves_case_sensitive_paths(self):
+        installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
+        normalize = installer.split("normalize_sshd_keywords() {\n", 1)[1].split("\n}", 1)[0]
+        result = subprocess.run(
+            ["bash", "-c", normalize],
+            input="AuthorizedKeysFile /Library/Partitura/NativeBuild/authorized_keys\nForceCommand /usr/bin/python3 /Library/Partitura/NativeBuild/broker.py\n",
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout, "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys\nforcecommand /usr/bin/python3 /Library/Partitura/NativeBuild/broker.py\n")
+        self.assertEqual(installer.count("| normalize_sshd_keywords)"), 2)
 
     def test_base_preparation_promotes_and_binds_the_destination_receipt(self):
         preparation = (ROOT / "deploy/mac-build/prepare-base.sh").read_text()

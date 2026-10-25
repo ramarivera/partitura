@@ -95,7 +95,10 @@ done
   "\$1 == \"Include\" && \$2 == \"/etc/ssh/sshd_config.d/*\" { \$0 = replacement; replaced = 1 } { print } END { if (!replaced) exit 1 }" \
   "$preflight/sshd_config.source" > "$preflight/sshd_config"
 /usr/sbin/sshd -t -f "$preflight/sshd_config"
-effective="$(/usr/sbin/sshd -T -f "$preflight/sshd_config" -C user="$account",host=localhost,addr=127.0.0.1)"
+normalize_sshd_keywords() {
+  /usr/bin/awk '{ key = $1; sub(/^[^ \t]+/, tolower(key)); print }'
+}
+effective="$(/usr/sbin/sshd -T -f "$preflight/sshd_config" -C user="$account",host=localhost,addr=127.0.0.1 | normalize_sshd_keywords)"
 for expected in \
   "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys" \
   "passwordauthentication no" \
@@ -131,7 +134,7 @@ atomic_install "$stage/managed-files.json" 0444 /Library/Partitura/NativeBuild/m
 /usr/bin/install -o root -g wheel -m 0644 "$stage/sshd_config" "$dropin.new"
 /bin/mv -f "$dropin.new" "$dropin"
 /usr/sbin/sshd -t
-live_effective="$(/usr/sbin/sshd -T -C user="$account",host=localhost,addr=127.0.0.1)"
+live_effective="$(/usr/sbin/sshd -T -C user="$account",host=localhost,addr=127.0.0.1 | normalize_sshd_keywords)"
 for expected in \
   "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys" \
   "passwordauthentication no" \
