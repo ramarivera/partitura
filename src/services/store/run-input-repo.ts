@@ -306,6 +306,14 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
                   FROM agent_run r
                   JOIN run_input i ON i.session_id=r.session_id AND i.processed_at IS NULL
                   WHERE r.state NOT IN ('succeeded','failed','canceled')
+                    OR (
+                      r.state='canceled' AND i.kind='prompted'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM run_input stop
+                        WHERE stop.session_id=r.session_id AND stop.kind='stop'
+                          AND stop.rowid>i.rowid
+                      )
+                    )
                   ORDER BY r.session_id
                 `)
               .all(),

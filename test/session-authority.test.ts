@@ -515,7 +515,7 @@ describe("SessionAuthority behavior invariants", () => {
   );
 
   it.effect(
-    "resumes a user-stopped run when a follow-up prompt arrives",
+    "schedules a user-stopped run when a follow-up prompt arrives",
     () =>
       withAuthority(() =>
         Effect.gen(function* () {
@@ -555,7 +555,7 @@ describe("SessionAuthority behavior invariants", () => {
             body: "stop",
             payload: {},
           });
-          yield* authority.processSession(testSessionId);
+          yield* authority.processRunnable();
 
           const stopped = yield* runRepo.get(testSessionId);
           expect(Option.isSome(stopped)).toBe(true);
@@ -563,6 +563,9 @@ describe("SessionAuthority behavior invariants", () => {
             expect(stopped.value.state).toBe("canceled");
             expect(stopped.value.desiredState).toBe("canceled");
           }
+          expect(yield* runInputRepo.listSessionsWithPendingInputs()).toEqual(
+            [],
+          );
           expect(projectorTerminals).toContainEqual({
             sessionId: testSessionId,
             sourceKey: `stop:${testSessionId}`,
@@ -577,7 +580,7 @@ describe("SessionAuthority behavior invariants", () => {
             body: "please continue the task",
             payload: {},
           });
-          yield* authority.processSession(testSessionId);
+          yield* authority.processRunnable();
 
           const resumed = yield* runRepo.get(testSessionId);
           expect(Option.isSome(resumed)).toBe(true);

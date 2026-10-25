@@ -377,6 +377,52 @@ describe("Store repositories", () => {
     ),
   );
 
+  it.live(
+    "only schedules canceled sessions for prompts received after stop",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const runs = yield* RunRepo;
+          const inputs = yield* RunInputRepo;
+          const sessionId = makeSessionId("stopped-scheduler");
+          yield* runs.create({
+            sessionId,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
+          for (const [id, kind] of [
+            ["old-prompt", "prompted"],
+            ["stop", "stop"],
+          ] as const) {
+            yield* inputs.enqueue({
+              id: makeInputId(id),
+              sessionId,
+              kind,
+              body: id,
+              payload: {},
+              createdAt: 100,
+            });
+          }
+          yield* runs.update(sessionId, { state: "canceled" });
+          yield* inputs.markProcessed(makeInputId("stop"));
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
+          yield* inputs.enqueue({
+            id: makeInputId("new-prompt"),
+            sessionId,
+            kind: "prompted",
+            body: "continue",
+            payload: {},
+            createdAt: 100,
+          });
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([
+            sessionId,
+          ]);
+          yield* inputs.markProcessed(makeInputId("new-prompt"));
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
+        }),
+      ),
+  );
+
   it.live("recovers active runs and leases after a process restart", () =>
     withRepos(
       Effect.gen(function* () {
