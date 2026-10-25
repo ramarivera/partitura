@@ -48,6 +48,7 @@ if(command[0]==="run") {
  let serialized=JSON.stringify(receipt);
  if(config.rawArtifactBytes!==undefined)serialized=serialized.replace(/"artifactBytes":[^,}]+/, '"artifactBytes":'+config.rawArtifactBytes);
  console.log(serialized);
+ process.exit(config.exitCode??0);
 } else if(command[0]==="artifact") process.stdout.write(config.corrupt?"corrupted":"${payload}");
 else console.log(JSON.stringify({job:command[1],state:"cancellation-requested"}));
 `;
@@ -561,6 +562,111 @@ it.live("waits for a current prune before leasing a fresh artifact", () =>
       }
     } finally {
       await client.close();
+    }
+  }),
+);
+
+it.live("preserves only validated failed-job diagnostics across restart", () =>
+  Effect.promise(async () => {
+    const fixture = await setup();
+    await writeFile(
+      fixture.configFile,
+      JSON.stringify({
+        trace: fixture.trace,
+        exitCode: 1,
+        receiptOverrides: {
+          state: "failed",
+          stage: "boot",
+          bootExitCode: 1,
+          failureCode: "host-key-unavailable",
+          cause: "private fixture detail",
+          log: "private fixture detail",
+        },
+      }),
+    );
+    const client = await createNativeBuildClient(fixture.config);
+    const job = await client.start({
+      sessionId: "session-a",
+      workspacePath: fixture.workspace,
+      commit: fixture.commit,
+      pullRequest: 12,
+      action: "archive",
+    });
+    const expected = {
+      ...job,
+      state: "failed",
+      stage: "boot",
+      bootExitCode: 1,
+      failureCode: "host-key-unavailable",
+    };
+    try {
+      expect(await settled(client, job.job)).toEqual(expected);
+      await expect(client.artifact("session-a", job.job)).rejects.toThrow(
+        "no successful artifact",
+      );
+    } finally {
+      await client.close();
+    }
+    const restarted = await createNativeBuildClient(fixture.config);
+    try {
+      expect(await restarted.status("session-a", job.job)).toEqual(expected);
+      expect(
+        await readFile(
+          join(fixture.config.scratchRoot, `${job.job}.json`),
+          "utf8",
+        ),
+      ).not.toContain("private fixture detail");
+    } finally {
+      await restarted.close();
+    }
+  }),
+);
+
+it.live("rejects foreign, untrusted and transport failure diagnostics", () =>
+  Effect.promise(async () => {
+    for (const [index, invalid] of [
+      { exitCode: 255 },
+      { exitCode: 0 },
+      { receiptOverrides: { commit: "f".repeat(40) } },
+      { receiptOverrides: { job: "f".repeat(32) } },
+      { receiptOverrides: { action: "foreign" } },
+      { receiptOverrides: { failureCode: "private fixture detail" } },
+      { receiptOverrides: { stage: "private fixture detail" } },
+      { receiptOverrides: { bootExitCode: 1.5 } },
+      { receiptOverrides: { stage: "workflow" } },
+      { receiptOverrides: { state: "succeeded" } },
+    ].entries()) {
+      const fixture = await setup(`invalid-failure-${index}`);
+      await writeFile(
+        fixture.configFile,
+        JSON.stringify({
+          trace: fixture.trace,
+          exitCode: invalid.exitCode ?? 1,
+          receiptOverrides: {
+            state: "failed",
+            stage: "boot",
+            bootExitCode: 1,
+            failureCode: "host-key-unavailable",
+            ...invalid.receiptOverrides,
+          },
+        }),
+      );
+      const client = await createNativeBuildClient(fixture.config);
+      try {
+        const job = await client.start({
+          sessionId: "session-a",
+          workspacePath: fixture.workspace,
+          commit: fixture.commit,
+          pullRequest: 12,
+          action: "archive",
+        });
+        expect(await settled(client, job.job)).toEqual({
+          ...job,
+          state: "failed",
+        });
+      } finally {
+        await client.close();
+      }
     }
   }),
 );

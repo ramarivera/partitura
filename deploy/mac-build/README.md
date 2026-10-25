@@ -214,6 +214,16 @@ queries and record `artifactExpired` when pruning removes their archive. An
 already-open artifact transfer can finish after its archive is unlinked. Pruning
 holds the job lock and never removes a running job's output or VM recovery fences.
 
+Failed `run` requests return exit status 1 with a JSON receipt. The gateway
+validates its job, commit and action before retaining the allowlisted `stage`,
+`bootExitCode` and `failureCode` fields. Transport errors and invalid receipts
+remain generic failures. `host-key-unavailable` identifies the known boot-log
+signature in Virtualization.framework; it doesn't identify which account
+prerequisite is missing. `cleanup-required` takes priority and blocks further jobs
+until reconciliation. Raw boot logs stay private. `status` can classify a retained
+boot log for an older failed job without changing the stored receipt or booting a
+VM. Installing this diagnostic support doesn't repair host security state.
+
 ## Acceptance
 
 On recent macOS hosts, creating the dedicated Unix account and installing a

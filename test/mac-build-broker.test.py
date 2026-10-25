@@ -24,8 +24,8 @@ with (root/'trace').open('a') as out: out.write(json.dumps(args)+'\\n')
 scenario = (root/'scenario').read_text()
 if args[0]=='clone' and scenario=='clone-failure': sys.exit(1)
 if args[0]=='clone': shutil.copytree(root/'vms'/args[1], root/'vms'/args[2])
-if args[0]=='run' and scenario=='boot-failure':
-    print('fixture virtualization startup refusal', file=sys.stderr)
+if args[0]=='run' and scenario in ('boot-failure', 'host-key-failure'):
+    print('VZErrorDomain Code=-9: Failed to get current host key; Failed to create new HostKey; private fixture detail' if scenario=='host-key-failure' else 'fixture virtualization startup refusal', file=sys.stderr)
     sys.exit(42)
 if args[0]=='run':
     if any(not (root/'vms'/args[1]/name).stat().st_mode & 0o200 for name in ['config.json','disk.img','nvram.bin']): sys.exit(1)
@@ -35,7 +35,7 @@ if args[0]=='delete':
     target=root/'vms'/args[1]
     if not target.exists(): sys.exit(1)
     shutil.rmtree(target)
-if args[0]=='exec' and scenario=='boot-failure': sys.exit(1)
+if args[0]=='exec' and scenario in ('boot-failure', 'host-key-failure'):  sys.exit(1)
 if args[0]=='exec' and '-i' in args:
     data=sys.stdin.buffer.read()
     (root/'received').write_bytes(data)
@@ -149,9 +149,48 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(receipt['stage'], 'boot')
         self.assertEqual(receipt['bootExitCode'], 42)
+        self.assertNotIn('failureCode', receipt)
         self.assertIn('fixture virtualization startup refusal', (self.root / self.job / 'boot.log').read_text())
         self.assertIn(['delete', 'partitura-job-'+self.job], self.trace())
         self.assertFalse((self.root / 'active-vm').exists())
+
+    def test_host_key_failure_exposes_only_fixed_diagnostic_and_preserves_cleanup(self):
+        (self.root / 'scenario').write_text('host-key-failure')
+        code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['failureCode'], 'host-key-unavailable')
+        self.assertNotIn('private fixture detail', json.dumps(receipt))
+        self.assertNotIn('Failed to create new HostKey', json.dumps(receipt))
+        self.assertFalse((self.root / 'active-vm').exists())
+        self.assertFalse((self.root / 'vms' / ('partitura-job-' + self.job)).exists())
+        # Status can classify old failed receipts without rewriting their history.
+        del receipt['failureCode']
+        broker.record(self.root / self.job, **receipt)
+        before = (self.root / self.job / 'receipt.json').read_bytes()
+        output = io.StringIO()
+        with patch.object(broker, 'load_config', return_value=self.config), patch.dict(os.environ, SSH_ORIGINAL_COMMAND='status ' + self.job), contextlib.redirect_stdout(output):
+            self.assertEqual(broker.main(), 0)
+        self.assertEqual(json.loads(output.getvalue())['failureCode'], 'host-key-unavailable')
+        self.assertEqual((self.root / self.job / 'receipt.json').read_bytes(), before)
+
+    def test_diagnostics_ignore_unknown_unsafe_or_oversized_logs(self):
+        directory = self.root / self.job
+        directory.mkdir()
+        target = directory / 'boot.log'
+        receipt = dict(state='failed', stage='boot')
+        signature = b'VZErrorDomain Code=-9: Failed to get current host key; Failed to create new HostKey'
+        for data in (b'unknown private detail', signature + b'x' * broker.MAX_BOOT_LOG):
+            target.write_bytes(data)
+            self.assertNotIn('failureCode', broker.diagnostic_receipt(directory, receipt))
+        target.unlink()
+        outside = self.root / 'private.log'
+        outside.write_bytes(signature)
+        target.symlink_to(outside)
+        self.assertNotIn('failureCode', broker.diagnostic_receipt(directory, receipt))
+        target.unlink()
+        os.mkfifo(target)
+        self.assertNotIn('failureCode', broker.diagnostic_receipt(directory, receipt))
+        self.assertEqual(broker.diagnostic_receipt(directory, dict(receipt, cause='cleanup-required'))['failureCode'], 'cleanup-required')
 
     def test_boot_log_drains_excess_bytes_without_growing_the_file(self):
         source = io.BytesIO(b'x' * (broker.MAX_BOOT_LOG * 3))
@@ -243,6 +282,7 @@ class BrokerTests(unittest.TestCase):
         code, receipt = self.invoke()
         self.assertEqual(code, 1)
         self.assertEqual(receipt['cause'], 'cleanup-required')
+        self.assertEqual(receipt['failureCode'], 'cleanup-required')
         with self.assertRaisesRegex(ValueError, 'operator reconciliation'):
             self.invoke()
 

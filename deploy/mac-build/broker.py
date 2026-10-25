@@ -125,6 +125,32 @@ def capture_boot_log(source, destination):
         source.close()
 
 
+def diagnostic_receipt(directory, receipt):
+    """Publish fixed codes only. Raw host diagnostics stay private."""
+    result = dict(receipt)
+    if receipt.get('state') != 'failed':
+        return result
+    if receipt.get('cause') == 'cleanup-required':
+        result['failureCode'] = 'cleanup-required'
+        return result
+    if receipt.get('stage') != 'boot':
+        return result
+    try:
+        descriptor = os.open(directory / 'boot.log', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > MAX_BOOT_LOG:
+                return result
+            diagnostic = source.read(MAX_BOOT_LOG + 1)
+        if len(diagnostic) <= MAX_BOOT_LOG and all(marker in diagnostic for marker in (
+            b'VZErrorDomain', b'Failed to get current host key', b'Failed to create new HostKey',
+        )):
+            result['failureCode'] = 'host-key-unavailable'
+    except OSError:
+        pass
+    return result
+
+
 def owned(arguments, environment, timeout, **kwargs):
     child = subprocess.Popen(arguments, env=environment, start_new_session=True, **kwargs)
     try:
@@ -407,6 +433,7 @@ def run_job(config, request):
                 (directory / 'artifacts.tar').unlink(missing_ok=True)
             if receipt['state'] == 'succeeded':
                 (directory / 'boot.log').unlink(missing_ok=True)
+            receipt = diagnostic_receipt(directory, receipt)
             record(directory, **receipt)
             bundle.unlink(missing_ok=True)
         print(json.dumps(receipt))
@@ -427,7 +454,7 @@ def main():
         return 0
     receipt = json.loads((directory / 'receipt.json').read_text())
     if request[0] == 'status':
-        print(json.dumps(receipt))
+        print(json.dumps(diagnostic_receipt(directory, receipt)))
     else:
         if receipt['state'] != 'succeeded':
             raise ValueError('no successful artifact')

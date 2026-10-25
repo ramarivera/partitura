@@ -34,7 +34,27 @@ export interface NativeBuildRequest {
   /** Gateway-selected job inputs. Never accepted from model tool arguments. */
   readonly secretFiles?: Readonly<Record<string, string>>;
 }
+const FailureFields = {
+  failureCode: Schema.optionalKey(
+    Schema.Literals(["host-key-unavailable", "cleanup-required"]),
+  ),
+  stage: Schema.optionalKey(
+    Schema.Literals(["clone", "boot", "workflow", "artifact"]),
+  ),
+  bootExitCode: Schema.optionalKey(
+    Schema.Number.check(
+      Schema.isInt(),
+      Schema.isGreaterThanOrEqualTo(-255),
+      Schema.isLessThanOrEqualTo(255),
+    ),
+  ),
+};
+const FailedReceiptSchema = Schema.Struct({
+  ...FailureFields,
+  state: Schema.Literal("failed"),
+});
 const JobSchema = Schema.Struct({
+  ...FailureFields,
   job: Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u)),
   sessionId: Schema.String,
   commit: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
@@ -153,6 +173,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       readonly signal?: AbortSignal;
       readonly timeout?: number;
       readonly hash?: ReturnType<typeof createHash>;
+      readonly acceptFailedReceipt?: boolean;
     } = {},
   ) => {
     const child = spawn(argv[0], argv.slice(1), {
@@ -161,13 +182,13 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       stdio: ["pipe", "pipe", "ignore"],
       signal: options.signal,
     });
-    const exited = new Promise<void>((resolve, reject) => {
+    const exited = new Promise<number>((resolve, reject) => {
       child.once("error", () =>
         reject(new Error("Native build process unavailable")),
       );
       child.once("exit", (code) =>
-        code === 0
-          ? resolve()
+        code === 0 || (code === 1 && options.acceptFailedReceipt)
+          ? resolve(code)
           : reject(new Error("Native build process failed")),
       );
     });
@@ -195,7 +216,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             child.stdin,
           )
         : Promise.resolve(child.stdin.end());
-      await Promise.all([
+      const [, , exitCode] = await Promise.all([
         input,
         pipeline(
           child.stdout,
@@ -204,7 +225,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
         ),
         exited,
       ]);
-      return Buffer.concat(chunks).toString("utf8");
+      return { output: Buffer.concat(chunks).toString("utf8"), exitCode };
     } finally {
       clearTimeout(timer);
       if (child.exitCode === null) child.kill("SIGKILL");
@@ -453,19 +474,19 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
           job.state = "running";
           await save(job);
           if (abort.signal.aborted) throw new Error("Native build cancelled");
-          const response: unknown = JSON.parse(
-            await remote(
-              `run ${job.job} ${job.commit} ${request.pullRequest} ${job.action} ${info.size}${secretInput === undefined ? "" : ` ${secretInput.byteLength}`}`,
-              {
-                inputFile: bundle,
-                ...(secretInput === undefined
-                  ? {}
-                  : { inputPrefix: secretInput }),
-                timeout: 3_600_000,
-                signal: abort.signal,
-              },
-            ),
+          const result = await remote(
+            `run ${job.job} ${job.commit} ${request.pullRequest} ${job.action} ${info.size}${secretInput === undefined ? "" : ` ${secretInput.byteLength}`}`,
+            {
+              inputFile: bundle,
+              ...(secretInput === undefined
+                ? {}
+                : { inputPrefix: secretInput }),
+              timeout: 3_600_000,
+              signal: abort.signal,
+              acceptFailedReceipt: true,
+            },
           );
+          const response: unknown = JSON.parse(result.output);
           if (
             typeof response !== "object" ||
             response === null ||
@@ -474,7 +495,22 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             !("commit" in response) ||
             response.commit !== request.commit ||
             !("action" in response) ||
-            response.action !== request.action ||
+            response.action !== request.action
+          )
+            throw new Error("Invalid native build receipt identity");
+          if (result.exitCode === 1) {
+            const failure =
+              Schema.decodeUnknownSync(FailedReceiptSchema)(response);
+            if (
+              (failure.failureCode === "host-key-unavailable" &&
+                failure.stage !== "boot") ||
+              (failure.bootExitCode !== undefined && failure.stage !== "boot")
+            )
+              throw new Error("Inconsistent native build failure diagnostic");
+            Object.assign(job, failure);
+            return;
+          }
+          if (
             !("state" in response) ||
             response.state !== "succeeded" ||
             !("artifactSha256" in response) ||
