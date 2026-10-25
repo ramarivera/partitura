@@ -5,6 +5,7 @@ import json
 import os
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 import unittest
 import tempfile
@@ -93,6 +94,23 @@ class NativeHostSetupTests(unittest.TestCase):
             (stage / 'broker.py').symlink_to(stage / 'config.json')
             with self.assertRaises(OSError):
                 launcher.verified_payloads(stage, pin, 'a'*64)
+
+    def test_root_staging_uses_account_home_when_sudo_preserves_administrator_home(self):
+        loader = importlib.util.spec_from_file_location('native_root_home', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            root_home = Path(directory)
+            actual_lstat = Path.lstat
+
+            def root_metadata(path):
+                info = actual_lstat(path)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+
+            with patch.dict(os.environ, {'HOME': '/untrusted/administrator'}), patch.object(launcher.pwd, 'getpwuid', return_value=SimpleNamespace(pw_dir=str(root_home))), patch.object(Path, 'lstat', root_metadata), patch.object(Path, 'home', side_effect=AssertionError('environment home must not be used')):
+                scratch = launcher.root_scratch_directory()
+            self.assertEqual(scratch, root_home / 'dev/agentic-scratchpads/partitura/native-host/root-installer')
+            self.assertEqual(scratch.stat().st_mode & 0o777, 0o700)
 
     def test_standalone_cli_exposes_check_and_stage_host(self):
         result = subprocess.run(

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import stat
 import subprocess
@@ -56,7 +57,9 @@ def fail(message: str) -> int:
 
 
 def root_scratch_directory() -> Path:
-    root_home = Path.home().resolve(strict=True)
+    # sudo may preserve the administrator's HOME. Root staging must use the
+    # root account's own directory, never an environment-selected home.
+    root_home = Path(pwd.getpwuid(0).pw_dir).resolve(strict=True)
     scratch = root_home / "dev/agentic-scratchpads/partitura/native-host/root-installer"
     missing: list[Path] = []
     current = scratch
