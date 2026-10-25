@@ -183,6 +183,11 @@ The API needs only `orchestration:read` and `orchestration:operate` scopes.
 The in-process T3 tests prove gateway behavior against the pinned contract,
 and the launcher tests run a real child process through the lifecycle. They
 don't establish the deployed Linear-session-to-PR acceptance target.
+
+The T3 watchdog interrupts a turn after five minutes without progress. While
+a tool is running, it allows up to thirty minutes without progress so quiet
+dependency installs and builds can finish. Tool completion restores the
+five-minute budget. Hung tools still reach the bounded timeout.
 ## Per-run settings
 
 Each new run resolves its driver, model alias, effort, and runtime mode from
