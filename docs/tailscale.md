@@ -226,6 +226,17 @@ the tailnet's DNS policy. Workers inherit the gateway's mount and network namesp
 including after a UID drop. DNS stops working if tailscaled is unavailable; no
 public fallback resolver silently bypasses tailnet DNS policy.
 
+If a tagged node's ACL denies access to a tailnet-wide private DNS resolver,
+MagicDNS can work while public queries return SERVFAIL. Either grant that node
+access to the intended resolver through your reviewed tailnet policy, or
+deliberately use `nameserver 127.0.0.11` in the gateway resolver file if the
+Docker host already resolves both public names and your MagicDNS names. That
+choice uses the Docker host's DNS policy. A second nameserver after Quad100
+isn't a reliable fallback because some clients stop on SERVFAIL. Recreate the
+gateway after replacing its bind-mounted resolver file, then verify both public
+queries and a full MagicDNS hostname from inside the gateway. Hosts without
+working MagicDNS need the default Quad100 configuration and resolver access.
+
 `TS_ACCEPT_DNS=true` lets tailscaled manage the **sidecar's** resolver. It doesn't
 guarantee that another container's independently mounted `/etc/resolv.conf` is
 updated. Keep the explicit gateway resolver even if enabling it. Don't set `dns`,
