@@ -3867,12 +3867,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 if (runUrlForSession !== null) {
                   yield* projector.externalUrls(
                     sessionId,
-                    `run-url:${sessionId}`,
+                    `partitura-run-url:${sessionId}`,
                     [
                       {
-                        // This label is part of the persisted payload for the
-                        // stable run-url key. Keep it compatible on resume.
-                        label: "OhMyPi run",
+                        // Use a new key to preserve immutable legacy payloads.
+                        label: "Partitura run",
                         url: runUrlForSession(sessionId),
                       },
                     ],
