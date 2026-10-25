@@ -474,6 +474,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       >;
       let nativeBuildClientPromise: Promise<NativeBuildClient> | undefined;
       const nativeBuildJobs = new Map<SessionId, Set<string>>();
+      const repositoryAgeIdentity = (run: AgentRun) =>
+        Option.isSome(run.repositoryId) &&
+        config.workerRepositoryAgeKeys !== undefined
+          ? Redacted.value(config.workerRepositoryAgeKeys)[
+              run.organizationId
+            ]?.[run.repositoryId.value]
+          : undefined;
       const getNativeBuildClient = () => {
         const nativeBuild: NativeBuildConfig | undefined = config.nativeBuild;
         if (nativeBuild === undefined)
@@ -2095,10 +2102,18 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                         !/^[a-z][a-z0-9-]{0,63}$/u.test(raw.action)
                       )
                         return fail("Invalid native build request");
+                      const identity = repositoryAgeIdentity(run);
                       const started = await client.start({
                         sessionId: run.sessionId,
                         workspacePath,
                         ...(workerUid === undefined ? {} : { workerUid }),
+                        ...(identity === undefined
+                          ? {}
+                          : {
+                              secretFiles: {
+                                "repository-age-identity": identity,
+                              },
+                            }),
                         commit: raw.commit,
                         pullRequest: raw.pullRequest,
                         action: raw.action,
@@ -2579,13 +2594,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         environment: Record<string, string>,
       ) {
         delete environment.FNOX_AGE_KEY_FILE;
-        const keys =
-          config.workerRepositoryAgeKeys === undefined
-            ? undefined
-            : Redacted.value(config.workerRepositoryAgeKeys);
-        const identity = Option.isSome(run.repositoryId)
-          ? keys?.[run.organizationId]?.[run.repositoryId.value]
-          : undefined;
+        const identity = repositoryAgeIdentity(run);
         const path = yield* Effect.tryPromise({
           try: () =>
             workspaceProcess(cwd, "age-identity", {

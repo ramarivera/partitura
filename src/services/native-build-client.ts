@@ -31,6 +31,8 @@ export interface NativeBuildRequest {
   readonly commit: string;
   readonly pullRequest: number;
   readonly action: string;
+  /** Gateway-selected job inputs. Never accepted from model tool arguments. */
+  readonly secretFiles?: Readonly<Record<string, string>>;
 }
 const JobSchema = Schema.Struct({
   job: Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u)),
@@ -145,6 +147,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     argv: [string, ...string[]],
     options: {
       readonly inputFile?: string;
+      readonly inputPrefix?: Buffer;
       readonly outputFile?: string;
       readonly outputLimit?: number;
       readonly signal?: AbortSignal;
@@ -182,8 +185,15 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
           },
         });
     try {
-      const input = options.inputFile
-        ? pipeline(createReadStream(options.inputFile), child.stdin)
+      const inputFile = options.inputFile;
+      const input = inputFile
+        ? pipeline(
+            (async function* () {
+              if (options.inputPrefix) yield options.inputPrefix;
+              yield* createReadStream(inputFile);
+            })(),
+            child.stdin,
+          )
         : Promise.resolve(child.stdin.end());
       await Promise.all([
         input,
@@ -337,6 +347,20 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
   await pruneBestEffort();
   return {
     start: async (request: NativeBuildRequest) => {
+      const entries = Object.entries(request.secretFiles ?? {});
+      if (
+        entries.length > 16 ||
+        entries.some(
+          ([name, value]) =>
+            !/^[a-z][a-z0-9-]{0,63}$/u.test(name) || typeof value !== "string",
+        )
+      )
+        throw new Error("Invalid native job secret files");
+      const secretInput = entries.length
+        ? Buffer.from(JSON.stringify(Object.fromEntries(entries)), "utf8")
+        : undefined;
+      if (secretInput !== undefined && secretInput.byteLength > 65_536)
+        throw new Error("Native job secret files exceed limit");
       if (
         !/^[a-f0-9]{40}$/u.test(request.commit) ||
         !Number.isSafeInteger(request.pullRequest) ||
@@ -431,8 +455,15 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
           if (abort.signal.aborted) throw new Error("Native build cancelled");
           const response: unknown = JSON.parse(
             await remote(
-              `run ${job.job} ${job.commit} ${request.pullRequest} ${job.action} ${info.size}`,
-              { inputFile: bundle, timeout: 3_600_000, signal: abort.signal },
+              `run ${job.job} ${job.commit} ${request.pullRequest} ${job.action} ${info.size}${secretInput === undefined ? "" : ` ${secretInput.byteLength}`}`,
+              {
+                inputFile: bundle,
+                ...(secretInput === undefined
+                  ? {}
+                  : { inputPrefix: secretInput }),
+                timeout: 3_600_000,
+                signal: abort.signal,
+              },
             ),
           );
           if (

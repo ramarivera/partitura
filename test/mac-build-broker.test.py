@@ -24,6 +24,9 @@ with (root/'trace').open('a') as out: out.write(json.dumps(args)+'\\n')
 scenario = (root/'scenario').read_text()
 if args[0]=='clone' and scenario=='clone-failure': sys.exit(1)
 if args[0]=='clone': shutil.copytree(root/'vms'/args[1], root/'vms'/args[2])
+if args[0]=='run' and scenario=='boot-failure':
+    print('fixture virtualization startup refusal', file=sys.stderr)
+    sys.exit(42)
 if args[0]=='run':
     if any(not (root/'vms'/args[1]/name).stat().st_mode & 0o200 for name in ['config.json','disk.img','nvram.bin']): sys.exit(1)
     time.sleep(120)
@@ -32,6 +35,7 @@ if args[0]=='delete':
     target=root/'vms'/args[1]
     if not target.exists(): sys.exit(1)
     shutil.rmtree(target)
+if args[0]=='exec' and scenario=='boot-failure': sys.exit(1)
 if args[0]=='exec' and '-i' in args:
     data=sys.stdin.buffer.read()
     (root/'received').write_bytes(data)
@@ -60,17 +64,39 @@ class BrokerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def invoke(self):
+    def invoke(self, prefix=b'', request=None):
         reader, writer = os.pipe()
-        os.write(writer, b'bundle')
+        os.write(writer, prefix + b'bundle')
         os.close(writer)
         output = io.StringIO()
         with os.fdopen(reader, 'rb', buffering=0) as source, patch.object(broker.sys, 'stdin', type('Input', (), {'buffer': source})()), contextlib.redirect_stdout(output):
-            code = broker.run_job(self.config, self.request)
+            code = broker.run_job(self.config, request or self.request)
         return code, json.loads(output.getvalue())
 
     def trace(self):
         return [json.loads(line) for line in (self.root / 'trace').read_text().splitlines()]
+
+    def test_secret_prefix_is_bounded_and_kept_out_of_named_host_state(self):
+        secret = b'{"repository-age-identity":"fixture-job-identity"}'
+        request = (*self.request, len(secret))
+        command = f'run {self.job} {"d"*40} 12 archive 6 {len(secret)}'
+        self.assertEqual(broker.parse_command(command), request)
+        for size in (0, 65537, 100000):
+            with self.assertRaises(ValueError):
+                broker.parse_command(f'run {self.job} {"d"*40} 12 archive 6 {size}')
+        code, receipt = self.invoke(secret, request)
+        self.assertEqual(code, 0)
+        self.assertEqual((self.root / 'received').read_bytes(), secret + b'bundle')
+        self.assertNotIn('fixture-job-identity', json.dumps(receipt))
+        self.assertNotIn('fixture-job-identity', (self.root / 'trace').read_text())
+        self.assertEqual(sorted(p.name for p in (self.root / self.job).iterdir()), ['artifacts.tar', 'receipt.json'])
+
+    def test_secret_path_injection_is_rejected_before_creating_a_vm(self):
+        secret = b'{"../escape":"fixture-job-identity"}'
+        with self.assertRaises(ValueError):
+            self.invoke(secret, (*self.request, len(secret)))
+        self.assertFalse((self.root / 'trace').exists())
+        self.assertFalse((self.root / self.job / 'source.bundle').exists())
 
     def test_rejects_shell_and_path_injection_and_oversized_bundles(self):
         command = f'run {self.job} {"d"*40} 12 archive 6'
@@ -116,6 +142,23 @@ class BrokerTests(unittest.TestCase):
                 with self.assertRaises((ValueError, OSError)):
                     broker.prepare_clone(self.config, clone.name)
                 self.assertEqual(target.stat().st_mode & 0o777, 0o444)
+
+    def test_boot_failure_has_private_diagnostics_and_keeps_cleanup(self):
+        (self.root / 'scenario').write_text('boot-failure')
+        code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['stage'], 'boot')
+        self.assertEqual(receipt['bootExitCode'], 42)
+        self.assertIn('fixture virtualization startup refusal', (self.root / self.job / 'boot.log').read_text())
+        self.assertIn(['delete', 'partitura-job-'+self.job], self.trace())
+        self.assertFalse((self.root / 'active-vm').exists())
+
+    def test_boot_log_drains_excess_bytes_without_growing_the_file(self):
+        source = io.BytesIO(b'x' * (broker.MAX_BOOT_LOG * 3))
+        target = self.root / 'boot.log'
+        broker.capture_boot_log(source, target)
+        self.assertTrue(source.closed)
+        self.assertEqual(target.read_bytes(), b'x' * broker.MAX_BOOT_LOG)
 
     def test_failed_build_destroys_vm_and_never_fetches_artifact(self):
         (self.root / 'scenario').write_text('build-failure')

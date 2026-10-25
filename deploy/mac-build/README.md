@@ -5,7 +5,8 @@ cancellation and cleanup. It doesn't know a repository's build system, toolchain
 version, signing process or secret manager. The generic base includes Mise and
 cached Node/Python runtimes. It doesn't require the operator's Mise configuration,
 toolbox checkout or fnox infrastructure.
-The native integration isn't deployed or live-qualified yet.
+Deployment and acceptance are separate steps. Require the live checks below for
+the installed revision before calling a configured host ready.
 
 ## Repository contract
 
@@ -46,6 +47,18 @@ credentials require an explicitly configured, scoped delivery method. Partitura
 never implicitly inherits an operator keychain, home, SSH agent, signing identity
 or secret-manager identity. A reusable generic base must contain no project keys.
 Don't share a project-specific base across unrelated repositories.
+
+When `WORKER_REPOSITORY_AGE_KEYS_JSON` contains an identity for the run's exact
+organization and repository, the gateway sends it as the generic job file
+`repository-age-identity`. The repository script receives
+`PARTITURA_JOB_SECRETS_DIR`, a mode-0700 directory containing mode-0600 files.
+A repository that uses fnox can select that file itself. Neither fnox nor any
+repository's secret names belong in the base. Model tool arguments cannot
+supply or select these secret files. The optional input is bounded to 16 flat
+filenames and 64 KiB of JSON, travels on stdin rather than SSH arguments, and
+never enters the source bundle or durable ownership record. The host uses an
+unlinked temporary transport, and the guest removes secret files on workflow
+success or failure before its disposable VM is destroyed.
 
 ## Host setup and automation
 
@@ -172,15 +185,19 @@ are canonical mode-0700 directories owned by the dedicated build account.
 The SSH forced command accepts only these requests with exact arguments and no
 shell evaluation:
 
-- `run <job32hex> <commit40hex> <pr> <action> <bundleBytes>`
+- `run <job32hex> <commit40hex> <pr> <action> <bundleBytes> [secretBytes]`
 - `status <job32hex>`
 - `artifact <job32hex>`
 - `cancel <job32hex>`
 
+With `secretBytes`, stdin starts with that many bytes of generic file JSON,
+followed by the source bundle. Without it, the original protocol is unchanged.
 Source arrives as an opaque Git bundle on stdin, bounded to 1 GiB. The host never
 extracts or executes repository code. The fixed guest runner validates itself and
 the generic base qualifier before importing source. Jobs run for at most 45
-minutes. Artifact archives are bounded to 2 GiB.
+minutes. Failed startup receipts identify the stage and boot exit code; private
+host boot diagnostics retain at most 64 KiB, remain outside artifacts, and are
+removed on success. Artifact archives are bounded to 2 GiB.
 
 One host lock serializes jobs. A persisted `active-vm` fence blocks subsequent
 jobs after a crash. Cancellation creates a tombstone even before submission.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,26 +15,31 @@ import stat
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 
 CONFIG = Path('/Library/Partitura/NativeBuild/config.json')
 MAX_BUNDLE = 1024 * 1024 * 1024
 MAX_ARTIFACT = 2 * MAX_BUNDLE
+MAX_BOOT_LOG = 65536
 ARTIFACT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 ARTIFACT_STORAGE_LIMIT = 8 * MAX_BUNDLE
 JOB = r'[a-f0-9]{32}'
 COMMIT = r'[a-f0-9]{40}'
-RUN = re.compile(rf'run ({JOB}) ({COMMIT}) ([1-9][0-9]{{0,7}}) ([a-z][a-z0-9-]{{0,63}}) ([1-9][0-9]{{0,9}})')
+RUN = re.compile(rf'run ({JOB}) ({COMMIT}) ([1-9][0-9]{{0,7}}) ([a-z][a-z0-9-]{{0,63}}) ([1-9][0-9]{{0,9}})(?: ([1-9][0-9]{{0,4}}))?')
 READ = re.compile(rf'(status|artifact|cancel) ({JOB})')
 
 
 def parse_command(command):
     match = RUN.fullmatch(command)
     if match:
-        job, commit, pr, action, length = match.groups()
+        job, commit, pr, action, length, secret_length = match.groups()
         if int(length) > MAX_BUNDLE:
             raise ValueError('bundle exceeds limit')
-        return ('run', job, commit, pr, action, int(length))
+        if secret_length is not None and int(secret_length) > 65536:
+            raise ValueError('job secret input exceeds limit')
+        request = ('run', job, commit, pr, action, int(length))
+        return request if secret_length is None else (*request, int(secret_length))
     match = READ.fullmatch(command)
     if match:
         return match.groups()
@@ -102,6 +108,21 @@ def stop(child):
         except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
             child.wait(timeout=10)
+
+
+def capture_boot_log(source, destination):
+    """Drain Tart stderr while retaining only a fixed-size private prefix."""
+    remaining = MAX_BOOT_LOG
+    try:
+        with destination.open('xb') as output:
+            for chunk in iter(lambda: source.read(65536), b''):
+                if remaining:
+                    kept = chunk[:remaining]
+                    output.write(kept)
+                    output.flush()
+                    remaining -= len(kept)
+    finally:
+        source.close()
 
 
 def owned(arguments, environment, timeout, **kwargs):
@@ -256,7 +277,8 @@ def cancel_job(config, job):
 
 
 def run_job(config, request):
-    _, job, commit, pr, action, length = request
+    _, job, commit, pr, action, length = request[:6]
+    secret_length = request[6] if len(request) == 7 else 0
     root = Path(config['root'])
     directory = root / job
     # A dedicated account's one forced-command key cannot start parallel VMs.
@@ -274,7 +296,16 @@ def run_job(config, request):
         directory.mkdir(mode=0o700)
         record(directory, job=job, commit=commit, action=action, state='receiving')
         bundle = directory / 'source.bundle'
+        secret_input = io.BytesIO()
         try:
+            if secret_length:
+                receive(sys.stdin.buffer, secret_input, secret_length, seconds=30)
+                files = json.loads(secret_input.getvalue())
+                if not isinstance(files, dict) or not 1 <= len(files) <= 16 or any(
+                    not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', name) or not isinstance(value, str)
+                    for name, value in files.items()
+                ):
+                    raise ValueError('invalid job secret files')
             with bundle.open('xb') as output:
                 receive(sys.stdin.buffer, output, length)
         except BaseException as error:
@@ -291,6 +322,8 @@ def run_job(config, request):
         tart = config['tart']
         vm = 'partitura-job-' + job
         boot = None
+        boot_logger = None
+        stage = 'clone'
         clone_attempted = False
         failure = None
         cleanup_failed = False
@@ -309,7 +342,12 @@ def run_job(config, request):
             clone_attempted = True
             owned([tart, 'clone', config['base'], vm], environment, 180, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             prepare_clone(config, vm)
-            boot = subprocess.Popen([tart, 'run', vm, '--no-graphics', '--no-audio', '--no-usb-accessories', '--no-clipboard'], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            stage = 'boot'
+            # Boot has no repository code or secrets; retain its private stderr
+            # only on failure so SSH-only startup failures can be diagnosed.
+            boot = subprocess.Popen([tart, 'run', vm, '--no-graphics', '--no-audio', '--no-usb-accessories', '--no-clipboard'], env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+            boot_logger = threading.Thread(target=capture_boot_log, args=(boot.stderr, directory / 'boot.log'), daemon=True)
+            boot_logger.start()
             ready = False
             for _ in range(60):
                 if boot.poll() is not None:
@@ -322,11 +360,22 @@ def run_job(config, request):
                     time.sleep(2)
             if not ready:
                 raise TimeoutError('guest boot timed out')
+            stage = 'workflow'
             record(directory, job=job, commit=commit, action=action, state='running')
             # The fixed installed guest runner verifies its own sealed qualifier,
             # receives a Git bundle, and never uses host mounts or credentials.
-            with bundle.open('rb') as source:
-                owned([tart, 'exec', '-i', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/env', '-i', 'HOME=' + config['guestHome'], 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', '/bin/bash', '/Library/Partitura/NativeBuild/run.sh', job, commit, pr, action, config['guestRunnerSha256'], config['qualifierSha256']], environment, 2700, stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with bundle.open('rb') as source, tempfile.TemporaryFile(dir=directory) as transport:
+                # Unlinked transport storage cannot survive a host-process crash.
+                # The source bundle and durable job record contain no secrets.
+                transport.write(secret_input.getvalue())
+                for block in iter(lambda: source.read(65536), b''):
+                    transport.write(block)
+                transport.seek(0)
+                arguments = [tart, 'exec', '-i', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/env', '-i', 'HOME=' + config['guestHome'], 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', '/bin/bash', '/Library/Partitura/NativeBuild/run.sh', job, commit, pr, action, config['guestRunnerSha256'], config['qualifierSha256']]
+                if secret_length:
+                    arguments.append(str(secret_length))
+                owned(arguments, environment, 2700, stdin=transport, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stage = 'artifact'
             size = bounded_output([tart, 'exec', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/tar', '-C', config['guestHome'] + '/dev/agentic-scratchpads/partitura/' + job, '-cf', '-', 'artifacts'], environment, directory / 'artifacts.tar', 180)
             digest = hashlib.sha256()
             with (directory / 'artifacts.tar').open('rb') as artifact:
@@ -335,12 +384,16 @@ def run_job(config, request):
             receipt = dict(job=job, commit=commit, action=action, state='succeeded', artifactBytes=size, artifactSha256=digest.hexdigest())
         except BaseException as error:
             failure = error
-            receipt = dict(job=job, commit=commit, action=action, state='failed', cause=type(error).__name__)
+            receipt = dict(job=job, commit=commit, action=action, state='failed', cause=type(error).__name__, stage=stage)
+            if stage == 'boot' and boot is not None and boot.poll() is not None:
+                receipt['bootExitCode'] = boot.returncode
         finally:
             ignore_shutdown_signals()
             finished.set()
             watcher.join(timeout=2)
             stop(boot)
+            if boot_logger is not None:
+                boot_logger.join(timeout=2)
             if clone_attempted:
                 try:
                     destroy_vm(config, job)
@@ -352,6 +405,8 @@ def run_job(config, request):
                 receipt.update(state='failed', cause='cleanup-required')
             if receipt['state'] != 'succeeded':
                 (directory / 'artifacts.tar').unlink(missing_ok=True)
+            if receipt['state'] == 'succeeded':
+                (directory / 'boot.log').unlink(missing_ok=True)
             record(directory, **receipt)
             bundle.unlink(missing_ok=True)
         print(json.dumps(receipt))

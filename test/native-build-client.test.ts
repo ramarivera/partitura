@@ -28,8 +28,11 @@ const config=JSON.parse(readFileSync(cfg,"utf8"));
 const command=args.at(-1).split(" ");
 appendFileSync(config.trace,JSON.stringify({args,env:Object.keys(process.env)})+"\\n");
 if(command[0]==="run") {
- const input=await new Response(Bun.stdin.stream()).arrayBuffer();
- if(input.byteLength!==Number(command[5]))process.exit(2);
+ const received=await new Response(Bun.stdin.stream()).arrayBuffer();
+ const secretLength=Number(command[6]??0);
+ if(received.byteLength!==Number(command[5])+secretLength)process.exit(2);
+ if(secretLength && JSON.parse(new TextDecoder().decode(received.slice(0,secretLength)))["repository-age-identity"]!==config.expectedSecret)process.exit(5);
+ const input=received.slice(secretLength);
  if(!new TextDecoder().decode(input.slice(0,20)).includes("git bundle"))process.exit(3);
  if(config.verifyBundle) {
   const directory=mkdtempSync(join(dirname(config.trace),"native-bundle-")), bundle=join(directory,"source.bundle"), checkout=join(directory,"checkout");
@@ -158,6 +161,53 @@ async function settled(
   }
   throw new Error("Native fixture job didn't settle");
 }
+
+it.live(
+  "delivers bounded job secrets only in SSH stdin, outside durable ownership",
+  () =>
+    Effect.promise(async () => {
+      const fixture = await setup();
+      const secret = "fixture-repository-job-identity";
+      await writeFile(
+        fixture.configFile,
+        JSON.stringify({ trace: fixture.trace, expectedSecret: secret }),
+      );
+      const client = await createNativeBuildClient(fixture.config);
+      try {
+        const request = {
+          sessionId: "session-a",
+          workspacePath: fixture.workspace,
+          commit: fixture.commit,
+          pullRequest: 12,
+          action: "archive",
+        };
+        for (const secretFiles of [
+          { "../escape": secret },
+          { identity: "x".repeat(65536) },
+        ])
+          await expect(
+            client.start({ ...request, secretFiles }),
+          ).rejects.toThrow();
+        const job = await client.start({
+          ...request,
+          secretFiles: { "repository-age-identity": secret },
+        });
+        expect((await settled(client, job.job)).state).toBe("succeeded");
+        expect(await readFile(fixture.trace, "utf8")).not.toContain(secret);
+        expect(
+          await readFile(
+            join(fixture.config.scratchRoot, `${job.job}.json`),
+            "utf8",
+          ),
+        ).not.toContain(secret);
+        await expect(
+          readFile(join(fixture.config.scratchRoot, `${job.job}.bundle`)),
+        ).rejects.toThrow();
+      } finally {
+        await client.close();
+      }
+    }),
+);
 
 it.live(
   "streams a real Git bundle, scopes job access, and verifies artifact bytes",

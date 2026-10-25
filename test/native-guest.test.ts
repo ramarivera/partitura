@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it } from "@effect/vitest";
@@ -20,7 +20,7 @@ it.live(
       const mise = join(path("generic-guest/bin"), "mise");
       writeFileSync(
         mise,
-        '#!/bin/bash\n[ "$1" = exec ] && [ "$2" = -- ] || exit 64\nshift 2\n[ "$MISE_TRUSTED_CONFIG_PATHS" = "$PWD" ] || exit 65\nexec "$@"\n',
+        '#!/bin/bash\n[ "$1" = exec ] && [ "$2" = -- ] || exit 64\nshift 2\n[ "$1" = python3 ] || [ "$MISE_TRUSTED_CONFIG_PATHS" = "$PWD" ] || exit 65\nexec "$@"\n',
       );
       chmodSync(mise, 0o700);
       const environment = {
@@ -47,7 +47,18 @@ it.live(
       );
       writeFileSync(
         script,
-        'set -euo pipefail\n[ "$1" = check ] || exit 2\nprintf "%s\\n" "$PARTITURA_COMMIT" > "$PARTITURA_ARTIFACT_DIR/commit.txt"\n',
+        `set -euo pipefail
+case "$1" in
+  check) ;;
+  secret-check|secret-fail)
+    test "$(cat "$PARTITURA_JOB_SECRETS_DIR/repository-age-identity")" = fixture-job-identity
+    test "$(stat -c %a "$PARTITURA_JOB_SECRETS_DIR")" = 700
+    test "$(stat -c %a "$PARTITURA_JOB_SECRETS_DIR/repository-age-identity")" = 600
+    [ "$1" != secret-fail ] || exit 23 ;;
+  *) exit 2 ;;
+esac
+printf '%s\\n' "$PARTITURA_COMMIT" > "$PARTITURA_ARTIFACT_DIR/commit.txt"
+`,
       );
       git("add", ".partitura/native-build.sh");
       git("commit", "--quiet", "-m", "generic task");
@@ -57,21 +68,29 @@ it.live(
       const commit = git("rev-parse", "HEAD");
       const bundle = join(root, "source.bundle");
       git("bundle", "create", bundle, "HEAD");
-      const execute = (action: string) => {
+      const execute = (action: string, secrets?: Record<string, string>) => {
+        const prefix =
+          secrets === undefined
+            ? Buffer.alloc(0)
+            : Buffer.from(JSON.stringify(secrets));
         const destination = join(root, action);
         const result = spawnSync(
           "/bin/bash",
           [
             "-euc",
-            'source "$1"; run_repository_workflow "$2" "$3" "$4" 12 "$5"',
+            'source "$1"; run_repository_workflow "$2" "$3" "$4" 12 "$5" "$6"',
             "native-guest-test",
             runner,
             destination,
             "a".repeat(32),
             commit,
             action,
+            String(prefix.byteLength),
           ],
-          { env: environment, input: readFileSync(bundle) },
+          {
+            env: environment,
+            input: Buffer.concat([prefix, readFileSync(bundle)]),
+          },
         );
         return { result, destination };
       };
@@ -92,5 +111,28 @@ it.live(
       );
       expect(imported.stdout.trim()).toBe(commit);
       expect(execute("unsupported").result.status).toBe(2);
+      for (const [action, exitCode] of [
+        ["secret-check", 0],
+        ["secret-fail", 23],
+      ] as const) {
+        const secretRun = execute(action, {
+          "repository-age-identity": "fixture-job-identity",
+        });
+        expect(
+          secretRun.result.status,
+          secretRun.result.stderr.toString(),
+        ).toBe(exitCode);
+        expect(existsSync(join(secretRun.destination, "secrets"))).toBe(false);
+        expect(secretRun.result.stdout.toString()).not.toContain(
+          "fixture-job-identity",
+        );
+        expect(secretRun.result.stderr.toString()).not.toContain(
+          "fixture-job-identity",
+        );
+      }
+      const unsafe = execute("unsafe", { "../escape": "fixture-job-identity" });
+      expect(unsafe.result.status).not.toBe(0);
+      expect(existsSync(join(unsafe.destination, "secrets"))).toBe(false);
+      expect(existsSync(join(root, "escape"))).toBe(false);
     }),
 );
