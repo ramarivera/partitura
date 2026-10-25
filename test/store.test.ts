@@ -419,6 +419,21 @@ describe("Store repositories", () => {
           ]);
           yield* inputs.markProcessed(makeInputId("new-prompt"));
           expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
+          const revoked = makeSessionId("access-revoked");
+          yield* runs.create({
+            sessionId: revoked,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
+          yield* inputs.enqueue({
+            id: makeInputId("revoked-prompt"),
+            sessionId: revoked,
+            kind: "prompted",
+            body: "continue",
+            payload: {},
+          });
+          yield* runs.update(revoked, { state: "canceled" });
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
         }),
       ),
   );

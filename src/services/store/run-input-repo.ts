@@ -307,7 +307,8 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
                   JOIN run_input i ON i.session_id=r.session_id AND i.processed_at IS NULL
                   WHERE r.state NOT IN ('succeeded','failed','canceled')
                     OR (
-                      r.state='canceled' AND i.kind='prompted'
+                      r.state='canceled' AND r.desired_state='canceled'
+                      AND i.kind='prompted'
                       AND NOT EXISTS (
                         SELECT 1 FROM run_input stop
                         WHERE stop.session_id=r.session_id AND stop.kind='stop'
