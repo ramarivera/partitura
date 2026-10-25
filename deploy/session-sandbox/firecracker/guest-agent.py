@@ -17,6 +17,7 @@ PORT = 52
 MAX_REQUEST = 1024 * 1024
 MAX_FRAME = 4 * 1024 * 1024
 WORKSPACE = Path("/workspace")
+WORKSPACE_DEPENDENCIES = Path("/var/lib/partitura/workspace-node-modules")
 DOCKER_SOCKET = Path("/run/docker.sock")
 ENV_KEYS = frozenset("""PATH HOME LANG LANGUAGE LC_ALL LC_CTYPE TERM COLORTERM TMPDIR
 XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME BUN_INSTALL_CACHE_DIR
@@ -148,6 +149,41 @@ async def bridge(reader, writer, peer_reader, peer_writer):
         await peer_writer.wait_closed()
 
 
+async def mount_workspace_dependencies(uid: int) -> None:
+    """Keep dependency files on this VM's existing disk, with live source over SFTP."""
+    cache, target = WORKSPACE_DEPENDENCIES, WORKSPACE / "node_modules"
+    cache.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if cache.parent.resolve() != cache.parent:
+        raise ValueError("dependency cache parent is not canonical")
+    cache.mkdir(mode=0o700, exist_ok=True)
+    target.mkdir(mode=0o700, exist_ok=True)
+    descriptors = []
+    try:
+        for directory in (cache, target):
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            descriptors.append(descriptor)
+            if os.fstat(descriptor).st_uid not in (0, uid):
+                raise ValueError("dependency directory has a foreign owner")
+        os.fchown(descriptors[0], uid, uid)
+        os.fchmod(descriptors[0], 0o700)
+        if os.path.ismount(target):
+            if not os.path.samefile(cache, target):
+                raise ValueError("dependency mount has a different source")
+            return
+        # Descriptor targets prevent repository symlink/rename races from
+        # redirecting the root mount. The disk follows the VM's existing lifecycle.
+        process = await asyncio.create_subprocess_exec(
+            "mount", "--bind", *(f"/proc/self/fd/{fd}" for fd in descriptors),
+            pass_fds=tuple(descriptors), stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        if await process.wait() != 0 or not os.path.ismount(target) or not os.path.samefile(cache, target):
+            raise ValueError("session dependency mount failed")
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
 class Agent:
     def __init__(self, token: str, uid: int):
         if not re.fullmatch(r"[a-f0-9]{64}", token) or not 1 <= uid <= 65535:
@@ -188,6 +224,7 @@ class Agent:
                     target_port = port(request.get("targetPort"))
                     if self.workspace_process is not None:
                         if self.workspace_process.returncode is None and os.path.ismount(WORKSPACE) and target_port == self.workspace_host_port:
+                            await mount_workspace_dependencies(self.uid)
                             await send_json(writer, {"ok": True})
                             return
                         raise ValueError("workspace mount unavailable")
@@ -218,6 +255,7 @@ class Agent:
                         self.workspace_process.kill()
                         await self.workspace_process.wait()
                         raise ValueError("workspace mount timed out")
+                    await mount_workspace_dependencies(self.uid)
                     await send_json(writer, {"ok": True})
             elif operation == "tunnel":
                 peer_reader, peer_writer = await asyncio.open_connection("127.0.0.1", port(request.get("targetPort")))

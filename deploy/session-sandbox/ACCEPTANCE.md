@@ -72,6 +72,9 @@ Each runtime must pass all of these checks:
   limited to two seconds. A dead daemon recorded in its pidfile fails the check.
 - A worker remains active while a host write becomes visible inside the guest,
   and its reply becomes visible on the host with the session's ownership.
+- Firecracker's root `node_modules` uses the session's local disk, belongs to the
+  worker and survives recovery. Its files stay absent from the host source and
+  peer VM, and a real nested Docker build copies them from its build context.
 - The allowed npm HTTPS endpoint works, a disallowed hostname returns proxy
   403 and direct external TCP access fails. The proxy opens before tooling
   starts, matching gateway startup, so Mise can use the approved network route.

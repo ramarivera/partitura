@@ -7,7 +7,7 @@ import socket
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 SOURCE = Path(__file__).resolve().parents[1] / "deploy/session-sandbox/firecracker/guest-agent.py"
 spec = importlib.util.spec_from_file_location("firecracker_guest", SOURCE)
@@ -25,6 +25,8 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
             os.chown(self.workspace, self.uid, self.uid)
         self.workspace_patch = patch.object(guest, "WORKSPACE", self.workspace)
         self.workspace_patch.start()
+        self.dependencies_patch = patch.object(guest, "WORKSPACE_DEPENDENCIES", self.workspace / "private-cache" / "modules")
+        self.dependencies_patch.start()
         self.docker_path = self.workspace / "docker.sock"
         self.docker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.docker_socket.bind(str(self.docker_path))
@@ -39,6 +41,7 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
         self.server.close()
         await self.server.wait_closed()
         self.workspace_patch.stop()
+        self.dependencies_patch.stop()
         self.docker_patch.stop()
         self.docker_socket.close()
         self.temp.cleanup()
@@ -102,6 +105,68 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
                    "cwd": str(self.workspace), "env": {"NODE_USE_ENV_PROXY": "1"}}
         _, _, environment = guest.validate_exec(request, self.uid)
         self.assertEqual(environment["NODE_USE_ENV_PROXY"], "1")
+
+    async def test_dependency_mount_uses_open_directory_descriptors(self):
+        async def mount(*argv, **options):
+            descriptors = options["pass_fds"]
+            self.assertEqual(argv, ("mount", "--bind", *(f"/proc/self/fd/{fd}" for fd in descriptors)))
+            self.assertEqual(os.fstat(descriptors[0]).st_uid, self.uid)
+            self.assertEqual(os.fstat(descriptors[0]).st_mode & 0o777, 0o700)
+            return type("Process", (), {"wait": AsyncMock(return_value=0)})()
+        with patch.object(guest.asyncio, "create_subprocess_exec", side_effect=mount) as launch, patch.object(guest.os.path, "ismount", side_effect=[False, True]), patch.object(guest.os.path, "samefile", return_value=True):
+            await guest.mount_workspace_dependencies(self.uid)
+        launch.assert_called_once()
+
+    async def test_dependency_mount_reuses_existing_owned_mount_and_data(self):
+        cache = guest.WORKSPACE_DEPENDENCIES
+        cache.mkdir(parents=True)
+        (cache / "recovery-marker").write_text("persisted")
+        with patch.object(guest.asyncio, "create_subprocess_exec") as launch, patch.object(guest.os.path, "ismount", return_value=True), patch.object(guest.os.path, "samefile", return_value=True):
+            await guest.mount_workspace_dependencies(self.uid)
+        launch.assert_not_called()
+        self.assertEqual((cache / "recovery-marker").read_text(), "persisted")
+
+    async def test_dependency_mount_refuses_symlinks_and_files_before_mount(self):
+        for name in ("node_modules", "private-cache/modules"):
+            target = self.workspace / name
+            target.parent.mkdir(exist_ok=True)
+            if target.is_dir():
+                target.rmdir()
+            target.symlink_to(self.workspace, target_is_directory=True)
+            with patch.object(guest.asyncio, "create_subprocess_exec") as launch, self.assertRaises(OSError):
+                await guest.mount_workspace_dependencies(self.uid)
+            launch.assert_not_called()
+            target.unlink()
+        target = self.workspace / "node_modules"
+        if target.is_dir():
+            target.rmdir()
+        target.write_text("not a directory")
+        with patch.object(guest.asyncio, "create_subprocess_exec") as launch, self.assertRaises(OSError):
+            await guest.mount_workspace_dependencies(self.uid)
+        launch.assert_not_called()
+
+    async def test_dependency_mount_refuses_a_foreign_mount(self):
+        with patch.object(guest.asyncio, "create_subprocess_exec") as launch, patch.object(guest.os.path, "ismount", return_value=True), patch.object(guest.os.path, "samefile", return_value=False), self.assertRaisesRegex(ValueError, "different source"):
+            await guest.mount_workspace_dependencies(self.uid)
+        launch.assert_not_called()
+
+    async def test_dependency_mount_requires_verified_mount_success(self):
+        for status in (0, 1):
+            process = type("Process", (), {"wait": AsyncMock(return_value=status)})()
+            with patch.object(guest.asyncio, "create_subprocess_exec", return_value=process), patch.object(guest.os.path, "ismount", return_value=False), self.assertRaisesRegex(ValueError, "mount failed"):
+                await guest.mount_workspace_dependencies(self.uid)
+
+    @unittest.skipUnless(os.geteuid() == 0, "ownership refusal requires disposable root container")
+    async def test_dependency_mount_refuses_foreign_directory_owners(self):
+        for target in (guest.WORKSPACE_DEPENDENCIES, self.workspace / "node_modules"):
+            target.mkdir(parents=True, exist_ok=True)
+            os.chown(target, self.uid + 1, self.uid + 1)
+            try:
+                with patch.object(guest.asyncio, "create_subprocess_exec") as launch, self.assertRaisesRegex(ValueError, "foreign owner"):
+                    await guest.mount_workspace_dependencies(self.uid)
+                launch.assert_not_called()
+            finally:
+                os.chown(target, self.uid, self.uid)
 
     @unittest.skipUnless(os.geteuid() == 0, "real privilege dropping requires disposable root container")
     async def test_real_exec_drops_uid_groups_and_inherited_secrets(self):

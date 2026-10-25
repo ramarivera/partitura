@@ -394,6 +394,10 @@ timeout 120 /bin/sh -ec '
         code, stdout, stderr = await self.wire.execute(self.exec_request(session, self.uid, ["python3", "-c", "import sys; print(sys.stdin.read(),end=''); print('stderr-marker',file=sys.stderr); sys.exit(23)"]), b"stdin-marker")
         self.assertEqual((code, stdout, stderr), (23, b"stdin-marker", b"stderr-marker\n"))
         await self.live_workspace(session, workspace)
+        if runtime == "firecracker":
+            await self.python(session, self.uid, "import os; from pathlib import Path; root=Path('/workspace/node_modules'); assert root.stat().st_dev != Path('/workspace').stat().st_dev; assert root.stat().st_uid == os.getuid(); (root/'.partitura-local-dependency').write_text('session-disk')")
+            self.assertFalse((workspace / "node_modules/.partitura-local-dependency").exists(), "dependencies leaked onto the SFTP source workspace")
+            self.assertEqual((await self.python(peer, self.peer_uid, "from pathlib import Path; print(Path('/workspace/node_modules/.partitura-local-dependency').exists())")).strip(), "False")
         await self.isolation(session, peer, workspace, peer_workspace, runtime)
         await self.execute(session, self.uid, ["curl", "--fail", "--silent", "--show-error", "--max-time", "30", "https://registry.npmjs.org/-/ping"], env)
         code, _, stderr = await self.wire.execute(self.exec_request(session, self.uid, ["curl", "--fail", "--silent", "--show-error", "--max-time", "10", "https://partitura-acceptance-denied.invalid/"], env))
@@ -404,9 +408,12 @@ timeout 120 /bin/sh -ec '
         image = os.environ["PARTITURA_SANDBOX_LIVE_DOCKER_IMAGE"]
         self.assertIn("@sha256:", image, "acceptance image must be digest pinned")
         self.assertEqual(await self.execute(session, self.uid, ["docker", "run", "--rm", image, "/bin/sh", "-ec", "printf nested-run-ok"], timeout=240), "nested-run-ok")
-        (workspace / "Dockerfile.acceptance").write_text(f"FROM {image}\nRUN printf nested-build-ok > /proof\nCMD [\"cat\",\"/proof\"]\n")
+        dependency_copy = "COPY node_modules/.partitura-local-dependency /dependency-proof\n" if runtime == "firecracker" else ""
+        (workspace / "Dockerfile.acceptance").write_text(f"FROM {image}\n{dependency_copy}RUN printf nested-build-ok > /proof\nCMD [\"cat\",\"/proof\"]\n")
         await self.execute(session, self.uid, ["docker", "build", "--network=none", "-f", "Dockerfile.acceptance", "-t", "partitura-acceptance:local", "."], timeout=240)
         self.assertEqual((await self.execute(session, self.uid, ["docker", "run", "--rm", "partitura-acceptance:local"])).strip(), "nested-build-ok")
+        if runtime == "firecracker":
+            self.assertEqual((await self.execute(session, self.uid, ["docker", "run", "--rm", "partitura-acceptance:local", "cat", "/dependency-proof"])).strip(), "session-disk")
         await self.relays_and_t3(session, peer, env)
         await self.cancellation(session, workspace)
         for writer in reversed(self.owners + self.leases):
@@ -422,6 +429,8 @@ timeout 120 /bin/sh -ec '
         self.assertTrue(recovery["exists"] and recovery["running"])
         self.assertEqual(recovery["runtime"], runtime)
         self.assertEqual((await self.python(session, self.uid, "from pathlib import Path; print(Path('/mise/recovery-marker').read_text())")).strip(), "persisted")
+        if runtime == "firecracker":
+            self.assertEqual((await self.python(session, self.uid, "from pathlib import Path; print(Path('/workspace/node_modules/.partitura-local-dependency').read_text())")).strip(), "session-disk")
         self.assertEqual((await self.python(session, self.uid, "from pathlib import Path; print(Path('/workspace/worker-live').read_text())")).strip(), "host-update-seen")
         before = (workspace / "recovery-heartbeat").read_text()
         await asyncio.sleep(0.3)

@@ -67,6 +67,17 @@ runs SSHFS with `allow_other`, `default_permissions`, `uid`/`gid` mapping,
 `nodev` and `nosuid`. Workspace programs can execute. Session readiness requires
 the mount, not just a successful control-agent ping.
 
+The guest binds `/workspace/node_modules` to a private directory on its existing
+session disk. Package imports therefore use local ext4 rather than one SFTP
+operation per dependency file. These files survive recovery with that VM and
+leave with its disk at teardown. They aren't copied to the host source workspace
+or shared with another session. Commands and Docker build contexts running in
+the guest see the local dependencies; host-side tools see only the source
+workspace. Nested package directories aren't redirected. Existing host-side
+`node_modules` contents remain hidden inside the guest, so install dependencies
+there before running repository tools. Symlinks, foreign owners and mismatched
+existing mounts fail session readiness.
+
 The guest mount uses `no_contain_symlinks` because Mise records absolute config
 links and package managers create parent-relative dependency links. Debian's
 SSHFS containment default rejects both forms. This option permits links to
