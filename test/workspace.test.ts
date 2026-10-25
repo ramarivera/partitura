@@ -619,6 +619,7 @@ describe("Workspace", () => {
         expect(first).toBeDefined();
         if (first === undefined) return;
         yield* workspace.configureGitBroker(id, target, first);
+        expect(yield* readGitConfig("push.negotiate", target)).toBe("true");
         expect(yield* readGitConfig(first.gitConfigKey, target)).toBe(
           record.url,
         );

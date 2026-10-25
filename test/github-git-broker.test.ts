@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,6 +50,7 @@ const gitHttpBackend = async (
       REQUEST_METHOD: init?.method ?? "GET",
       CONTENT_TYPE: headers.get("content-type") ?? "",
       CONTENT_LENGTH: String(bytes.byteLength),
+      HTTP_GIT_PROTOCOL: headers.get("git-protocol") ?? "",
       REMOTE_USER: "partitura-test-app[bot]",
       REMOTE_ADDR: "127.0.0.1",
       SERVER_PROTOCOL: "HTTP/1.1",
@@ -90,6 +92,121 @@ const gitHttpBackend = async (
 };
 
 describe("GitHub Git broker", () => {
+  it.live(
+    "reports an oversized chunked Git push without an upstream failure",
+    () =>
+      Effect.promise(async () => {
+        const upstream = vi.fn(async () => new Response("unexpected upstream"));
+        const broker = startGitHubGitBroker({ repository, fetch: upstream });
+        let blocks = 0;
+        const body = new ReadableStream({
+          pull(controller) {
+            if (blocks++ < 65) controller.enqueue(new Uint8Array(1024 * 1024));
+            else controller.close();
+          },
+        });
+        try {
+          const response = await fetch(`${broker.baseUrl}/git-receive-pack`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-git-receive-pack-request",
+            },
+            body,
+          });
+          expect(response.status).toBe(413);
+          expect(upstream).not.toHaveBeenCalled();
+        } finally {
+          broker.stop();
+        }
+      }),
+  );
+
+  it.live(
+    "negotiates an old shallow snapshot before pushing through a bounded broker",
+    () =>
+      Effect.promise(async () => {
+        const root = await mkdtemp(join(tmpdir(), "partitura-shallow-push-"));
+        const projects = join(root, "projects");
+        const bare = join(projects, "acme", "widget.git");
+        const editor = join(root, "editor");
+        const worker = join(root, "worker");
+        const authorization = `Basic ${Buffer.from("x-access-token:test-installation-token").toString("base64")}`;
+        const received: number[] = [];
+        const broker = startGitHubGitBroker({
+          repository,
+          token: "test-installation-token",
+          fetch: async (url, init) => {
+            if (String(url).endsWith("/git-receive-pack")) {
+              const bytes = Buffer.from(init?.body as Buffer).length;
+              received.push(bytes);
+              // Scale the production body limit down without changing the
+              // negotiation or smart HTTP protocol exercised by real Git.
+              if (bytes > 128 * 1024)
+                return new Response("Snapshot is too large", { status: 413 });
+            }
+            return gitHttpBackend(projects, url, init, authorization);
+          },
+        });
+        try {
+          await mkdir(join(projects, "acme"), { recursive: true });
+          await runGit(["init", "--bare", "--initial-branch=main", bare], root);
+          await runGit(
+            ["--git-dir", bare, "config", "http.receivepack", "true"],
+            root,
+          );
+          await mkdir(editor);
+          await runGit(["init", "--initial-branch=main"], editor);
+          for (const cwd of [editor]) {
+            await runGit(["config", "user.name", "Partitura fixture"], cwd);
+            await runGit(["config", "user.email", "fixture@example.test"], cwd);
+          }
+          await writeFile(
+            join(editor, "snapshot.bin"),
+            randomBytes(256 * 1024),
+          );
+          await runGit(["add", "."], editor);
+          await runGit(["commit", "-m", "original snapshot"], editor);
+          await runGit(["push", bare, "main"], editor);
+          await runGit(["clone", "--depth=1", `file://${bare}`, worker], root);
+          await writeFile(
+            join(editor, "new-main.txt"),
+            "main advanced while the worker ran\n",
+          );
+          await runGit(["add", "."], editor);
+          await runGit(["commit", "-m", "advance remote main"], editor);
+          await runGit(["push", bare, "main"], editor);
+          await runGit(["config", "user.name", "Partitura worker"], worker);
+          await runGit(["config", "user.email", "worker@example.test"], worker);
+          await runGit(["remote", "set-url", "origin", repository.url], worker);
+          await runGit(
+            ["config", broker.gitConfigKey, broker.gitConfigValue],
+            worker,
+          );
+          await writeFile(
+            join(worker, "acceptance.txt"),
+            "small worker change\n",
+          );
+          await runGit(["add", "."], worker);
+          await runGit(["commit", "-m", "worker change"], worker);
+          await runGit(["config", "push.negotiate", "false"], worker);
+          await expect(
+            runGit(["push", "origin", "HEAD:refs/heads/worker-test"], worker),
+          ).rejects.toThrow("413");
+          expect(received[0]).toBeGreaterThan(128 * 1024);
+          await runGit(["config", "push.negotiate", "true"], worker);
+          await runGit(
+            ["push", "origin", "HEAD:refs/heads/worker-test"],
+            worker,
+          );
+          expect(received).toHaveLength(2);
+          expect(received[1]).toBeLessThan(16 * 1024);
+        } finally {
+          broker.stop();
+          await rm(root, { recursive: true, force: true });
+        }
+      }),
+  );
+
   it.live("lets real Git push through the configured broker rewrite", () =>
     Effect.promise(async () => {
       const root = await mkdtemp(join(tmpdir(), "partitura-git-broker-"));

@@ -32,6 +32,9 @@ requests go through a per-session broker bound to that one repository. The broke
 keeps the GitHub installation token in gateway memory, accepts only Git smart-HTTP
 upload and receive-pack paths, rejects redirects, and caps request and response
 bodies. Workers receive a random session URL for the broker, not the GitHub token.
+Broker-configured checkouts enable `push.negotiate` so an older shallow snapshot
+can discover common upstream objects before packing a push. The broker retains
+its 64 MiB request limit and returns HTTP 413 for oversized request bodies.
 The session broker stops with its worker; the host relay must route its fixed Git
 service to that listener. Public GitHub reads follow the sandbox's configured
 web egress policy; repository write credentials remain in the broker.

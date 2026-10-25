@@ -1062,6 +1062,14 @@ export const makeWorkspace = (input: {
             ? { key: broker.gitConfigKey, value: broker.gitConfigValue }
             : broker.gitConfigFor(relayBaseUrl);
         yield* clearGitBrokerConfig(sessionId, target);
+        // A long-lived shallow checkout may no longer contain an advertised
+        // branch tip. Negotiate common objects before packing instead of
+        // resending the entire snapshot through the bounded session broker.
+        yield* git(
+          ["config", "--local", "--replace-all", "push.negotiate", "true"],
+          target,
+          sessionId,
+        );
         yield* git(
           ["config", "--local", "--replace-all", config.key, config.value],
           target,

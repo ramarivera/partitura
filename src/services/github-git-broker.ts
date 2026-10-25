@@ -4,6 +4,7 @@ import { isHttpsGitHubRepositoryUrl } from "./workspace.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 128 * 1024 * 1024;
+class GitRequestTooLargeError extends Error {}
 
 export interface GitBrokerHandle {
   readonly port: number;
@@ -24,7 +25,7 @@ const boundedBody = async (
 ): Promise<Uint8Array> => {
   const declared = Number(request.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > limit)
-    throw new Error("Git request body is too large");
+    throw new GitRequestTooLargeError("Git request body is too large");
   if (request.body === null) return new Uint8Array();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -36,7 +37,7 @@ const boundedBody = async (
       length += part.value.byteLength;
       if (length > limit) {
         await reader.cancel();
-        throw new Error("Git request body is too large");
+        throw new GitRequestTooLargeError("Git request body is too large");
       }
       chunks.push(part.value);
     }
@@ -229,7 +230,11 @@ export const startGitHubGitBroker = (input: {
         if (contentType) headers.set("content-type", contentType);
         headers.set("cache-control", "no-store");
         return new Response(responseBody, { status: response.status, headers });
-      } catch {
+      } catch (error) {
+        if (error instanceof GitRequestTooLargeError)
+          return new Response("Git request exceeds the 64 MiB broker limit", {
+            status: 413,
+          });
         return new Response("Git broker request failed", { status: 502 });
       } finally {
         clearTimeout(timer);
