@@ -504,6 +504,8 @@ def _sysbox_provision(request: dict[str, Any]) -> dict[str, Any]:
                 "--env",
                 f"HTTPS_PROXY={egress_proxy}",
                 "--env",
+                "NODE_USE_ENV_PROXY=1",
+                "--env",
                 f"NO_PROXY=localhost,127.0.0.1,::1,host.docker.internal,{relay_ip}",
                 "--mount",
                 f"type=bind,src={workspace},dst=/workspace,readonly=false",
@@ -819,7 +821,7 @@ async def _stream_exec(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         "NIX_SSL_CERT_FILE", "T3CODE_HOME", "T3CODE_NO_BROWSER",
         "T3CODE_TELEMETRY_ENABLED", "DISABLE_AUTOUPDATER",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "CLIPROXYAPI_BASE_URL", "CLIPROXYAPI_API_KEY",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "NODE_USE_ENV_PROXY", "CLIPROXYAPI_BASE_URL", "CLIPROXYAPI_API_KEY",
         "PI_CLAUDE_DRIVER", "PI_CLAUDE_AUTH", "PI_CLAUDE_EXECUTABLE",
     }
     if set(env) - allowed_env:

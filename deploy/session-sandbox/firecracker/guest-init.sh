@@ -20,6 +20,7 @@ export MISE_DATA_DIR=/mise
 export DOCKER_DATA_ROOT=/var/lib/docker
 export HTTP_PROXY=http://127.0.0.1:3128
 export HTTPS_PROXY=http://127.0.0.1:3128
+export NODE_USE_ENV_PROXY=1
 export NO_PROXY=localhost,127.0.0.1,::1
 hostname partitura-worker
 ip link set lo up

@@ -2947,6 +2947,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             if (sandbox !== undefined) {
               environment.HTTP_PROXY = sandbox.egressProxyUrl;
               environment.HTTPS_PROXY = sandbox.egressProxyUrl;
+              environment.NODE_USE_ENV_PROXY = "1";
               environment.NO_PROXY = [
                 "localhost",
                 "127.0.0.1",
@@ -3184,6 +3185,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         if (sandbox !== undefined) {
           environment.HTTP_PROXY = sandbox.egressProxyUrl;
           environment.HTTPS_PROXY = sandbox.egressProxyUrl;
+          environment.NODE_USE_ENV_PROXY = "1";
           environment.NO_PROXY = [
             "localhost",
             "127.0.0.1",
@@ -3419,6 +3421,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               : {
                   HTTP_PROXY: sandbox.egressProxyUrl,
                   HTTPS_PROXY: sandbox.egressProxyUrl,
+                  NODE_USE_ENV_PROXY: "1",
                   NO_PROXY: environment.NO_PROXY ?? "",
                 }),
             ...workerModelEnvironment({

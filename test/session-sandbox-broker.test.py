@@ -283,6 +283,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--pids-limit 512", joined)
         self.assertIn("HTTP_PROXY=http://172.19.0.1:3128", joined)
         self.assertIn("HTTPS_PROXY=http://172.19.0.1:3128", joined)
+        self.assertIn("NODE_USE_ENV_PROXY=1", joined)
         self.assertIn("PARTITURA_WORKER_UID=1003", joined)
         self.assertIn("DOCKER_DATA_ROOT=/var/lib/docker", joined)
         self.assertIn("SYSBOX_HONOR_CAPS=FALSE", joined)
@@ -520,6 +521,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                             "PATH": "/usr/local/bin:/usr/bin",
                             "HTTP_PROXY": "http://172.19.0.1:3128",
                             "HTTPS_PROXY": "http://172.19.0.1:3128",
+                            "NODE_USE_ENV_PROXY": "1",
                             "NO_PROXY": "localhost,127.0.0.1",
                             "T3CODE_HOME": "/workspace/.omp-home/t3",
                             "T3CODE_NO_BROWSER": "true",
@@ -544,6 +546,7 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("POST /v1.41/containers/partitura-session-session-1/exec", create_request)
             self.assertEqual(json.loads(create_body)["User"], "1001:1001")
             self.assertIn("HTTP_PROXY=http://172.19.0.1:3128", json.loads(create_body)["Env"])
+            self.assertIn("NODE_USE_ENV_PROXY=1", json.loads(create_body)["Env"])
             self.assertIn("T3CODE_HOME=/workspace/.omp-home/t3", json.loads(create_body)["Env"])
             self.assertIn("PI_CLAUDE_DRIVER=claude-cliproxy", json.loads(create_body)["Env"])
             self.assertIn("PI_CLAUDE_AUTH=credential-ref", json.loads(create_body)["Env"])

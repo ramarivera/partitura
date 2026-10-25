@@ -97,6 +97,12 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "identity"):
             guest.validate_exec(request | {"workerUid": "0"}, self.uid)
 
+    def test_exec_preserves_node_proxy_opt_in(self):
+        request = {"workerUid": str(self.uid), "argv": ["node", "build.mjs"],
+                   "cwd": str(self.workspace), "env": {"NODE_USE_ENV_PROXY": "1"}}
+        _, _, environment = guest.validate_exec(request, self.uid)
+        self.assertEqual(environment["NODE_USE_ENV_PROXY"], "1")
+
     @unittest.skipUnless(os.geteuid() == 0, "real privilege dropping requires disposable root container")
     async def test_real_exec_drops_uid_groups_and_inherited_secrets(self):
         script = "import os,sys; print(os.getuid(),os.getgid(),os.getgroups(),os.getenv('HOST_SECRET')); print(sys.stdin.read()); print('err',file=sys.stderr); sys.exit(7)"
