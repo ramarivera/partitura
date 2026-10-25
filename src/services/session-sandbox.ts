@@ -105,6 +105,14 @@ export const sandboxEnvironment = (
     MISE_CACHE_DIR: "/mise/cache",
     MISE_CONFIG_DIR: "/workspace/.omp-home/mise/config",
     MISE_TRUSTED_CONFIG_PATHS: "/workspace",
+    // SSHFS doesn't support Unix sockets. Transient IPC belongs to the guest.
+    TMPDIR: "/tmp",
+    // Package stores create many small files. Keep them on the existing
+    // session disk rather than sending each operation over live workspace SFTP.
+    XDG_CACHE_HOME: "/mise/cache",
+    XDG_DATA_HOME: "/mise/user-data",
+    BUN_INSTALL_CACHE_DIR: "/mise/cache/bun/install",
+    BUN_RUNTIME_TRANSPILER_CACHE_PATH: "/mise/cache/bun/transpiler",
   };
 };
 

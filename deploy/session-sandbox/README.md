@@ -232,8 +232,15 @@ versions available on `PATH` before a repository supplies its own Mise config.
 Use `mise exec` to run repository-pinned versions. At startup,
 `worker-init.sh` creates session-owned links in `/mise/installs`, so Mise can
 use those immutable runtimes while repository-specific versions install into
-the writable `/mise` volume. The volume also holds `/mise/cache`; Mise config
-stays under `/workspace/.omp-home/mise/config`. No writable cache is shared
+the writable `/mise` volume. XDG caches and Bun caches also use `/mise/cache`,
+and XDG data uses `/mise/user-data`. Package managers honoring these defaults
+keep their stores on the session disk. Repository settings can override them,
+including an explicit pnpm `storeDir` beneath HOME; those paths still use SSHFS.
+Transient files use guest-local `/tmp`, which supports Unix sockets required
+by tools such as tsx. Workspace SSHFS doesn't support those sockets.
+Configuration, credentials, HOME and explicit agent state paths remain under
+`/workspace/.omp-home`; Mise config stays under its `mise/config` directory.
+No writable cache is shared
 between sessions, and the `/mise` volume is removed with its session.
 
 `worker-init.sh` also starts one nested Docker daemon per Sysbox container and

@@ -39,7 +39,42 @@ describe("session sandbox", () => {
       MISE_CACHE_DIR: "/mise/cache",
       MISE_CONFIG_DIR: "/workspace/.omp-home/mise/config",
       MISE_TRUSTED_CONFIG_PATHS: "/workspace",
+      TMPDIR: "/tmp",
+      XDG_CACHE_HOME: "/mise/cache",
+      XDG_DATA_HOME: "/mise/user-data",
+      BUN_INSTALL_CACHE_DIR: "/mise/cache/bun/install",
+      BUN_RUNTIME_TRANSPILER_CACHE_PATH: "/mise/cache/bun/transpiler",
     });
+  });
+
+  it("keeps default caches and transient IPC local while preserving scoped credentials", () => {
+    const workspace = "/app/workspaces/session-1";
+    const environment = sandboxEnvironment(workspace, {
+      HOME: `${workspace}/.omp-home`,
+      TMPDIR: `${workspace}/.omp-tmp`,
+      XDG_CACHE_HOME: `${workspace}/.omp-home/.cache`,
+      XDG_DATA_HOME: `${workspace}/.omp-home/.local/share`,
+      XDG_CONFIG_HOME: `${workspace}/.omp-home/.config`,
+      BUN_INSTALL_CACHE_DIR: `${workspace}/.omp-home/.cache/bun/install`,
+      BUN_RUNTIME_TRANSPILER_CACHE_PATH: `${workspace}/.omp-home/.cache/bun/transpiler`,
+      FNOX_AGE_KEY_FILE: `${workspace}/.omp-home/.config/sops/age/keys.txt`,
+      T3CODE_HOME: `${workspace}/.omp-home/t3`,
+    });
+    for (const key of [
+      "XDG_CACHE_HOME",
+      "XDG_DATA_HOME",
+      "BUN_INSTALL_CACHE_DIR",
+      "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+    ]) {
+      expect(environment[key]).toMatch(/^\/mise\//u);
+    }
+    expect(environment.FNOX_AGE_KEY_FILE).toBe(
+      "/workspace/.omp-home/.config/sops/age/keys.txt",
+    );
+    expect(environment.XDG_CONFIG_HOME).toBe("/workspace/.omp-home/.config");
+    expect(environment.HOME).toBe("/workspace/.omp-home");
+    expect(environment.TMPDIR).toBe("/tmp");
+    expect(environment.T3CODE_HOME).toBe("/workspace/.omp-home/t3");
   });
 
   it("builds a stream-wrapper launch without putting secret values in argv", () => {
