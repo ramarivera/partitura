@@ -4121,6 +4121,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     yield* workerIdentities.acquire(
                       sessionId,
                       config.workspaceRoot,
+                      { retireTerminal: sandboxMode === "native" },
                     ),
                   );
                   yield* updateRun(sessionId, {

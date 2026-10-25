@@ -257,6 +257,29 @@ class FirecrackerTests(unittest.IsolatedAsyncioTestCase):
                 broker.destroy(self.request)
         self.assertIsNotNone(vm.load("test-session"))
 
+    def test_repeated_firecracker_destroy_never_requires_docker(self):
+        vm.save("test-session", self.record)
+        directory = vm.VM_ROOT / vm.key("test-session")
+        directory.mkdir(parents=True)
+        (directory / "rootfs.ext4").write_bytes(b"private disk")
+        request = {"sessionId": "test-session", "runtime": "firecracker"}
+        with patch.object(vm.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="")), patch.object(vm, "running", return_value=False), patch.object(broker, "_sysbox_destroy", side_effect=RuntimeError("Docker unavailable")) as docker:
+            for _ in range(2):
+                self.assertEqual(broker.destroy(request), {"destroyed": True})
+                self.assertIsNone(vm.load("test-session"))
+                self.assertFalse(directory.exists())
+            docker.assert_not_called()
+
+    def test_destroy_rejects_runtime_mismatch_without_stopping_either_runtime(self):
+        for runtime, requested in (("firecracker", "sysbox"), ("sysbox", "firecracker")):
+            vm.save("test-session", {**self.record, "runtime": runtime})
+            with patch.object(vm, "destroy") as firecracker, patch.object(broker, "_sysbox_destroy") as docker:
+                with self.assertRaisesRegex(ValueError, "runtime does not match"):
+                    broker.destroy({"sessionId": "test-session", "runtime": requested})
+                firecracker.assert_not_called()
+                docker.assert_not_called()
+                self.assertEqual(vm.load("test-session")["runtime"], runtime)
+
 
 if __name__ == "__main__":
     unittest.main()

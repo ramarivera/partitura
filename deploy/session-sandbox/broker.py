@@ -705,7 +705,14 @@ def destroy(request: dict[str, Any]) -> dict[str, Any]:
     session = _session(request.get("sessionId"))
     with vm.SessionLock(session):
         record = vm.load(session)
-        if record is not None and record["runtime"] == "firecracker":
+        # Older gateways omitted runtime and may still own legacy Sysbox
+        # resources. New callers retain runtime even after teardown removes
+        # the lifecycle record, so repeated VM cleanup never needs Docker.
+        requested_runtime = _runtime(request) if "runtime" in request else None
+        if record is not None and requested_runtime is not None and record["runtime"] != requested_runtime:
+            raise ValueError("sandbox teardown runtime does not match")
+        runtime = record["runtime"] if record is not None else requested_runtime
+        if runtime == "firecracker":
             vm.destroy(session)
         else:
             if record is None:

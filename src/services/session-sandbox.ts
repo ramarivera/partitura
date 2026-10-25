@@ -38,7 +38,11 @@ export type SandboxBrokerRequest =
       readonly workspacePath: string;
       readonly workerUid: string;
     }
-  | { readonly operation: "destroy"; readonly sessionId: string }
+  | {
+      readonly operation: "destroy";
+      readonly runtime: SessionSandboxRuntimeKind;
+      readonly sessionId: string;
+    }
   | {
       readonly operation: "recover";
       readonly runtime: SessionSandboxRuntimeKind;
@@ -423,7 +427,7 @@ export const makeSessionSandboxRuntime = (
   destroy: Effect.fn("SessionSandbox.destroy")(function* (sessionId) {
     const operation = "destroy" as const;
     const result = yield* Effect.tryPromise({
-      try: () => requestBroker(socketPath, { operation, sessionId }),
+      try: () => requestBroker(socketPath, { operation, runtime, sessionId }),
       catch: () =>
         new SandboxBrokerError({
           message: "Sandbox broker request failed",

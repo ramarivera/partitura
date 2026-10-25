@@ -1400,6 +1400,7 @@ const withAuthority = <A, E>(
     readonly withLinearGateway?: boolean;
     readonly githubApp?: GitHubAppTokenService;
     readonly workerUid?: string;
+    readonly workerIdentityRepo?: WorkerIdentityRepo["Service"];
   },
 ) =>
   Effect.scoped(
@@ -1468,12 +1469,14 @@ const withAuthority = <A, E>(
         RunInputRepo.layer,
         RunRepo.layer,
         WorkspaceRepo.layer,
-        options?.workerUid === undefined
-          ? WorkerIdentityRepo.layer
-          : Layer.succeed(WorkerIdentityRepo, {
-              acquire: () => Effect.succeed(options.workerUid),
-              release: () => Effect.void,
-            }),
+        options?.workerIdentityRepo !== undefined
+          ? Layer.succeed(WorkerIdentityRepo, options.workerIdentityRepo)
+          : options?.workerUid === undefined
+            ? WorkerIdentityRepo.layer
+            : Layer.succeed(WorkerIdentityRepo, {
+                acquire: () => Effect.succeed(options.workerUid),
+                release: () => Effect.void,
+              }),
         GitHubApp.layer,
         githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
@@ -1612,6 +1615,78 @@ describe("run settings startup snapshots", () => {
 });
 
 describe("SessionAuthority team-access gate", () => {
+  it.live.each(["native", "firecracker", "sysbox"] as const)(
+    "uses safe uid retirement during initial %s workspace materialization",
+    (runtime) => {
+      const acquisitions: Array<
+        { readonly retireTerminal?: boolean } | undefined
+      > = [];
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            yield* InstallationRepo.use((repo) =>
+              repo.put(install(testOrganizationId)),
+            );
+            yield* WorkspaceRepo.use((repo) =>
+              repo.createRepository({
+                organizationId: testOrganizationId,
+                id: Schema.decodeUnknownSync(WorkspaceId)(
+                  "fresh-materialization-repo",
+                ),
+                url: "https://github.com/org/repo.git",
+                ref: "main",
+                isDefault: true,
+              }),
+            );
+            yield* RunRepo.use((repo) =>
+              repo.create({
+                sessionId: testSessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.none(),
+              }),
+            );
+            yield* RunInputRepo.use((repo) =>
+              repo.enqueue({
+                id: Schema.decodeUnknownSync(InputId)(
+                  "fresh-materialization-input",
+                ),
+                sessionId: testSessionId,
+                kind: "created",
+                body: "start",
+                payload: {},
+              }),
+            );
+            const result = yield* (yield* SessionAuthority)
+              .processSession(testSessionId)
+              .pipe(Effect.result);
+            expect(Result.isFailure(result)).toBe(true);
+            expect(acquisitions).toEqual([
+              { retireTerminal: runtime === "native" },
+            ]);
+            expect(workerSpawnInputs).toHaveLength(0);
+          }),
+        {
+          configOverride: (config) => ({
+            ...config,
+            workerSandboxMode: runtime,
+            sessionSandboxBrokerSocketPath: testPath("missing-broker.sock"),
+          }),
+          workerIdentityRepo: {
+            acquire: (_sessionId, _root, options) => {
+              acquisitions.push(options);
+              return Effect.fail(
+                new DatabaseError({
+                  message: "Reserved uid pool exhausted",
+                }),
+              );
+            },
+            release: () => Effect.void,
+          },
+        },
+      );
+    },
+  );
+
   it.live(
     "proceeds when the installation team-access snapshot is unknown (null)",
     () =>

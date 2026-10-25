@@ -208,7 +208,11 @@ describe("session sandbox", () => {
               workspacePath: "/app/workspaces/session-2",
               workerUid: "1002",
             },
-            { operation: "destroy", sessionId: "session-2" },
+            {
+              operation: "destroy",
+              runtime: selectedRuntime,
+              sessionId: "session-2",
+            },
           ]);
         } finally {
           await new Promise<void>((resolve, reject) =>
