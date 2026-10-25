@@ -139,6 +139,35 @@ class NativeHostSetupTests(unittest.TestCase):
             )
         )
 
+    def test_private_runtime_is_checked_as_its_owner_without_relaxing_permissions(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            root = Path(directory)
+            runtime, tart = root / 'private-home' / 'runtime', root / 'tart'
+            runtime.mkdir(parents=True, mode=0o700)
+            runtime.parent.chmod(0o700)
+            tart.mkdir(mode=0o700)
+            calls = []
+
+            def run(arguments, **kwargs):
+                calls.append((arguments, kwargs))
+                self.assertEqual(arguments[:4], ['/usr/bin/sudo', '--non-interactive', '-u', 'partitura-build'])
+                self.assertEqual(kwargs['timeout'], 15)
+                return subprocess.run(arguments[4:], **kwargs)
+
+            settings = {'account': 'partitura-build', 'runtime': {'root': str(runtime), 'tart_home': str(tart)}}
+            with patch.object(Path, 'lstat', side_effect=PermissionError('administrator cannot traverse private home')):
+                host_setup.verify_private_runtime(settings, run)
+            self.assertEqual(runtime.parent.stat().st_mode & 0o777, 0o700)
+            runtime.chmod(0o755)
+            with self.assertRaises(subprocess.CalledProcessError):
+                host_setup.verify_private_runtime(settings, run)
+            runtime.chmod(0o700)
+            link = root / 'link'
+            link.symlink_to(tart, target_is_directory=True)
+            settings['runtime']['tart_home'] = str(link)
+            with self.assertRaises(subprocess.CalledProcessError):
+                host_setup.verify_private_runtime(settings, run)
+
     def test_installer_checks_staged_and_live_sshd_and_restores_dropin_on_failure(self):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
         swap = installer.index('/bin/mv -f "$dropin.new" "$dropin"')

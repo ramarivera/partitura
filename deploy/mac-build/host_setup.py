@@ -690,16 +690,31 @@ def verify_installed_tart(config: dict) -> tuple[str, int]:
 
 
 def verify_private_runtime(config: dict, run=subprocess.run) -> None:
-    account_result = run(
-        ["/usr/bin/id", "-u", config["account"]], capture_output=True, text=True, check=True
+    # The staging administrator cannot traverse the dedicated account's 0700
+    # home. Inspect it as its owner, as with the qualified base tree hash.
+    script = r'''
+import os
+from pathlib import Path
+import stat
+import sys
+
+for value in sys.argv[1:]:
+    path = Path(value)
+    if not path.is_absolute():
+        raise SystemExit("private runtime path must be absolute")
+    for ancestor in reversed((path, *path.parents)):
+        if stat.S_ISLNK(ancestor.lstat().st_mode):
+            raise SystemExit("private runtime path contains a symlink")
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise SystemExit("private runtime directory is not account-owned mode 0700")
+'''
+    run(
+        ["/usr/bin/sudo", "--non-interactive", "-u", config["account"],
+         "/usr/bin/python3", "-c", script,
+         config["runtime"]["root"], config["runtime"]["tart_home"]],
+        capture_output=True, text=True, check=True, timeout=15,
     )
-    uid = int(account_result.stdout.strip())
-    for key in ("root", "tart_home"):
-        path = Path(config["runtime"][key])
-        reject_symlink_ancestors(path)
-        metadata = path.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid or stat.S_IMODE(metadata.st_mode) != 0o700:
-            raise NativeHostError(f"private runtime directory is not account-owned mode 0700: {path}")
 
 
 def stage(settings: object, destination: Path) -> None:
