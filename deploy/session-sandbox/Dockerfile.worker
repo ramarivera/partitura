@@ -65,7 +65,7 @@ ENV MISE_CONFIG_DIR=/workspace/.omp-home/mise/config
 ENV MISE_TRUSTED_CONFIG_PATHS=/workspace
 WORKDIR /workspace
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git libssl-dev libudev1 openssh-client pkg-config tini iptables iproute2 procps xz-utils \
+  && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git libssl-dev libudev1 openssh-client pkg-config tini iptables iproute2 procps xz-utils libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libdbus-1-3 libgbm1 libnspr4 libnss3 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
