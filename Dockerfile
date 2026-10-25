@@ -103,6 +103,7 @@ COPY --from=agent-clis /opt/codex /opt/codex
 COPY --from=agent-clis /opt/t3 /opt/t3
 COPY --from=worker-extensions /opt/omp-extensions /opt/omp-extensions
 COPY deploy/agent-clis/claude-cliproxy /usr/local/bin/claude-cliproxy
+COPY --chmod=0755 deploy/agent-clis/apply_patch /usr/local/bin/apply_patch
 RUN ln -s /opt/claude/bin/claude /usr/local/bin/claude \
   && ln -s /opt/codex/bin/codex /usr/local/bin/codex \
   && ln -s /opt/t3/t3 /usr/local/bin/t3 \
