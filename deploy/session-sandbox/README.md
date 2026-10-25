@@ -229,6 +229,14 @@ Python 3.13.17 come from `deploy/build-tools/mise.toml`; the image keeps their
 root-owned installs under `/opt/partitura/mise/installs`. Stable `node`, `npm`,
 `npx`, `python`, and `python3` links in `/opt/partitura/bin` make those
 versions available on `PATH` before a repository supplies its own Mise config.
+The worker also supplies the Linux Chromium runtime libraries, Fontconfig
+configuration and fallback fonts for browser tasks. Repositories still select
+and download their Playwright/browser versions. A browser download alone
+doesn't install OS packages. Repositories must document those prerequisites
+for other environments; CI can use Playwright's `install-deps chromium`.
+Qualify this image with font fallback rendering as well as library resolution,
+because `ldd` doesn't detect missing Fontconfig configuration or font files.
+
 Use `mise exec` to run repository-pinned versions. At startup,
 `worker-init.sh` creates session-owned links in `/mise/installs`, so Mise can
 use those immutable runtimes while repository-specific versions install into
