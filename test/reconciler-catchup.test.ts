@@ -143,6 +143,14 @@ describe("Reconciler catch-up", () => {
                 createdAt: "2025-01-01T00:00:00.000Z",
               },
               {
+                id: "invalid-time-prompt",
+                type: "prompt",
+                body: "cannot order this against a stop",
+                title: null,
+                signal: null,
+                createdAt: "not-a-timestamp",
+              },
+              {
                 id: "new-1",
                 type: "unknown",
                 body: "ignored",

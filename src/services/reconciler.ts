@@ -181,6 +181,9 @@ export class Reconciler extends Context.Service<Reconciler>()("Reconciler", {
                 ? `# ${title}\n\n${activityBody}`
                 : activityBody || title;
             const activityCreatedAt = Date.parse(activity.createdAt);
+            // A recovered prompt needs a trustworthy time to order it against a stop.
+            if (kind === "prompted" && !Number.isFinite(activityCreatedAt))
+              continue;
             const inserted = yield* runInputRepo
               .enqueue({
                 id,

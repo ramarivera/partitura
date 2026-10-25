@@ -444,6 +444,65 @@ describe("Store repositories", () => {
       ),
   );
 
+  it.live(
+    "ignores historical catch-up prompts across cancellation without dropping fresh follow-ups",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const runs = yield* RunRepo;
+          const inputs = yield* RunInputRepo;
+          const sessionId = makeSessionId("historical-catchup");
+          yield* runs.create({
+            sessionId,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
+          yield* inputs.enqueue({
+            id: makeInputId("stop-catchup"),
+            sessionId,
+            kind: "stop",
+            body: "stop",
+            payload: {},
+            createdAt: 100,
+          });
+          const recover = (id: string, createdAt: number) =>
+            inputs.enqueue({
+              id: makeInputId(id),
+              sessionId,
+              kind: "prompted",
+              body: "continue",
+              payload: { source: "reconciler.catchup" },
+              createdAt,
+            });
+          // Protect the interval between accepting a stop and completing cleanup.
+          expect(yield* recover("before-stop", 99)).toBe(false);
+          expect(yield* recover("at-stop", 100)).toBe(false);
+          yield* runs.update(sessionId, { state: "canceled" });
+          expect(yield* recover("late-original-delegation", 99)).toBe(false);
+          expect(yield* recover("at-cancellation", 100)).toBe(false);
+          expect(yield* recover("fresh-resume", 101)).toBe(true);
+          // A live webhook keeps its arrival-order semantics, even at equal timestamps.
+          expect(
+            yield* inputs.enqueue({
+              id: makeInputId("live-followup"),
+              sessionId,
+              kind: "prompted",
+              body: "continue",
+              payload: {},
+              createdAt: 100,
+            }),
+          ).toBe(true);
+          expect(
+            (yield* inputs.pending(sessionId)).map((input) => input.id),
+          ).toEqual([
+            makeInputId("stop-catchup"),
+            makeInputId("fresh-resume"),
+            makeInputId("live-followup"),
+          ]);
+        }),
+      ),
+  );
+
   it.live("recovers active runs and leases after a process restart", () =>
     withRepos(
       Effect.gen(function* () {

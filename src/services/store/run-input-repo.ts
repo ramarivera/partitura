@@ -41,6 +41,7 @@ const RunRowState = Schema.Struct({
     "orphaned",
   ]),
   desired_state: Schema.Literals(["running", "canceled"]),
+  cancellation_at: Schema.Number,
 });
 
 type RunRowState = Schema.Schema.Type<typeof RunRowState>;
@@ -90,7 +91,10 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
             () =>
               db
                 .query<RunRowState, [string]>(
-                  "SELECT state, desired_state FROM agent_run WHERE session_id=?",
+                  `SELECT state, desired_state,
+                    COALESCE((SELECT MAX(created_at) FROM run_input
+                      WHERE session_id=agent_run.session_id AND kind='stop'), updated_at) AS cancellation_at
+                  FROM agent_run WHERE session_id=?`,
                 )
                 .get(sessionId),
             "RunInputRepo.getRunState",
@@ -159,6 +163,21 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
           // not at enqueue time.
 
           const createdAt = input.createdAt ?? (yield* Clock.currentTimeMillis);
+          // A poll can discover an original delegation only after a stop. Check
+          // inside this transaction so a concurrent stop also fences recovery.
+          // Live webhooks retain arrival ordering and can explicitly resume.
+          if (
+            input.kind === "prompted" &&
+            typeof input.payload === "object" &&
+            input.payload !== null &&
+            "source" in input.payload &&
+            input.payload.source === "reconciler.catchup" &&
+            (run.value.desired_state === "canceled" ||
+              run.value.state === "canceled") &&
+            (!Number.isFinite(createdAt) ||
+              createdAt <= run.value.cancellation_at)
+          )
+            return false;
           const insertResult = yield* tryDb(
             () =>
               db
