@@ -69,6 +69,7 @@ class NativeHostSetupTests(unittest.TestCase):
         loader = importlib.util.spec_from_file_location('native_installer', ROOT / 'deploy/mac-build/native_host.py')
         launcher = importlib.util.module_from_spec(loader)
         loader.loader.exec_module(launcher)
+        self.assertEqual(launcher.INSTALL_HOST_SHA256, hashlib.sha256((ROOT / 'deploy/mac-build/install-host.sh').read_bytes()).hexdigest())
         with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
             stage = Path(directory)
             entries = {}
