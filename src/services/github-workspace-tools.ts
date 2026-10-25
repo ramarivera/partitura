@@ -265,7 +265,9 @@ export async function createGitHubPullRequest(
   } catch {
     throw new Error("GitHub request could not be completed");
   }
-  if (!/^[A-Za-z0-9_-]{1,8192}$/u.test(token))
+  // GitHub installation tokens can be structured tokens containing dots.
+  // Accept the bearer-token alphabet while still rejecting header injection.
+  if (token.length > 8192 || !/^[A-Za-z0-9._~+/-]+=*$/u.test(token))
     throw new Error("GitHub request could not be completed");
 
   const fetchImpl = input.fetchImpl ?? fetch;

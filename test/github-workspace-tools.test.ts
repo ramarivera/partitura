@@ -67,6 +67,54 @@ const input = (
 });
 
 describe("GitHub workspace tools", () => {
+  it("accepts structured installation tokens without exposing them", async () => {
+    const structuredToken = "ghs_fixture.header.payload.signature";
+    const authorization: Array<string | null> = [];
+    const result = await createGitHubPullRequest(
+      input(
+        async (_url, init) => {
+          authorization.push(new Headers(init?.headers).get("authorization"));
+          return Response.json(init?.method === "POST" ? pullRequest() : [], {
+            status: init?.method === "POST" ? 201 : 200,
+          });
+        },
+        { getToken: async () => structuredToken },
+      ),
+      arguments_,
+    );
+    expect(result.created).toBe(true);
+    expect(authorization).toEqual([
+      `Bearer ${structuredToken}`,
+      `Bearer ${structuredToken}`,
+    ]);
+    expect(JSON.stringify(result)).not.toContain(structuredToken);
+  });
+
+  it("rejects invalid bearer values before making any request", async () => {
+    for (const invalid of [
+      "",
+      "token\r\nx-header: value",
+      "token value",
+      "token=middle",
+      "x".repeat(8193),
+    ]) {
+      let requested = false;
+      await expect(
+        createGitHubPullRequest(
+          input(
+            async () => {
+              requested = true;
+              return Response.json([]);
+            },
+            { getToken: async () => invalid },
+          ),
+          arguments_,
+        ),
+      ).rejects.toThrow("GitHub request could not be completed");
+      expect(requested).toBe(false);
+    }
+  });
+
   it("binds create requests to the configured repository and keeps auth upstream", async () => {
     const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
     let tokenRepository: RepositoryRecordType | undefined;
