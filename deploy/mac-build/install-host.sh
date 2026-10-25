@@ -109,7 +109,7 @@ for expected in \
   "permituserenvironment no"; do
   /usr/bin/grep -Fxq "$expected" <<<"$effective" || { echo "staged sshd policy differs: $expected" >&2; exit 1; }
 done
-/usr/bin/install -d -o root -g wheel -m 0755 /Library/Partitura/NativeBuild
+/usr/bin/install -d -o root -g wheel -m 0755 /Library/Partitura /Library/Partitura/NativeBuild
 /usr/bin/install -d -o root -g wheel -m 0755 /private/etc/ssh/sshd_config.d
 /usr/bin/ditto --rsrc "$stage/tart.app" "$tart_new"
 /usr/sbin/chown -R root:wheel "$tart_new"

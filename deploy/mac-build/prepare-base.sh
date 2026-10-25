@@ -447,7 +447,9 @@ with open(path, "w") as handle:
     json.dump(receipt, handle, sort_keys=True, indent=2)
     handle.write("\n")
 PY
-sudo /usr/bin/install -d -o root -g wheel -m 0755 "${receipt%/*}"
+# install -d applies its mode only to the last component. Explicitly create the
+# managed parents so umask 077 cannot hide the public hashes-only receipt.
+sudo /usr/bin/install -d -o root -g wheel -m 0755 /Library/Partitura /Library/Partitura/NativeBuild "${receipt%/*}"
 receipt_write_started=1
 sudo /usr/bin/install -o root -g wheel -m 0444 "$receipt_tmp" "$receipt"
 completed=1
