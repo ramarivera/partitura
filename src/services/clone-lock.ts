@@ -1,9 +1,55 @@
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface CloneLock {
   readonly release: () => Promise<void>;
 }
+
+// macOS has the kernel primitive but no flock executable. Keep the descriptor
+// in this process so crashes release ownership without a PID/stale-file test.
+const acquireDarwinLock = async (
+  path: string,
+): Promise<CloneLock | undefined> => {
+  const { dlopen, read } = await import("bun:ffi");
+  const library = dlopen("/usr/lib/libSystem.B.dylib", {
+    flock: { args: ["i32", "i32"], returns: "i32" },
+    __error: { args: [], returns: "ptr" },
+  });
+  const file = await open(path, "a", 0o600).catch((error: unknown) => {
+    library.close();
+    throw error;
+  });
+  let acquired = false;
+  try {
+    if (library.symbols.flock(file.fd, 2 | 4) !== 0) {
+      const errno = library.symbols.__error();
+      // Darwin EWOULDBLOCK. Other errors must never look like contention.
+      if (errno === null || read.i32(errno) !== 35)
+        throw new Error("Clone lock acquisition failed");
+    } else acquired = true;
+  } catch (error) {
+    await file.close();
+    library.close();
+    throw error;
+  }
+  if (!acquired) {
+    await file.close();
+    library.close();
+    return undefined;
+  }
+  let released = false;
+  return {
+    release: async () => {
+      if (released) return;
+      released = true;
+      try {
+        await file.close();
+      } finally {
+        library.close();
+      }
+    },
+  };
+};
 
 /** Kernel flock ownership survives PID reuse and works across PID namespaces.
  * The helper holds the lock until its private stdin closes, including on a
@@ -28,6 +74,8 @@ export const acquireCloneLock = async (
     (stat.mode & 0o077) !== 0
   )
     throw new Error("Unsafe clone lock directory");
+  if (process.platform === "darwin")
+    return acquireDarwinLock(join(directory, owner));
   const child = Bun.spawn(
     [
       "flock",

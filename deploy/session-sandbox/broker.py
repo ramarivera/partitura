@@ -606,6 +606,11 @@ def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
     volume_record = json.loads(volume_info.stdout)[0]
     if volume_record.get("Labels", {}).get("partitura.session") != session:
         raise ValueError("sandbox Mise volume session label does not match")
+    if vm.load(session) is None:
+        _save_docker_owner(session, {"sessionId": session, "runtime": "sysbox", "workerUid": worker_uid, "workspaceHost": str(workspace)})
+    _docker_mutate(session, ["restart", container])
+    # A stopped endpoint has no address, and restart can assign a different IP.
+    # Validate ownership before restarting, then read the resulting network.
     worker_ip = _run(
         ["inspect", "--format", f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}', container]
     )
@@ -617,9 +622,6 @@ def _sysbox_recover(request: dict[str, Any]) -> dict[str, Any]:
     )
     if not worker_ip or not gateway_ip or not relay_ip:
         raise ValueError("sandbox network addresses are missing")
-    if vm.load(session) is None:
-        _save_docker_owner(session, {"sessionId": session, "runtime": "sysbox", "workerUid": worker_uid, "workspaceHost": str(workspace)})
-    _docker_mutate(session, ["restart", container])
     return {
         "exists": True,
         "running": True,

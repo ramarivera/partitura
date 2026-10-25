@@ -1072,9 +1072,19 @@ class DockerMutationFenceTests(unittest.TestCase):
                             output = json.dumps([{"Labels": {"partitura.session": self.session}}])
                         return SimpleNamespace(returncode=0, stdout=output, stderr="")
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
-                with patch.object(broker.subprocess, "run", side_effect=command), patch.object(broker, "_workspace", return_value=Path("/host/session")), patch.object(broker, "_run", side_effect=["172.19.0.2", "172.18.0.4", "172.19.0.1"]):
+                def address(args):
+                    # Docker drops a stopped endpoint's IP and may assign a new
+                    # one on restart. Only post-restart inspect is meaningful.
+                    if not mutations:
+                        return ""
+                    if args[0] == "network":
+                        return "172.19.0.1"
+                    return "172.19.0.9" if args[-1] == broker._container(self.session) else "172.18.0.4"
+                with patch.object(broker.subprocess, "run", side_effect=command), patch.object(broker, "_workspace", return_value=Path("/host/session")), patch.object(broker, "_run", side_effect=address):
                     if valid:
-                        self.assertTrue(broker.recover(self.request)["running"])
+                        recovered = broker.recover(self.request)
+                        self.assertTrue(recovered["running"])
+                        self.assertEqual(recovered["workerAddress"], "172.19.0.9")
                         self.assertEqual(mutations, [["restart", broker._container(self.session)]])
                         self.assertNotIn("dockerOperation", broker.vm.load(self.session))
                     else:
