@@ -60,7 +60,11 @@ import {
   type EffectiveRunSettings,
   resolveRunSettings,
 } from "./agent-settings.js";
-import { GatewayConfig, type T3LaunchConfig } from "./config.js";
+import {
+  GatewayConfig,
+  type T3LaunchConfig,
+  type WorkerSandboxMode,
+} from "./config.js";
 import { GitHubApp } from "./github-app.js";
 import {
   createGitHubPullRequest,
@@ -241,7 +245,11 @@ const linearWorkerPromptWithTemplate = (
         );
 };
 
-export const resolveDeviationExtensionPath = (): string | null => {
+export const resolveDeviationExtensionPath = (
+  sandboxMode: WorkerSandboxMode = "native",
+): string | null => {
+  if (sandboxMode !== "native")
+    return "/app/dist/extensions/report-deviation.js";
   const candidates = [
     fileURLToPath(
       new URL("../extensions/report-deviation.ts", import.meta.url),
@@ -3126,7 +3134,8 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           command.push("--session", run.ompSessionFile.value);
         }
 
-        const deviationExtensionPath = resolveDeviationExtensionPath();
+        const deviationExtensionPath =
+          resolveDeviationExtensionPath(sandboxMode);
         if (deviationExtensionPath === null) {
           return yield* Effect.fail(
             new RpcSpawnError({

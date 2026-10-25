@@ -136,6 +136,19 @@ describe("Linear worker prompt contract", () => {
   it("resolves the bundled deviation extension entrypoint", () => {
     expect(resolveDeviationExtensionPath()).not.toBeNull();
   });
+
+  it("loads the image's bundled deviation extension for isolated workers", () => {
+    for (const mode of ["firecracker", "sysbox"] as const) {
+      expect(resolveDeviationExtensionPath(mode)).toBe(
+        "/app/dist/extensions/report-deviation.js",
+      );
+    }
+    expect(resolveDeviationExtensionPath("native")).toBe(
+      fileURLToPath(
+        new URL("../src/extensions/report-deviation.ts", import.meta.url),
+      ),
+    );
+  });
 });
 
 describe("SessionAuthority behavior invariants", () => {
