@@ -141,6 +141,15 @@ forwarding. Choose your own encrypted secret storage; workers receive neither
 the config nor its private key. Revoking that one authorized key revokes the
 transport without changing the operator's keys.
 
+macOS may restrict Remote Login to selected users through the existing
+`com.apple.access_ssh` service ACL. Account creation and a valid public key don't
+grant membership. After installing the restricted SSH policy, run
+`sudo python3 deploy/mac-build/remote_login.py --account partitura-build` to check
+that prerequisite. With explicit approval, append `--apply` to admit only that
+account. The helper verifies the effective forced command, public-key-only
+authentication and disabled forwarding/TTY before editing the existing group.
+It never creates a service ACL or enables Remote Login globally.
+
 Install `broker.py` root:wheel 0555 outside checkouts. Its config is
 `/Library/Partitura/NativeBuild/config.json`; all ancestors and the verified Tart
 executable must be root-owned and not group/other writable. `root` and `tartHome`
