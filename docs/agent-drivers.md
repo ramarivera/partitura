@@ -226,3 +226,36 @@ Artifact delivery returns only a path inside that session workspace, its SHA-256
 and byte count. T3 receives the tools through its per-session MCP endpoint.
 Host setup and live acceptance requirements are in
 `deploy/mac-build/README.md`; source tests don't qualify a live Mac host.
+
+## Optional existing T3 device backup
+
+`T3_DEVICE_BACKUP_CONFIG_JSON` or its `_FILE` alternative enables the
+`t3_device_backup` host tool for explicitly configured organizations. Both OMP
+and T3 workers receive it through the existing session host-tool bridge.
+Configure `baseUrl`, `tokenFile`, `workspaceRoot`, `organizationHosts`,
+`instanceId`, and `model`. The URL must use HTTPS or loopback HTTP. Paths must
+be absolute and normalized, and the workspace must already exist on the T3
+server. Host IDs come from that server's device configuration.
+
+Provision a dedicated T3 bearer with `orchestration:read` and
+`orchestration:operate` scopes into the gateway's secret store. Choose its
+expiry and rotation policy explicitly. Never reuse a conversation's MCP
+credential or send the bearer or operator SSH keys to workers. The gateway
+reads the bearer file on every connection. It creates an idle run-owned thread
+without an initial message, so device operations don't start model inference.
+The provider and model fields identify that idle thread's existing selection.
+
+The tool lists simulators on configured hosts, opens a stopped unclaimed
+simulator, reads device details, launches or terminates an installed app, and
+closes the run's device. It refuses physical devices, foreign hosts and other
+threads' sessions. Cancellation and worker cleanup release the run's sessions,
+including ownership recovered from T3 after a gateway restart. Cleanup leaves
+a simulator running if another thread has attached to it. Existing T3 device
+support and agent consent must already be enabled.
+
+This supplements the disposable VM route for device checks. T3's existing
+remote-device bridge provides discovery, streaming and control; it doesn't
+provide remote Xcode builds, app transfer or Metro forwarding. This host tool
+currently exposes device lifecycle and installed-app actions only. Build,
+install, screenshots and accessibility interaction aren't implemented by this
+tool. Native build acceptance and live backup activation remain separate checks.

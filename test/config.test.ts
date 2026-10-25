@@ -63,6 +63,46 @@ afterEach(async () => {
 const testPath = testPaths();
 
 describe("GatewayConfig", () => {
+  test("loads optional T3 device backup from a file and sanitizes invalid config", async () => {
+    const config = {
+      baseUrl: "https://t3.example.test",
+      tokenFile: "/run/secrets/dedicated-t3-backup",
+      workspaceRoot: "/srv/partitura-device",
+      organizationHosts: { "org-one": ["configured-host"] },
+      instanceId: "configured-provider",
+      model: "configured-model",
+    };
+    const directory = await mkdtemp(testPath("device-backup-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "config.json");
+    await writeFile(path, JSON.stringify(config));
+    const configured = await Effect.runPromise(
+      configResult(valuesWith([["T3_DEVICE_BACKUP_CONFIG_JSON_FILE", path]])),
+    );
+    expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured))
+      expect(configured.success.t3DeviceBackup).toEqual(config);
+    const absent = await Effect.runPromise(configResult(valuesWith([])));
+    if (Result.isSuccess(absent))
+      expect(absent.success.t3DeviceBackup).toBeUndefined();
+    const invalid = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          [
+            "T3_DEVICE_BACKUP_CONFIG_JSON",
+            JSON.stringify({
+              ...config,
+              baseUrl:
+                "https://secret-invalid-user:secret-invalid-value@t3.example.test",
+            }),
+          ],
+        ]),
+      ),
+    );
+    expect(Result.isFailure(invalid)).toBe(true);
+    expect(JSON.stringify(invalid)).not.toContain("secret-invalid-value");
+  });
+
   test("loads scoped age bindings as redacted configuration and hides invalid contents", async () => {
     const keys = { "org-one": { "repo-one": "scoped-test-identity" } };
     const configured = await Effect.runPromise(

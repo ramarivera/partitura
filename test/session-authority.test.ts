@@ -87,6 +87,7 @@ import {
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
 import { WorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
+import * as T3DeviceBackup from "../src/services/t3-device-backup.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { tokenContext } from "../src/services/token-migration.js";
 import { safeSessionKey } from "../src/services/workspace.js";
@@ -2396,6 +2397,95 @@ describe("SessionAuthority repository age identities", () => {
 });
 
 describe("SessionAuthority host-tool mutation gate", () => {
+  it.live(
+    "routes T3 device backup through the current run and refuses operations after stop",
+    () => {
+      const calls: Array<unknown> = [];
+      const releases: Array<unknown> = [];
+      const backup = vi
+        .spyOn(T3DeviceBackup, "makeT3DeviceBackup")
+        .mockReturnValue({
+          call: (organizationId, sessionId, arguments_) =>
+            Effect.sync(() => {
+              calls.push({ organizationId, sessionId, arguments_ });
+              return { devices: [] };
+            }),
+          release: (organizationId, sessionId) =>
+            Effect.sync(() => {
+              releases.push({ organizationId, sessionId });
+            }),
+        });
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runs = yield* RunRepo;
+            const inputs = yield* RunInputRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            yield* runs.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            const cwd = testPath("device-backup-authority");
+            yield* runs.update(testSessionId, {
+              state: "orphaned",
+              workspacePath: Option.some(cwd),
+              ompSessionFile: Option.some(join(cwd, "session.jsonl")),
+            });
+            yield* authority.processSession(testSessionId);
+            expect(registeredHostTools.map((tool) => tool.name)).toContain(
+              "t3_device_backup",
+            );
+            const listener = hostToolListener;
+            if (listener === undefined)
+              throw new Error("Missing host tool listener");
+            const call = {
+              id: "device-call",
+              toolCallId: "device-tool",
+              toolName: "t3_device_backup",
+              arguments: {
+                operation: "list",
+                organizationId: "foreign",
+                sessionId: "foreign",
+              },
+            };
+            const result = yield* listener(call);
+            expect(result.isError).not.toBe(true);
+            expect(calls).toEqual([
+              {
+                organizationId: testOrganizationId,
+                sessionId: testSessionId,
+                arguments_: call.arguments,
+              },
+            ]);
+            yield* inputs.applyStop(testSessionId);
+            const refused = yield* listener(call);
+            expect(refused.isError).toBe(true);
+            expect(calls).toHaveLength(1);
+            yield* authority.processSession(testSessionId);
+            expect(releases).toContainEqual({
+              organizationId: testOrganizationId,
+              sessionId: testSessionId,
+            });
+          }),
+        {
+          configOverride: (config) => ({
+            ...config,
+            t3DeviceBackup: {
+              baseUrl: "https://t3.example.test",
+              tokenFile: "/run/secrets/t3-backup",
+              workspaceRoot: "/srv/device-backup",
+              organizationHosts: { [testOrganizationId]: ["mac"] },
+              instanceId: "configured-provider",
+              model: "configured-model",
+            },
+          }),
+        },
+      ).pipe(Effect.ensuring(Effect.sync(() => backup.mockRestore())));
+    },
+  );
+
   it.live(
     "creates a repo-bound PR without Linear and refuses creation after stop",
     () => {

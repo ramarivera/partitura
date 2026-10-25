@@ -12,6 +12,10 @@ import {
 import type { LogLevel } from "../domain/models.js";
 import { RUNTIME_MODES, type RuntimeMode } from "../drivers/driver.js";
 import type { NativeBuildConfig } from "./native-build-client.js";
+import {
+  parseT3DeviceBackupConfig,
+  type T3DeviceBackupConfig,
+} from "./t3-device-backup.js";
 import { modelProvider } from "./worker-profile.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
@@ -130,6 +134,7 @@ export interface GatewayConfigShape {
   readonly sessionSandboxBrokerSocketPath?: string | undefined;
   /** Gateway-only SSH transport for optional native build host tools. */
   readonly nativeBuild?: NativeBuildConfig | undefined;
+  readonly t3DeviceBackup?: T3DeviceBackupConfig | undefined;
   /** Present only when T3_MODE or T3_BASE_URL is set. */
   readonly t3Driver?: T3DriverConfig;
 }
@@ -969,6 +974,21 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       }
       const routing = yield* workerModelRouting();
       const t3Driver = yield* t3DriverConfig();
+      const deviceBackupInput = yield* optionalValue(
+        "T3_DEVICE_BACKUP_CONFIG_JSON",
+      );
+      const t3DeviceBackup =
+        deviceBackupInput === undefined
+          ? undefined
+          : yield* Effect.try({
+              try: () => parseT3DeviceBackupConfig(deviceBackupInput),
+              catch: () =>
+                new Config.ConfigError(
+                  new ConfigProvider.SourceError({
+                    message: "Invalid T3_DEVICE_BACKUP_CONFIG_JSON",
+                  }),
+                ),
+            });
       if (
         values.workerSandboxMode !== "native" &&
         values.sessionSandboxBrokerSocketPath === undefined
@@ -1006,6 +1026,7 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
               },
             }),
         ...routing,
+        ...(t3DeviceBackup === undefined ? {} : { t3DeviceBackup }),
         workerRepositoryAgeKeys,
         allowedOrganizationIds,
         gatewayAdminOrganizationIds,

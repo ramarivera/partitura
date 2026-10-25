@@ -235,6 +235,14 @@ positive and negative decryption cases before enabling a live grant.
 
 ## Launched T3 daemons
 
+The optional existing-server device backup is configured separately through
+`T3_DEVICE_BACKUP_CONFIG_JSON` or `_FILE`. Its dedicated bearer stays gateway
+side; organization-to-host bindings restrict the worker tool, and the authority
+serializes its operations with session cancellation. Run-owned idle threads
+carry device ownership across gateway restarts. Enabling this tool doesn't
+grant shell execution or a remote build route. See
+`docs/agent-drivers.md` for its credential scopes and verification limits.
+
 With `T3_MODE=launch` each T3 session gets its own `t3 serve` started by the
 gateway under the session's worker uid, with the same `setpriv` flags, env
 allowlist and model-credential injection as an OMP worker. Its `HOME` and T3

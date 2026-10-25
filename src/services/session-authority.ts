@@ -123,6 +123,7 @@ import {
   WorkspaceRepo,
 } from "./store/repositories.js";
 import { WorkerIdentityRepo } from "./store/worker-identity-repo.js";
+import { makeT3DeviceBackup, t3DeviceBackupTool } from "./t3-device-backup.js";
 import { startWorkerMcpProxy } from "./worker-mcp-proxy.js";
 import {
   seedWorkerProfileFiles,
@@ -459,6 +460,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const workerIdentities = yield* WorkerIdentityRepo;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      const deviceBackup =
+        config.t3DeviceBackup === undefined
+          ? undefined
+          : makeT3DeviceBackup(config.t3DeviceBackup);
       const sandboxMode = config.workerSandboxMode ?? "firecracker";
       if (
         sandboxMode !== "native" &&
@@ -1394,6 +1399,19 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
 
       const dropWorker = (sessionId: SessionId) =>
         Effect.gen(function* () {
+          if (deviceBackup !== undefined) {
+            yield* bestEffort(
+              "close T3 backup devices",
+              Effect.gen(function* () {
+                const run = yield* runRepo.get(sessionId);
+                if (Option.isSome(run))
+                  yield* deviceBackup.release(
+                    run.value.organizationId,
+                    sessionId,
+                  );
+              }),
+            );
+          }
           stopMcpProxy(sessionId);
           stopGitBroker(sessionId);
           yield* cancelSessionNativeBuilds(sessionId);
@@ -1929,6 +1947,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         const definitions: ReadonlyArray<RpcHostToolDefinition> = [
           ...linearDefinitions,
           githubCreatePullRequestToolDefinition,
+          ...(deviceBackup === undefined ||
+          config.t3DeviceBackup?.organizationHosts[run.organizationId] ===
+            undefined
+            ? []
+            : [t3DeviceBackupTool]),
           ...(config.nativeBuild === undefined
             ? []
             : ([
@@ -2007,6 +2030,40 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             const fail = (message: string) =>
               textResult(message, undefined, true);
             const raw = request.arguments;
+            if (request.toolName === "t3_device_backup") {
+              if (deviceBackup === undefined)
+                return fail("T3 device backup is disabled");
+              return yield* withSessionMutationGate(
+                run.sessionId,
+                Effect.gen(function* () {
+                  const current = yield* runRepo.get(run.sessionId);
+                  if (
+                    Option.isNone(current) ||
+                    current.value.desiredState === "canceled" ||
+                    ["succeeded", "failed", "canceled"].includes(
+                      current.value.state,
+                    )
+                  )
+                    return fail(
+                      "Run is finished; device operations are refused",
+                    );
+                  const result = yield* deviceBackup.call(
+                    run.organizationId,
+                    run.sessionId,
+                    raw,
+                  );
+                  return textResult(JSON.stringify(result), result);
+                }).pipe(
+                  Effect.catch(() =>
+                    Effect.succeed(
+                      fail(
+                        "T3 device backup failed. Check its configured host, device ownership, and server access.",
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
             if (request.toolName === "github_create_pull_request") {
               return yield* withSessionMutationGate(
                 run.sessionId,
