@@ -216,6 +216,25 @@ holds the job lock and never removes a running job's output or VM recovery fence
 
 ## Acceptance
 
+On recent macOS hosts, creating the dedicated Unix account and installing a
+qualified base aren't sufficient to prove VM startup. Virtualization.framework
+also needs that account's host security state. A fresh headless account can fail
+with `VZErrorDomain Code=-9`, `Failed to get current host key`, and `Failed to
+create new HostKey`. Check the dedicated account's default keychain and its
+locked state, rather than borrowing the operator's keychain or running jobs as
+the operator. An account with no default keychain needs explicit provisioning;
+some macOS versions also need an initial desktop login for that account. A
+manually created keychain alone isn't proven sufficient. See the upstream
+[Tart investigation](https://github.com/openai/tart/issues/1146).
+
+The bootstrap currently creates the account and private paths, but doesn't
+initialize its keychain or desktop security state. Treat those as unresolved
+host prerequisites until a job boots through the installed restricted SSH route.
+Provisioning a keychain or changing account authentication requires separate
+operator approval. Preserve public-key-only SSH, the forced command and disabled
+forwarding. Keep any host keychain credential outside the guest, gateway and
+repository. No project credentials belong in this host keychain.
+
 After approved installation, verify account and SSH restrictions, exact installed
 hashes/modes, base provenance and qualification, no host shares, a generic
 repository task and artifact receipt, cross-session denial, cancellation and crash
