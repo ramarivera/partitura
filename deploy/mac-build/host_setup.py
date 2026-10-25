@@ -336,7 +336,6 @@ def sshd_dropin(account: str) -> str:
             "    AllowAgentForwarding no",
             "    X11Forwarding no",
             "    PermitTTY no",
-            "    PermitUserEnvironment no",
             "",
         ]
     )
