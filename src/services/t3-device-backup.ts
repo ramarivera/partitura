@@ -12,6 +12,7 @@ import {
 } from "../drivers/t3/rpc-client.js";
 import { readBoundedBody } from "./bounded-body.js";
 import type { RpcHostToolDefinition, RpcHostToolResult } from "./rpc-worker.js";
+import { DeviceInput, sendT3DeviceInput } from "./t3-device-input.js";
 
 const ConfigSchema = Schema.Struct({
   baseUrl: Schema.String,
@@ -87,18 +88,20 @@ const Arguments = Schema.Struct({
     "terminate-app",
     "screenshot",
     "accessibility",
+    "input",
     "close",
   ]),
   hostId: Schema.optional(Schema.String),
   deviceId: Schema.optional(Schema.String),
   appId: Schema.optional(Schema.String),
+  input: Schema.optional(DeviceInput),
 });
 
 export const t3DeviceBackupTool: RpcHostToolDefinition = {
   name: "t3_device_backup",
   label: "T3: remote device backup",
   description:
-    "Use an existing T3 server's simulators as a backup for native device checks. The primary disposable VM build route remains separate. List first; open only a stopped unclaimed simulator. Device actions and cleanup are bound to this run. Screenshot and accessibility operations inspect the current app through T3. This tool doesn't build, install apps, or execute shell commands.",
+    "Use an existing T3 server's simulators as a backup for native device checks. List first; open only a stopped unclaimed simulator. Actions and cleanup are bound to this run. Input supports normalized taps, named keys and short text. iOS text is limited to 32 printable ASCII characters, newline and tab; Android text is limited to 300 UTF-8 bytes. Input results establish dispatch only. Inspect accessibility or screenshots after input, including failed calls, before deciding whether to retry. This tool doesn't build, install apps, or execute shell commands. The disposable VM build route remains separate.",
   parameters: {
     type: "object",
     additionalProperties: false,
@@ -114,12 +117,59 @@ export const t3DeviceBackupTool: RpcHostToolDefinition = {
           "terminate-app",
           "screenshot",
           "accessibility",
+          "input",
           "close",
         ],
       },
       hostId: { type: "string", minLength: 1 },
       deviceId: { type: "string", minLength: 1 },
       appId: { type: "string", minLength: 1 },
+      input: {
+        oneOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "x", "y"],
+            properties: {
+              type: { const: "tap" },
+              x: { type: "number", minimum: 0, maximum: 1 },
+              y: { type: "number", minimum: 0, maximum: 1 },
+            },
+          },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "key"],
+            properties: {
+              type: { const: "key" },
+              key: {
+                type: "string",
+                enum: [
+                  "Enter",
+                  "Escape",
+                  "Backspace",
+                  "Tab",
+                  "Space",
+                  "ArrowRight",
+                  "ArrowLeft",
+                  "ArrowDown",
+                  "ArrowUp",
+                  "Delete",
+                ],
+              },
+            },
+          },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "text"],
+            properties: {
+              type: { const: "text" },
+              text: { type: "string", minLength: 1, maxLength: 300 },
+            },
+          },
+        ],
+      },
     },
   },
 };
@@ -381,6 +431,24 @@ export const makeT3DeviceBackup = (
           }
           if (!owned)
             return yield* refused("Open this device for the current run first");
+          if (args.operation === "input") {
+            if (
+              !current.agentAccessEnabled ||
+              current.hostStatus === "disabled"
+            )
+              return yield* refused("Device agent access is disabled");
+            if (!args.input)
+              return yield* refused("Provide a device input action");
+            return {
+              ...target,
+              ...(yield* sendT3DeviceInput({
+                baseUrl,
+                token,
+                device,
+                input: args.input,
+              })),
+            };
+          }
           if (args.operation === "close") {
             yield* request("device.close", {
               ...target,

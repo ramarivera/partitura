@@ -2061,7 +2061,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   Effect.catch(() =>
                     Effect.succeed(
                       fail(
-                        "T3 device backup failed. Check its configured host, device ownership, and server access.",
+                        "T3 device backup failed. Check its configured host, device ownership, and server access. Inspect the device before retrying input because dispatch may have occurred.",
                       ),
                     ),
                   ),

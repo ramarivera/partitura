@@ -259,7 +259,13 @@ support and agent consent must already be enabled.
 This supplements the disposable VM route for device checks. T3's existing
 remote-device bridge provides discovery, streaming and control; it doesn't
 provide remote Xcode builds, app transfer or Metro forwarding. This host tool
-exposes device lifecycle, installed-app actions, screenshots and accessibility
-inspection. Build, install and interactive taps or text input aren't implemented
-by this tool. Native build acceptance and live backup activation remain separate
-checks.
+exposes device lifecycle, installed-app actions, screenshots, accessibility
+inspection and input through the same authenticated device proxy. Input supports
+normalized taps, named keys and short text. iOS waits for input admission and
+screen configuration before sending HID packets; text supports up to 32 ASCII
+characters, newline and tab. Android text supports up to 300 UTF-8 bytes. Input
+never retries automatically. Its result reports dispatch, not observed UI behavior;
+inspect accessibility or a screenshot afterward, including after a failed call,
+before deciding whether another action is needed. Build and app transfer aren't
+implemented by this tool. Native build acceptance and live backup acceptance
+remain separate checks.
