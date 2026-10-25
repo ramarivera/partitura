@@ -529,9 +529,9 @@ describe("SessionAuthority behavior invariants", () => {
     { timeout: 15_000 },
   );
 
-  it.effect(
-    "schedules a user-stopped run when a follow-up prompt arrives",
-    () =>
+  it.effect.each([true, false])(
+    "schedules a follow-up prompt when the preceding stop was already processed: %s",
+    (processStopFirst) =>
       withAuthority(() =>
         Effect.gen(function* () {
           const authority = yield* SessionAuthority;
@@ -555,7 +555,7 @@ describe("SessionAuthority behavior invariants", () => {
             issueId: Option.none(),
           });
           yield* runRepo.update(testSessionId, {
-            state: "running",
+            state: processStopFirst ? "running" : "succeeded",
             repositoryId: Option.some(repositoryId),
             workspacePath: Option.some(testPath("resume-workspace")),
             ompSessionFile: Option.some(
@@ -570,23 +570,24 @@ describe("SessionAuthority behavior invariants", () => {
             body: "stop",
             payload: {},
           });
-          yield* authority.processRunnable();
+          if (processStopFirst) yield* authority.processRunnable();
 
           const stopped = yield* runRepo.get(testSessionId);
           expect(Option.isSome(stopped)).toBe(true);
-          if (Option.isSome(stopped)) {
+          if (Option.isSome(stopped) && processStopFirst) {
             expect(stopped.value.state).toBe("canceled");
             expect(stopped.value.desiredState).toBe("canceled");
           }
           expect(yield* runInputRepo.listSessionsWithPendingInputs()).toEqual(
             [],
           );
-          expect(projectorTerminals).toContainEqual({
-            sessionId: testSessionId,
-            sourceKey: `stop:${testSessionId}`,
-            kind: "response",
-            text: "Stopped as requested.",
-          });
+          if (processStopFirst)
+            expect(projectorTerminals).toContainEqual({
+              sessionId: testSessionId,
+              sourceKey: `stop:${testSessionId}`,
+              kind: "response",
+              text: "Stopped as requested.",
+            });
 
           yield* runInputRepo.enqueue({
             id: Schema.decodeUnknownSync(InputId)("resume-input"),
@@ -596,6 +597,7 @@ describe("SessionAuthority behavior invariants", () => {
             payload: {},
           });
           yield* authority.processRunnable();
+          if (!processStopFirst) yield* authority.processRunnable();
 
           const resumed = yield* runRepo.get(testSessionId);
           expect(Option.isSome(resumed)).toBe(true);

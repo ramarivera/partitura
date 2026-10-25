@@ -3576,11 +3576,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   yield* runInputRepo.markProcessed(input.id);
                   continue;
                 }
-                if (isDeferredNotificationStopPayload(input.payload)) {
-                  yield* runInputRepo.applyStop(sessionId);
-                  const refreshed = yield* runRepo.get(sessionId);
-                  if (Option.isSome(refreshed)) latest = refreshed.value;
-                }
+                // A newer prompt may have reopened a terminal run since this
+                // stop was enqueued. Persist cancellation again so that prompt
+                // remains eligible for the normal canceled-run resume path.
+                yield* runInputRepo.applyStop(sessionId);
+                const refreshed = yield* runRepo.get(sessionId);
+                if (Option.isSome(refreshed)) latest = refreshed.value;
                 yield* cancel(latest);
                 yield* runInputRepo.markProcessed(input.id);
                 return;
