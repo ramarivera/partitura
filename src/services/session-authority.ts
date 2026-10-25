@@ -3514,10 +3514,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 hasActionableInput && (yield* runRepo.reopen(sessionId));
               if (!resumed) {
                 yield* cancel(initial.value);
-                // The cancellation honors any pending stop inputs; mark them
-                // so a later prompt isn't preceded by a stale stop re-cancel.
+                // The cancellation honors pending stops and supersedes older
+                // prompts, while later prompts remain eligible to resume.
                 yield* Effect.forEach(
-                  inputs.filter((input) => input.kind === "stop"),
+                  inputs.slice(
+                    0,
+                    inputs.findLastIndex((input) => input.kind === "stop") + 1,
+                  ),
                   (input) => runInputRepo.markProcessed(input.id),
                   { discard: true },
                 );
@@ -3583,7 +3586,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 const refreshed = yield* runRepo.get(sessionId);
                 if (Option.isSome(refreshed)) latest = refreshed.value;
                 yield* cancel(latest);
-                yield* runInputRepo.markProcessed(input.id);
+                // The accepted stop also cancels prompts queued before it.
+                // Leave later prompts pending so they can resume the run.
+                for (const superseded of inputs.slice(
+                  0,
+                  inputs.findIndex((candidate) => candidate.id === input.id) +
+                    1,
+                ))
+                  yield* runInputRepo.markProcessed(superseded.id);
                 return;
               }
             }

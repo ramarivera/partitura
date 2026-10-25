@@ -702,7 +702,10 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
           const active = activeRun(before);
           const dispatchMode: DispatchMode =
             turn.delivery === "queue" ||
-            (turn.delivery === "auto" && active !== undefined)
+            (turn.delivery === "auto" && active !== undefined) ||
+            (turn.delivery === "steer" &&
+              active !== undefined &&
+              active.status !== "running")
               ? { type: "queue_after_active" }
               : turn.delivery === "steer" && active !== undefined
                 ? { type: "steer_active", targetRunId: active.id }

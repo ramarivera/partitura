@@ -527,6 +527,30 @@ describe("T3 driver turns and events", () => {
     }),
   );
 
+  it.live.each(["preparing", "starting", "waiting"] as const)(
+    "queues a steer request while the active run is %s",
+    (status) =>
+      Effect.gen(function* () {
+        const server = yield* withServer;
+        const session = yield* driverFor(server).open(openInput);
+        yield* session.sendTurn({
+          clientRequestId: "starting-first",
+          text: "first",
+          delivery: "start",
+        });
+        server.updateRun(THREAD_ID, "run-1", { status });
+        const queued = yield* session.sendTurn({
+          clientRequestId: "starting-follow-up",
+          text: "follow up",
+          delivery: "steer",
+        });
+        expect(queued).toMatchObject({ turnId: "run-2", delivery: "queued" });
+        expect(
+          server.commandsOf("message.dispatch").at(-1)?.dispatchMode,
+        ).toEqual({ type: "queue_after_active" });
+      }),
+  );
+
   it.live("queues behind an active run and steers into it", () =>
     Effect.gen(function* () {
       const server = yield* withServer;

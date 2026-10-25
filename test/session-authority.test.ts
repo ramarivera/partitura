@@ -564,6 +564,14 @@ describe("SessionAuthority behavior invariants", () => {
           });
 
           yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("superseded-prompt"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "this prompt must be canceled by the later stop",
+            payload: {},
+            createdAt: 0,
+          });
+          yield* runInputRepo.enqueue({
             id: Schema.decodeUnknownSync(InputId)("stop-input"),
             sessionId: testSessionId,
             kind: "stop",
@@ -579,7 +587,7 @@ describe("SessionAuthority behavior invariants", () => {
             expect(stopped.value.desiredState).toBe("canceled");
           }
           expect(yield* runInputRepo.listSessionsWithPendingInputs()).toEqual(
-            [],
+            processStopFirst ? [] : [testSessionId],
           );
           if (processStopFirst)
             expect(projectorTerminals).toContainEqual({
@@ -615,6 +623,7 @@ describe("SessionAuthority behavior invariants", () => {
           );
           expect(workerSpawnInputs[0]?.cwd).toBe(testPath("resume-workspace"));
           expect(workerPrompts).toEqual(["please continue the task"]);
+          expect(yield* runInputRepo.pending(testSessionId)).toEqual([]);
         }),
       ),
     { timeout: 15_000 },

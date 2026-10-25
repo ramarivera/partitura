@@ -235,7 +235,7 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
           () =>
             db
               .query<RunInputRow, [string]>(
-                "SELECT id, session_id, kind, body, payload_json, created_at FROM run_input WHERE session_id=? AND processed_at IS NULL ORDER BY created_at, id",
+                "SELECT id, session_id, kind, body, payload_json, created_at FROM run_input WHERE session_id=? AND processed_at IS NULL ORDER BY rowid",
               )
               .all(sessionId),
           "RunInputRepo.pending",
@@ -270,7 +270,7 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
               >(`
                 SELECT id, body, kind, payload_json FROM run_input
                 WHERE session_id=? AND kind!='stop'
-                ORDER BY created_at DESC, id DESC
+                ORDER BY rowid DESC
                 LIMIT 1
               `)
               .get(sessionId),

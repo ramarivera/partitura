@@ -417,6 +417,12 @@ describe("Store repositories", () => {
           expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([
             sessionId,
           ]);
+          expect(
+            (yield* inputs.pending(sessionId)).map((input) => input.id),
+          ).toEqual([makeInputId("old-prompt"), makeInputId("new-prompt")]);
+          expect(yield* inputs.latestActionableInput(sessionId)).toMatchObject(
+            Option.some({ id: makeInputId("new-prompt") }),
+          );
           yield* inputs.markProcessed(makeInputId("new-prompt"));
           expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
           const revoked = makeSessionId("access-revoked");

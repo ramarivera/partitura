@@ -538,6 +538,19 @@ export class FakeT3Server {
           return;
         }
         if (mode.type === "steer_active") {
+          if (
+            active === undefined ||
+            active.id !== mode.targetRunId ||
+            active.status !== "running"
+          ) {
+            this.fail(
+              ws,
+              id,
+              "OrchestrationV2DispatchCommandError",
+              "The target run is not running and cannot be steered.",
+            );
+            return;
+          }
           const message = this.userMessage(
             thread,
             messageId,
