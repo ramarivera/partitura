@@ -6,6 +6,20 @@ tailnet hosts. Tailscale lives only in the sidecar. The gateway image, its child
 processes, and SSH client don't need a Tailscale binary, socket, or auth key.
 This is an opt-in, standalone Compose project. It doesn't change the default image.
 
+Bring your own tailnet and auth key. Partitura doesn't require a particular
+tailnet, device, build host, or tag. With Docker Compose 2.24.4 or newer, have your
+secret manager provide `PARTITURA_TAILSCALE_AUTH_KEY` in the command environment,
+then start with `docker compose -f compose.yaml -f compose.auth-env.yaml up -d`.
+The overlay turns that environment input into a Compose secret file mounted only
+in the sidecar. The key isn't passed to the gateway or workers. The default
+`compose.yaml` supports `TS_AUTHKEY_FILE` instead, for an existing secret file.
+The other gateway credentials below are still required.
+
+`TS_HOSTNAME` chooses the node name. `TS_EXTRA_ARGS` optionally configures
+`tailscale up` arguments, including tags allowed by your own tailnet policy.
+Remote host addresses belong to repository or deployment configuration. The
+example Mac policy below is optional and contains no required host addresses.
+
 The gateway shares the sidecar's network namespace. A kernel `tailscale0` interface
 provides both incoming HTTP on port 3000 and outbound worker traffic. The optional
 Serve overlay terminates tailnet HTTPS on port 443 and proxies to localhost:3000.
@@ -42,7 +56,7 @@ Configure `/etc/partitura-sandbox/broker.env` on the host with
 after the volume exists. If you override the Compose project name, use that
 project's volume name. The broker maps the gateway's logical workspace paths
 into this host directory. `/app/workspaces` itself isn't the host mountpoint.
-Set the broker's exact HTTPS egress allowlist and qualify Firecracker's KVM,
+Choose the broker's public-web or explicit allowlist policy and qualify Firecracker's KVM,
 guest artifacts and restricted SFTP runtime before dispatching sessions.
 
 Both isolated backends need the gateway's Docker network identity for relays.
@@ -84,8 +98,9 @@ This example doesn't enable Funnel or configure a public ingress.
 1. Use a Linux Docker engine with `/dev/net/tun` and support for `NET_ADMIN` and
    `NET_RAW`. On Docker Desktop these requirements apply inside its Linux VM.
    Rootless engines may not support the required device/capabilities.
-2. Enable MagicDNS in the tailnet. Add the policy below and create a pre-approved,
-   short-lived, single-use auth key tagged `tag:partitura`. For an always-on gateway,
+2. Enable MagicDNS in the tailnet. Choose a policy for your required services and
+   create a pre-approved, short-lived auth key. The optional example below uses
+   `tag:partitura`; use your own tags or an untagged key instead. For an always-on gateway,
    use a non-ephemeral node and keep its state volume. Ephemeral keys suit disposable
    deployments: the node disappears after disconnecting, and its next registration
    needs a usable key. Auth-key expiry and node-key expiry are separate settings.

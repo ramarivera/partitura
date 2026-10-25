@@ -23,7 +23,8 @@ services:
       TS_USERSPACE: "false"
       # Keep Docker DNS for sidecar bootstrap. Gateway DNS is configured below.
       TS_ACCEPT_DNS: "false"
-      TS_EXTRA_ARGS: --advertise-tags=tag:partitura
+      # Your auth key and tailnet policy own tags; no fleet tag is required.
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
       TS_ENABLE_HEALTH_CHECK: "true"
       TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
     secrets:

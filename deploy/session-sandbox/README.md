@@ -98,7 +98,7 @@ the command's process group, including after stdin closes.
 fixed host vsock port. Port zero requests an allocated loopback port. Closing
 the control connection stops the listener. `tunnel` connects to a guest loopback
 service for gateway-to-worker traffic. The egress listener uses guest loopback
-3128 and host vsock 1081; the host applies its exact-host CONNECT allowlist.
+3128 and host vsock 1081; the host applies the configured public-web or hostname-allowlist policy.
 Guest Docker inherits that proxy. There is no direct Internet or host network
 route from the VM.
 
@@ -154,11 +154,11 @@ TCP forwarder on the host side of the session bridge. It accepts connections
 from the worker IP for gateway-bound relays and from the gateway network owner
 for worker-bound relays. Its Unix control connection owns the relay lifetime.
 The gateway chooses the target service and port, then gives the worker only the
-relay URL. `egress` starts an HTTPS CONNECT proxy on the same session
-bridge address. It accepts exact hostnames from
-`PARTITURA_SANDBOX_EGRESS_HOSTS`, port 443, and DNS results for which every
-answer is globally routable. Workers have no direct DNS or Internet route.
-Keep the allowlist to required package and model service hosts.
+relay URL. `egress` starts an HTTP/HTTPS proxy on the same session bridge address. By
+default it permits public destinations on ports 80 and 443 after checking every
+DNS answer. Restricted deployments can select `allowlist` mode and enumerate
+`PARTITURA_SANDBOX_EGRESS_HOSTS`. Workers have no direct DNS or Internet route.
+Private destinations require exact configured HTTPS provider pins.
 
 Host INPUT firewalls can block these listeners even when Docker forwarding works.
 The optional `PARTITURA_SANDBOX_MANAGE_FIREWALL=true` mode creates one IPv4 TCP
@@ -191,19 +191,22 @@ networks or mount `/var/run/docker.sock` into the gateway. The socket unit
 currently allows only root clients, matching the gateway container's root
 identity.
 
-The managed gateway install must also set `PARTITURA_SANDBOX_EGRESS_HOSTS` to
-the exact comma-separated HTTPS hostnames workers need, including
-`cliproxyapi.ai.roxasroot.net` for the configured model proxy and any package
-registries used by worker tools. It defaults to an empty list, so worker
-egress stays closed until an operator sets the allowlist. Review DNS results
-before each connection; by default the broker rejects a hostname if any answer
-isn't globally routable. An operator can explicitly approve a private HTTPS
+`PARTITURA_SANDBOX_EGRESS_MODE=public-web` is the default. Workers can reach any
+public HTTP service on TCP 80 and HTTPS service on TCP 443, including package
+registries, mirrors, redirects, and artifact verification services. There is no
+hostname list to maintain for public web access. For a restricted deployment,
+set `PARTITURA_SANDBOX_EGRESS_MODE=allowlist` and supply exact comma-separated
+hostnames in `PARTITURA_SANDBOX_EGRESS_HOSTS`. An empty allowlist denies egress.
+Both modes validate every DNS answer before connecting and reject a hostname
+if any answer isn't globally routable. An operator can explicitly approve a private HTTPS
 service by setting `PARTITURA_SANDBOX_PRIVATE_EGRESS_ADDRESSES_JSON` to an object
 mapping an already-allowed hostname to exact IP addresses. It defaults to `{}`.
 Pinned hosts must resolve entirely within their approved address set, and the
-proxy connects to the validated address without resolving it again. CIDRs,
+proxy connects to the validated address without resolving it again. Private
+pins remain HTTPS-only in either mode. CIDRs,
 loopback, link-local, metadata, multicast, unspecified, and reserved addresses
-are refused. CONNECT remains limited to port 443. This is a protected access
+are refused. CONNECT supports only ports 80 and 443; absolute-form HTTP requests
+support only port 80 and discard proxy credentials before forwarding. This is a protected access
 grant, so review and approve it before deployment. Keep both settings in the
 deployment source of truth and apply them to the broker service environment,
 not the gateway container. A changed service address requires a reviewed pin
@@ -226,7 +229,7 @@ between sessions, and the `/mise` volume is removed with its session.
 stores its data under the session workspace. The socket stays at
 `/run/docker.sock` inside that container. The broker never mounts the host
 Docker socket. The outer session proxy variables are present before `dockerd`
-starts, so inner Docker image pulls use the same exact-host egress policy.
+starts, so inner Docker image pulls use the same configured egress policy.
 
 For launched T3 sessions, the gateway MCP endpoint also receives a
 session-owned broker relay into the gateway's configured Docker network. T3's

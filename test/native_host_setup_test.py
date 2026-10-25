@@ -3,6 +3,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import unittest
@@ -17,6 +18,53 @@ spec.loader.exec_module(host_setup)
 
 
 class NativeHostSetupTests(unittest.TestCase):
+    def test_qualification_mount_check_is_portable_and_fails_on_awk_errors(self):
+        source = (ROOT / "deploy/mac-build/qualify-base.sh").read_text()
+        check = source[source.index("mount_check=$("):source.index("\nprintf 'PARTITURA_NATIVE_BASE_QUALIFIED")]
+        for mounts, accepted in [
+            ("/dev/disk1 on / (apfs, local)\n", True),
+            ("share on /Volumes/workspace (virtiofs)\n", False),
+            ("server on /mnt/build (smbfs)\n", False),
+            ("share on /Volumes/workspace (other)\n", False),
+        ]:
+            with self.subTest(mounts=mounts):
+                result = subprocess.run(
+                    ["bash", "-c", 'set -euo pipefail; fail() { exit 1; }; mount() { printf "%s" "$MOUNT_FIXTURE"; }; ' + check],
+                    env={**os.environ, "MOUNT_FIXTURE": mounts}, capture_output=True,
+                )
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+        result = subprocess.run(
+            ["bash", "-c", 'set -euo pipefail; fail() { exit 1; }; mount() { :; }; awk() { return 23; }; ' + check],
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("export MISE_OFFLINE=true", source)
+
+    def test_base_sealing_removes_only_a_stale_owned_control_socket(self):
+        source = (ROOT / "deploy/mac-build/prepare-base.sh").read_text()
+        block = source.split('/usr/bin/python3 - "$base_vm/control.sock" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            control = Path(directory) / "control.sock"
+
+            def seal():
+                return subprocess.run(["/usr/bin/python3", "-c", block, str(control)], capture_output=True)
+
+            self.assertEqual(seal().returncode, 0)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(str(control))
+                server.listen(1)
+                self.assertNotEqual(seal().returncode, 0)
+                self.assertTrue(control.exists())
+            self.assertEqual(seal().returncode, 0)
+            self.assertFalse(control.exists())
+            control.write_text("unexpected")
+            self.assertNotEqual(seal().returncode, 0)
+            self.assertEqual(control.read_text(), "unexpected")
+            control.unlink()
+            control.symlink_to(Path(directory) / "missing")
+            self.assertNotEqual(seal().returncode, 0)
+            self.assertTrue(control.is_symlink())
+
     def test_root_launcher_snapshots_only_manifest_pinned_payloads(self):
         loader = importlib.util.spec_from_file_location('native_installer', ROOT / 'deploy/mac-build/native_host.py')
         launcher = importlib.util.module_from_spec(loader)

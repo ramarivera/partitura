@@ -21,6 +21,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 # Direct-script loading also works in isolated importlib-based broker tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -46,6 +47,9 @@ MEMORY_LIMIT = os.environ.get("PARTITURA_SANDBOX_MEMORY", "8g")
 CPU_LIMIT = os.environ.get("PARTITURA_SANDBOX_CPUS", "4")
 PIDS_LIMIT = int(os.environ.get("PARTITURA_SANDBOX_PIDS", "2048"))
 EGRESS_PROXY_PORT = 3128
+EGRESS_MODE = os.environ.get("PARTITURA_SANDBOX_EGRESS_MODE", "public-web")
+if EGRESS_MODE not in ("public-web", "allowlist"):
+    raise ValueError("sandbox egress mode must be public-web or allowlist")
 MANAGE_FIREWALL = os.environ.get("PARTITURA_SANDBOX_MANAGE_FIREWALL", "false") == "true"
 IPTABLES = "/usr/bin/iptables"
 EGRESS_HOSTS = frozenset(
@@ -78,17 +82,49 @@ PRIVATE_EGRESS_ADDRESSES = private_egress_addresses(
 )
 
 
-def egress_addresses(host: str, addresses: set[str]) -> list[str]:
-    if host not in EGRESS_HOSTS or not addresses:
+def egress_addresses(host: str, addresses: set[str], port: int = 443) -> list[str]:
+    if port not in (80, 443) or not addresses or (EGRESS_MODE == "allowlist" and host not in EGRESS_HOSTS):
         raise ValueError("egress target is not allowed")
     normalized = {str(ipaddress.ip_address(value)) for value in addresses}
     pinned = PRIVATE_EGRESS_ADDRESSES.get(host)
     if pinned is not None:
-        if not normalized.issubset(pinned):
+        if port != 443 or not normalized.issubset(pinned):
             raise ValueError("egress DNS differs from approved address pins")
     elif any(not ipaddress.ip_address(value).is_global for value in normalized):
         raise ValueError("host resolved to a non-public address")
     return sorted(normalized)
+
+
+def proxy_target(header: bytes) -> tuple[str, int, bytes | None]:
+    """Parse a public web proxy request without forwarding proxy credentials."""
+    first, *lines = header[:-4].split(b"\r\n")
+    method, target, version = first.decode("ascii").split(" ")
+    if not re.fullmatch(r"[A-Z]+", method) or version not in ("HTTP/1.0", "HTTP/1.1"):
+        raise ValueError("invalid proxy request")
+    parsed = urlsplit("//" + target if method == "CONNECT" else target)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ValueError("invalid proxy authority")
+    port = parsed.port or (443 if method == "CONNECT" else 80)
+    if port not in (80, 443):
+        raise ValueError("proxy supports public HTTP and HTTPS only")
+    if method == "CONNECT":
+        if parsed.path or parsed.query:
+            raise ValueError("invalid CONNECT target")
+        return host, port, None
+    if parsed.scheme != "http" or port != 80:
+        raise ValueError("HTTP proxy requests must use an http URL on port 80")
+    path = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+    forwarded = [f"{method} {path} {version}".encode("ascii")]
+    for line in lines:
+        name, separator, _ = line.partition(b":")
+        if not separator or not name or name.strip() != name:
+            raise ValueError("invalid proxy header")
+        if name.lower() not in (b"host", b"proxy-authorization", b"proxy-connection", b"connection"):
+            forwarded.append(line)
+    authority = f"[{host}]" if ":" in host else host
+    forwarded.extend([f"Host: {authority}".encode("ascii"), b"Connection: close", b"", b""])
+    return host, port, b"\r\n".join(forwarded)
 
 
 def _firewall_tag() -> str:
@@ -994,7 +1030,7 @@ async def _stream_relay(
 async def _stream_egress(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: dict[str, Any], record: dict[str, Any] | None = None
 ) -> None:
-    if not EGRESS_HOSTS:
+    if EGRESS_MODE == "allowlist" and not EGRESS_HOSTS:
         raise ValueError("PARTITURA_SANDBOX_EGRESS_HOSTS must not be empty")
     session = _session(request.get("sessionId"))
     network = _network(session)
@@ -1046,26 +1082,35 @@ async def _stream_egress(
                 client_writer.write(b"HTTP/1.1 413 Request Too Large\r\nConnection: close\r\n\r\n")
                 await client_writer.drain()
                 return
-            first = header.split(b"\r\n", 1)[0].decode("ascii", "ignore")
-            match = re.fullmatch(r"CONNECT ([A-Za-z0-9.-]+):443 HTTP/1\.[01]", first)
-            host = match.group(1).lower() if match else ""
-            if not host or host not in EGRESS_HOSTS:
+            try:
+                host, port, forwarded = proxy_target(header)
+            except (ValueError, UnicodeError):
                 client_writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
                 await client_writer.drain()
                 return
             try:
                 answers = await asyncio.get_running_loop().getaddrinfo(
-                    host, 443, type=socket.SOCK_STREAM
+                    host, port, type=socket.SOCK_STREAM
                 )
-                addresses = egress_addresses(host, {answer[4][0] for answer in answers})
-                remote_reader, remote_writer = await asyncio.open_connection(addresses[0], 443)
+                addresses = egress_addresses(host, {answer[4][0] for answer in answers}, port)
+                for address in addresses:
+                    try:
+                        remote_reader, remote_writer = await asyncio.wait_for(asyncio.open_connection(address, port), 15)
+                        break
+                    except (OSError, TimeoutError):
+                        if address == addresses[-1]:
+                            raise
                 active_writers.add(remote_writer)
             except (OSError, ValueError):
                 client_writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
                 await client_writer.drain()
                 return
-            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            await client_writer.drain()
+            if forwarded is None:
+                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await client_writer.drain()
+            else:
+                remote_writer.write(forwarded)
+                await remote_writer.drain()
             await asyncio.gather(
                 pipe(client_reader, remote_writer),
                 pipe(remote_reader, client_writer),

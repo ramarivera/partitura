@@ -3,6 +3,7 @@
 set -euo pipefail
 umask 077
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export MISE_OFFLINE=true MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false
 
 fail() { printf 'base qualification failed: %s\n' "$1" >&2; exit 1; }
 [ "$#" -eq 3 ] || fail 'expected runner hash, qualifier hash, and guest user'
@@ -72,9 +73,8 @@ python_output=$(MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false "$mise" exe
 # Tart directory shares appear as mounts under /Volumes. The launcher also
 # starts jobs without any --dir/share options; this check catches a base that
 # was prepared with a host directory still attached.
-if mount | awk '$3 ~ /^\/Volumes\/[^/]+/ { found=1 } tolower($0) ~ /virtiofs|9pfs|smbfs/ { found=1 } END { exit !found }'; then
-  fail 'guest has a mounted host share'
-fi
+mount_check=$(mount | awk 'index($3, "/Volumes/") == 1 { found=1 } tolower($0) ~ /virtiofs|9pfs|smbfs/ { found=1 } END { print found ? "host-share" : "none" }')
+[ "$mount_check" = none ] || fail 'guest has a mounted host share'
 
 printf 'PARTITURA_NATIVE_BASE_QUALIFIED os=Darwin arch=arm64 guestUser=%s developerTools=verified runnerSha256=%s qualifierSha256=%s miseSha256=%s miseVersion=%s nodeVersion=%s pythonVersion=%s\n' \
   "$guest_user" "$runner_sha" "$qualifier_sha" "$mise_sha" "$mise_version" "$node_version" "$python_version"

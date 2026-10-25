@@ -47,6 +47,36 @@ class CaptureWriter:
 
 
 class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
+    def test_public_web_allows_unlisted_registries_but_preserves_private_pins(self):
+        with patch.object(broker, "EGRESS_MODE", "public-web"), patch.object(broker, "EGRESS_HOSTS", frozenset()), patch.object(broker, "PRIVATE_EGRESS_ADDRESSES", {"model.example": frozenset({"100.81.163.26"})}):
+            for host in ("pypi.org", "files.pythonhosted.org", "sh.rustup.rs", "tuf-repo-cdn.sigstore.dev", "new-mirror.example"):
+                for port in (80, 443):
+                    self.assertEqual(broker.egress_addresses(host, {"1.1.1.1"}, port), ["1.1.1.1"])
+            for address in ("127.0.0.1", "10.0.0.1", "169.254.169.254", "100.81.163.26", "::1", "fd00::1"):
+                with self.assertRaises(ValueError):
+                    broker.egress_addresses("unlisted.example", {address})
+            self.assertEqual(broker.egress_addresses("model.example", {"100.81.163.26"}), ["100.81.163.26"])
+            with self.assertRaises(ValueError):
+                broker.egress_addresses("model.example", {"100.81.163.26"}, 80)
+            with self.assertRaises(ValueError):
+                broker.egress_addresses("new-mirror.example", {"1.1.1.1", "10.0.0.1"})
+            with self.assertRaises(ValueError):
+                broker.egress_addresses("new-mirror.example", {"1.1.1.1"}, 22)
+        with patch.object(broker, "EGRESS_MODE", "allowlist"), patch.object(broker, "EGRESS_HOSTS", frozenset({"pypi.org"})):
+            self.assertEqual(broker.egress_addresses("pypi.org", {"1.1.1.1"}), ["1.1.1.1"])
+            with self.assertRaises(ValueError):
+                broker.egress_addresses("unlisted.example", {"1.1.1.1"})
+
+    def test_proxy_parses_connect_and_rewrites_http_without_proxy_credentials(self):
+        self.assertEqual(broker.proxy_target(b"CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org\r\n\r\n"), ("pypi.org", 443, None))
+        self.assertEqual(broker.proxy_target(b"CONNECT [2606:4700:4700::1111]:443 HTTP/1.1\r\n\r\n"), ("2606:4700:4700::1111", 443, None))
+        host, port, header = broker.proxy_target(b"GET http://packages.example/path?q=1 HTTP/1.1\r\nHost: wrong.example\r\nProxy-Authorization: Basic secret\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n")
+        self.assertEqual((host, port), ("packages.example", 80))
+        self.assertEqual(header, b"GET /path?q=1 HTTP/1.1\r\nAccept: */*\r\nHost: packages.example\r\nConnection: close\r\n\r\n")
+        for target in ("CONNECT example.com:22", "GET https://example.com/", "GET http://user:pass@example.com/", "GET http://example.com:8080/", "GET /relative", "CONNECT example.com:443/path"):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                broker.proxy_target((target + " HTTP/1.1\r\n\r\n").encode())
+
     def test_private_egress_requires_exact_host_and_address_pins(self):
         with patch.object(broker, "EGRESS_HOSTS", frozenset({"model.example", "packages.example"})):
             pins = broker.private_egress_addresses('{"model.example":["100.81.163.26"]}')
@@ -767,6 +797,71 @@ class SandboxBrokerTests(unittest.IsolatedAsyncioTestCase):
                     guest_writer.wait_closed.assert_awaited_once_with()
                 finally:
                     existing.close()
+
+    async def test_public_web_proxy_forwards_http_and_connect_and_denies_private_dns(self):
+        received = []
+
+        async def origin(reader, writer):
+            received.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(http_response("200 OK", b"registry response"))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(origin, "127.0.0.1", 0)
+        port = upstream.sockets[0].getsockname()[1]
+        connect = asyncio.open_connection
+        destinations = []
+
+        async def dial(address, target_port):
+            destinations.append((address, target_port))
+            return await connect("127.0.0.1", port)
+
+        async def resolve(host, target_port, **kwargs):
+            address = "127.0.0.1" if host == "private.example" else "1.1.1.1"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, target_port))]
+
+        control = asyncio.StreamReader()
+        status = CaptureWriter()
+        with (
+            patch.object(broker, "_run", side_effect=["127.0.0.1"] * 2),
+            patch.object(broker, "EGRESS_MODE", "public-web"),
+            patch.object(broker, "EGRESS_HOSTS", frozenset()),
+            patch.object(broker, "EGRESS_PROXY_PORT", 0),
+            patch.object(asyncio.get_running_loop(), "getaddrinfo", side_effect=resolve),
+            patch.object(broker.asyncio, "open_connection", side_effect=dial),
+        ):
+            task = asyncio.create_task(broker._stream_egress(control, status, {"sessionId": "session-web"}))
+            try:
+                async with asyncio.timeout(2):
+                    while b"\n" not in status.data:
+                        await asyncio.sleep(0)
+                    proxy = json.loads(bytes(status.data).split(b"\n", 1)[0])["result"]
+                    for kind in ("http", "connect", "private"):
+                        reader, writer = await connect(proxy["address"], proxy["port"])
+                        try:
+                            if kind == "connect":
+                                writer.write(b"CONNECT registry.example:443 HTTP/1.1\r\n\r\n")
+                                await writer.drain()
+                                self.assertIn(b"200 Connection Established", await reader.readuntil(b"\r\n\r\n"))
+                                writer.write(b"GET /tls-fixture HTTP/1.1\r\nHost: registry.example\r\n\r\n")
+                            else:
+                                host = "private.example" if kind == "private" else "registry.example"
+                                writer.write(f"GET http://{host}/package HTTP/1.1\r\nProxy-Authorization: Basic hidden\r\n\r\n".encode())
+                            await writer.drain()
+                            response = await reader.read()
+                            self.assertIn(b"403 Forbidden" if kind == "private" else b"registry response", response)
+                        finally:
+                            writer.close()
+                            await writer.wait_closed()
+                    self.assertEqual(destinations, [("1.1.1.1", 80), ("1.1.1.1", 443)])
+                    self.assertTrue(received[0].startswith(b"GET /package HTTP/1.1\r\n"))
+                    self.assertNotIn(b"Proxy-Authorization", received[0])
+            finally:
+                control.feed_eof()
+                await asyncio.wait_for(task, 2)
+                upstream.close()
+                await upstream.wait_closed()
 
     async def test_egress_partial_header_closes_client_before_control_ends(self):
         control_reader = asyncio.StreamReader()

@@ -345,6 +345,26 @@ case "$qualification_output" in PARTITURA_NATIVE_BASE_QUALIFIED*) ;; *) fail 'ge
 "$tart" stop "$base_name"
 running=0
 wait "$tart_run_pid" 2>/dev/null || true
+# Tart 2.41 may leave its Unix control socket after the VMM has exited.
+# Remove only that owned socket before sealing the stopped VM, never arbitrary
+# unexpected files or a symlink. Persistent base hashing still rejects those.
+/usr/bin/python3 - "$base_vm/control.sock" <<'PY'
+import errno, os, socket, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    info = path.lstat()
+except FileNotFoundError:
+    pass
+else:
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+        raise SystemExit("unexpected Tart control socket type or owner")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1)
+        if probe.connect_ex(str(path)) != errno.ECONNREFUSED:
+            raise SystemExit("Tart control socket is still active or cannot be verified stale")
+    path.unlink()
+PY
 base_sha=$(/usr/bin/python3 - "$base_vm" <<'PY'
 import hashlib, os, stat, sys
 from pathlib import Path
