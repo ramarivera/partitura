@@ -338,7 +338,8 @@ export const makeT3DeviceBackup = (
             const launched = yield* request("orchestration.launchThread", {
               commandId: `${threadId}:launch`,
               threadId,
-              reuseExistingThread: true,
+              // This is a create, replayed by its stable command id. T3's reuse
+              // flag requires an existing empty thread and rejects first open.
               projectId,
               title: `Partitura device ${sessionId}`,
               modelSelection: {

@@ -51,8 +51,11 @@ const fixture = (
           sessions,
         };
       const args = payload as Record<string, unknown>;
-      if (method === "orchestration.launchThread")
+      if (method === "orchestration.launchThread") {
+        if (args.reuseExistingThread === true)
+          throw new Error("Cannot reuse a thread that hasn't been created");
         return { threadId: args.threadId };
+      }
       if (method === "device.open") {
         const session = {
           hostId: String(args.hostId),
@@ -243,6 +246,7 @@ describe("T3 remote device backup", () => {
       runtimeMode: "approval-required",
     });
     expect(launch?.payload).not.toHaveProperty("initialMessage");
+    expect(launch?.payload).not.toHaveProperty("reuseExistingThread");
     await Effect.runPromise(
       f.backup.call("org-a", "run-a", {
         operation: "launch-app",
