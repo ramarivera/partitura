@@ -1,4 +1,4 @@
-/** Optional simulator control through an existing T3 server. No build or shell execution. */
+/** Optional simulator control and inspection through an existing T3 server. */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
@@ -8,8 +8,10 @@ import {
   connectT3,
   type T3RpcConnection,
   T3RpcError,
+  t3Endpoint,
 } from "../drivers/t3/rpc-client.js";
-import type { RpcHostToolDefinition } from "./rpc-worker.js";
+import { readBoundedBody } from "./bounded-body.js";
+import type { RpcHostToolDefinition, RpcHostToolResult } from "./rpc-worker.js";
 
 const ConfigSchema = Schema.Struct({
   baseUrl: Schema.String,
@@ -83,6 +85,8 @@ const Arguments = Schema.Struct({
     "detail",
     "launch-app",
     "terminate-app",
+    "screenshot",
+    "accessibility",
     "close",
   ]),
   hostId: Schema.optional(Schema.String),
@@ -94,7 +98,7 @@ export const t3DeviceBackupTool: RpcHostToolDefinition = {
   name: "t3_device_backup",
   label: "T3: remote device backup",
   description:
-    "Use an existing T3 server's simulators as a backup for native device checks. The primary disposable VM build route remains separate. List first; open only a stopped unclaimed simulator. Device actions and cleanup are bound to this run. This tool doesn't build, install apps, or execute shell commands.",
+    "Use an existing T3 server's simulators as a backup for native device checks. The primary disposable VM build route remains separate. List first; open only a stopped unclaimed simulator. Device actions and cleanup are bound to this run. Screenshot and accessibility operations inspect the current app through T3. This tool doesn't build, install apps, or execute shell commands.",
   parameters: {
     type: "object",
     additionalProperties: false,
@@ -108,6 +112,8 @@ export const t3DeviceBackupTool: RpcHostToolDefinition = {
           "detail",
           "launch-app",
           "terminate-app",
+          "screenshot",
+          "accessibility",
           "close",
         ],
       },
@@ -134,7 +140,11 @@ type Request = T3RpcConnection["request"];
 /** The optional transport seam lets tests exercise the same ownership and request contract. */
 export const makeT3DeviceBackup = (
   config: T3DeviceBackupConfig,
-  transport?: { readonly request: Request; readonly projectId: string },
+  transport?: {
+    readonly request: Request;
+    readonly projectId: string;
+    readonly fetch?: (url: URL, init: RequestInit) => Promise<Response>;
+  },
 ) => {
   const gate = Semaphore.makeUnsafe(1);
   const baseUrl = new URL(config.baseUrl);
@@ -171,6 +181,76 @@ export const makeT3DeviceBackup = (
         }),
       ),
     );
+  const inspectDevice = (
+    device: typeof Device.Type,
+    operation: "screenshot" | "accessibility",
+  ) =>
+    Effect.gen(function* () {
+      const credential = yield* token;
+      const vendor = device.platform === "ios" ? "serve-sim" : "serve-emu";
+      const path =
+        operation === "screenshot"
+          ? "/api/screenshot"
+          : device.platform === "ios"
+            ? `/helper/${encodeURIComponent(device.id)}/ax`
+            : "/api/accessibility";
+      const url = t3Endpoint(
+        baseUrl,
+        `/api/device-hub/vendor/${vendor}${path}`,
+      );
+      url.searchParams.set("hostId", device.hostId);
+      if (operation === "screenshot" || device.platform === "android")
+        url.searchParams.set("device", device.id);
+      return yield* Effect.tryPromise({
+        try: async () => {
+          const response = await (transport?.fetch ?? fetch)(url, {
+            method: operation === "screenshot" ? "POST" : "GET",
+            headers: { authorization: `Bearer ${Redacted.value(credential)}` },
+            redirect: "manual",
+            signal: AbortSignal.timeout(20_000),
+          });
+          if (!response.ok) {
+            await response.body?.cancel();
+            throw new Error("Device inspection failed");
+          }
+          // Leave room for base64 and the host-tool envelope within the MCP limit.
+          const body = await readBoundedBody(response, 512 * 1024);
+          if (operation === "screenshot") {
+            if (
+              !Buffer.from(body.subarray(0, 8)).equals(
+                Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+              )
+            )
+              throw new Error("Invalid PNG response");
+            return {
+              hostId: device.hostId,
+              deviceId: device.id,
+              screenshot: {
+                mimeType: "image/png" as const,
+                data: Buffer.from(body).toString("base64"),
+              },
+            };
+          }
+          const tree: unknown = JSON.parse(new TextDecoder().decode(body));
+          if (
+            device.platform === "ios"
+              ? !Array.isArray(tree)
+              : typeof tree !== "object" ||
+                tree === null ||
+                !("nodes" in tree) ||
+                !Array.isArray(tree.nodes)
+          )
+            throw new Error("Invalid accessibility response");
+          return {
+            hostId: device.hostId,
+            deviceId: device.id,
+            accessibility: tree,
+          };
+        },
+        catch: () =>
+          refused("T3 device inspection failed or exceeded its response limit"),
+      });
+    });
   const hostsFor = (organizationId: string) =>
     new Set(config.organizationHosts[organizationId] ?? []);
   const state = (request: Request) =>
@@ -311,6 +391,11 @@ export const makeT3DeviceBackup = (
           if (args.operation === "detail")
             return yield* request("device.detail", target);
           if (
+            args.operation === "screenshot" ||
+            args.operation === "accessibility"
+          )
+            return yield* inspectDevice(device, args.operation);
+          if (
             !args.appId ||
             !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u.test(args.appId)
           )
@@ -353,5 +438,39 @@ export const makeT3DeviceBackup = (
         }),
       );
     },
+  };
+};
+
+const ScreenshotResult = Schema.Struct({
+  hostId: Schema.String,
+  deviceId: Schema.String,
+  screenshot: Schema.Struct({
+    mimeType: Schema.Literal("image/png"),
+    data: Schema.String,
+  }),
+});
+
+/** Preserve images as host-tool image content rather than dumping base64 into text. */
+export const t3DeviceBackupResult = (result: unknown): RpcHostToolResult => {
+  if (Schema.is(ScreenshotResult)(result))
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            hostId: result.hostId,
+            deviceId: result.deviceId,
+          }),
+        },
+        {
+          type: "image",
+          mimeType: result.screenshot.mimeType,
+          data: result.screenshot.data,
+        },
+      ],
+    };
+  return {
+    content: [{ type: "text", text: JSON.stringify(result) }],
+    details: result,
   };
 };

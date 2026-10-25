@@ -1,9 +1,12 @@
+import { writeFileSync } from "node:fs";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Result } from "effect";
 import {
   makeT3DeviceBackup,
   parseT3DeviceBackupConfig,
+  t3DeviceBackupResult,
 } from "../src/services/t3-device-backup.js";
+import { suitePaths } from "./fixtures/paths.js";
 
 const config = {
   baseUrl: "https://t3.example.test",
@@ -13,7 +16,13 @@ const config = {
   instanceId: "codex",
   model: "configured-model",
 };
-const fixture = () => {
+const testPath = suitePaths();
+const credentialPath = testPath("t3-test-token.txt");
+writeFileSync(credentialPath, "dedicated-test-token");
+const fixture = (
+  http?: (url: URL, init: RequestInit) => Promise<Response>,
+  platform = "ios",
+) => {
   const requests: Array<{ method: string; payload: unknown }> = [];
   let sessions: Array<{ hostId: string; deviceId: string; threadId: string }> =
     [];
@@ -22,7 +31,7 @@ const fixture = () => {
   const device = {
     hostId: "mac",
     id: "sim-a",
-    platform: "ios",
+    platform,
     name: "iPhone",
     version: "26.4",
     physical: false,
@@ -63,10 +72,14 @@ const fixture = () => {
     });
   return {
     requests,
-    backup: makeT3DeviceBackup(config, {
-      request,
-      projectId: "device-project",
-    }),
+    backup: makeT3DeviceBackup(
+      { ...config, tokenFile: credentialPath },
+      {
+        request,
+        ...(http ? { fetch: http } : {}),
+        projectId: "device-project",
+      },
+    ),
     get sessions() {
       return sessions;
     },
@@ -84,6 +97,133 @@ const fixture = () => {
 const target = { hostId: "mac", deviceId: "sim-a" };
 
 describe("T3 remote device backup", () => {
+  it("inspects only run-owned devices through authenticated bounded T3 proxy requests", async () => {
+    const requests: Array<{
+      url: string;
+      method: string | undefined;
+      authorization: string | null;
+      redirect: string | undefined;
+    }> = [];
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==",
+      "base64",
+    );
+    const f = fixture(async (url, init) => {
+      requests.push({
+        url: url.toString(),
+        method: init.method,
+        authorization: new Headers(init.headers).get("authorization"),
+        redirect: init.redirect,
+      });
+      return url.pathname.endsWith("/ax")
+        ? Response.json([{ AXLabel: "Settings", children: [] }])
+        : new Response(png);
+    });
+    await expect(
+      Effect.runPromise(
+        f.backup.call("org-a", "other-run", {
+          operation: "screenshot",
+          ...target,
+        }),
+      ),
+    ).rejects.toThrow();
+    expect(requests).toEqual([]);
+    await Effect.runPromise(
+      f.backup.call("org-a", "run-a", { operation: "open", ...target }),
+    );
+    const image = await Effect.runPromise(
+      f.backup.call("org-a", "run-a", { operation: "screenshot", ...target }),
+    );
+    const result = t3DeviceBackupResult(image);
+    expect(result.content).toEqual([
+      { type: "text", text: JSON.stringify(target) },
+      { type: "image", mimeType: "image/png", data: png.toString("base64") },
+    ]);
+    expect(result.details).toBeUndefined();
+    const ax = await Effect.runPromise(
+      f.backup.call("org-a", "run-a", {
+        operation: "accessibility",
+        ...target,
+      }),
+    );
+    expect(ax).toMatchObject({ accessibility: [{ AXLabel: "Settings" }] });
+    expect(requests).toEqual([
+      {
+        url: "https://t3.example.test/api/device-hub/vendor/serve-sim/api/screenshot?hostId=mac&device=sim-a",
+        method: "POST",
+        authorization: "Bearer dedicated-test-token",
+        redirect: "manual",
+      },
+      {
+        url: "https://t3.example.test/api/device-hub/vendor/serve-sim/helper/sim-a/ax?hostId=mac",
+        method: "GET",
+        authorization: "Bearer dedicated-test-token",
+        redirect: "manual",
+      },
+    ]);
+    f.sessions = [{ ...target, threadId: "foreign" }];
+    await expect(
+      Effect.runPromise(
+        f.backup.call("org-a", "run-a", {
+          operation: "accessibility",
+          ...target,
+        }),
+      ),
+    ).rejects.toThrow();
+    expect(requests).toHaveLength(2);
+  });
+
+  it("uses the existing Android accessibility endpoint for owned emulators", async () => {
+    let requested = "";
+    const f = fixture(async (url) => {
+      requested = url.toString();
+      return Response.json({ nodes: [{ text: "Settings" }] });
+    }, "android");
+    await Effect.runPromise(
+      f.backup.call("org-a", "run-a", { operation: "open", ...target }),
+    );
+    const result = await Effect.runPromise(
+      f.backup.call("org-a", "run-a", {
+        operation: "accessibility",
+        ...target,
+      }),
+    );
+    expect(result).toMatchObject({
+      accessibility: { nodes: [{ text: "Settings" }] },
+    });
+    expect(requested).toBe(
+      "https://t3.example.test/api/device-hub/vendor/serve-emu/api/accessibility?hostId=mac&device=sim-a",
+    );
+  });
+
+  it("refuses redirected, malformed and oversized device inspection responses", async () => {
+    const responses = [
+      new Response(null, {
+        status: 302,
+        headers: { location: "https://foreign.test" },
+      }),
+      new Response("not PNG"),
+      new Response("x".repeat(512 * 1024 + 1)),
+      Response.json({ error: "AX unavailable" }),
+    ];
+    for (let index = 0; index < responses.length; index++) {
+      const response = responses[index];
+      if (!response) throw new Error("Missing response fixture");
+      const f = fixture(async () => response);
+      await Effect.runPromise(
+        f.backup.call("org-a", "run-a", { operation: "open", ...target }),
+      );
+      await expect(
+        Effect.runPromise(
+          f.backup.call("org-a", "run-a", {
+            operation: index === 3 ? "accessibility" : "screenshot",
+            ...target,
+          }),
+        ),
+      ).rejects.toThrow("inspection failed");
+    }
+  });
+
   it("uses existing T3 discovery and control with a run-owned idle thread and no inference", async () => {
     const f = fixture();
     const listed = await Effect.runPromise(

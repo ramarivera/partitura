@@ -123,7 +123,11 @@ import {
   WorkspaceRepo,
 } from "./store/repositories.js";
 import { WorkerIdentityRepo } from "./store/worker-identity-repo.js";
-import { makeT3DeviceBackup, t3DeviceBackupTool } from "./t3-device-backup.js";
+import {
+  makeT3DeviceBackup,
+  t3DeviceBackupResult,
+  t3DeviceBackupTool,
+} from "./t3-device-backup.js";
 import { startWorkerMcpProxy } from "./worker-mcp-proxy.js";
 import {
   seedWorkerProfileFiles,
@@ -2052,7 +2056,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     run.sessionId,
                     raw,
                   );
-                  return textResult(JSON.stringify(result), result);
+                  return t3DeviceBackupResult(result);
                 }).pipe(
                   Effect.catch(() =>
                     Effect.succeed(

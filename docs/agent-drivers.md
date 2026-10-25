@@ -247,8 +247,11 @@ The provider and model fields identify that idle thread's existing selection.
 
 The tool lists simulators on configured hosts, opens a stopped unclaimed
 simulator, reads device details, launches or terminates an installed app, and
-closes the run's device. It refuses physical devices, foreign hosts and other
-threads' sessions. Cancellation and worker cleanup release the run's sessions,
+closes the run's device. Screenshot and accessibility operations use the existing
+authenticated T3 device proxy after checking run ownership. Screenshot results
+remain image content through the worker bridge. Inspection bodies have a 512 KiB
+streaming limit and a 20-second timeout; redirects are refused. It refuses
+physical devices, foreign hosts and other threads' sessions. Cancellation and worker cleanup release the run's sessions,
 including ownership recovered from T3 after a gateway restart. Cleanup leaves
 a simulator running if another thread has attached to it. Existing T3 device
 support and agent consent must already be enabled.
@@ -256,6 +259,7 @@ support and agent consent must already be enabled.
 This supplements the disposable VM route for device checks. T3's existing
 remote-device bridge provides discovery, streaming and control; it doesn't
 provide remote Xcode builds, app transfer or Metro forwarding. This host tool
-currently exposes device lifecycle and installed-app actions only. Build,
-install, screenshots and accessibility interaction aren't implemented by this
-tool. Native build acceptance and live backup activation remain separate checks.
+exposes device lifecycle, installed-app actions, screenshots and accessibility
+inspection. Build, install and interactive taps or text input aren't implemented
+by this tool. Native build acceptance and live backup activation remain separate
+checks.
