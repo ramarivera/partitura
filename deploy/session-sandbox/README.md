@@ -67,6 +67,16 @@ runs SSHFS with `allow_other`, `default_permissions`, `uid`/`gid` mapping,
 `nodev` and `nosuid`. Workspace programs can execute. Session readiness requires
 the mount, not just a successful control-agent ping.
 
+The guest mount uses `no_contain_symlinks` because Mise records absolute config
+links and package managers create parent-relative dependency links. Debian's
+SSHFS containment default rejects both forms. This option permits links to
+resolve elsewhere in the disposable guest, subject to its filesystem permissions.
+It does not expose host paths beyond the session's existing SFTP jail. Keep the
+host jail, session UID, `default_permissions`, `nodev` and `nosuid` controls.
+Changing this containment setting requires operator approval before deploying
+the guest image. The live qualification checks absolute and parent-relative
+links together with the existing cross-session denial tests.
+
 An immutable host Python helper enters the numeric session identity before
 executing the VMM or SFTP server. It permanently sets all user/group IDs,
 clears every capability set and enables `no_new_privs`. This avoids depending

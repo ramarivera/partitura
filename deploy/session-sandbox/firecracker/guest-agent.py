@@ -196,8 +196,11 @@ class Agent:
                     try:
                         await asyncio.get_running_loop().sock_connect(channel, (2, target_port))
                         channel.setblocking(True)
+                        # Repository tools need absolute and parent-relative links.
+                        # This mount exists only in the session VM; the server is
+                        # chrooted to that session and all execs drop to its UID.
                         self.workspace_process = await asyncio.create_subprocess_exec(
-                            "sshfs", "-f", "-o", f"slave,allow_other,default_permissions,uid={self.uid},gid={self.uid},nodev,nosuid,dir_cache=no,attr_timeout=0,entry_timeout=0,negative_timeout=0",
+                            "sshfs", "-f", "-o", f"slave,allow_other,default_permissions,uid={self.uid},gid={self.uid},nodev,nosuid,no_contain_symlinks,dir_cache=no,attr_timeout=0,entry_timeout=0,negative_timeout=0",
                             "ignored:/workspace", str(WORKSPACE),
                             stdin=channel, stdout=channel, stderr=asyncio.subprocess.DEVNULL,
                             env=BASE_ENV,

@@ -437,6 +437,19 @@ timeout 120 /bin/sh -ec '
         print(f"LIVE {runtime}: passed; owned runtime resources absent", flush=True)
 
     async def live_workspace(self, session, workspace):
+        links = """import os
+from pathlib import Path
+root=Path('/workspace/symlink-check')
+root.mkdir()
+(root/'target').write_text('session-owned')
+(root/'nested').mkdir()
+for link,target in [(root/'absolute','/workspace/symlink-check/target'),
+                    (root/'nested/parent','../target')]:
+    link.symlink_to(target)
+    assert os.readlink(link)==target
+    assert link.read_text()=='session-owned'
+"""
+        await self.python(session, self.uid, links)
         (workspace / "host-live").write_text("initial")
         os.chown(workspace / "host-live", self.uid, self.uid)
         code = "from pathlib import Path; import time; p=Path('/workspace/host-live'); assert p.read_text()=='initial'; Path('/workspace/worker-ready').write_text('ready'); deadline=time.monotonic()+20\nwhile p.read_text()!='host-update':\n assert time.monotonic()<deadline; time.sleep(.05)\nPath('/workspace/worker-live').write_text('host-update-seen')"
