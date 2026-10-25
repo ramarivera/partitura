@@ -1,5 +1,6 @@
 import { createConnection, isIPv4 } from "node:net";
 import { dirname } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Effect, Schema } from "effect";
 import type { WorkerSandboxMode } from "./config.js";
@@ -232,9 +233,12 @@ const openBrokerRelay = (
         readonly targetPort: number;
       }
     | { readonly operation: "egress"; readonly sessionId: string },
-): Promise<SessionSandboxRelay> =>
+): Promise<SessionSandboxRelay & { readonly closed: Promise<void> }> =>
   new Promise((resolve, reject) => {
     const socket = createConnection({ path: socketPath });
+    const closed = new Promise<void>((resolveClosed) => {
+      socket.once("close", () => resolveClosed());
+    });
     let data = "";
     let settled = false;
     socket.setEncoding("utf8");
@@ -268,6 +272,7 @@ const openBrokerRelay = (
         resolve({
           baseUrl: `http://${address}:${port}`,
           stop: () => socket.end(),
+          closed,
         });
       } catch (error) {
         settled = true;
@@ -297,6 +302,45 @@ const openBrokerRelay = (
       reject(new Error("Sandbox broker relay request timed out"));
     });
   });
+
+const openResilientEgressProxy = async (
+  socketPath: string,
+  sessionId: string,
+): Promise<SessionSandboxRelay> => {
+  const request = { operation: "egress" as const, sessionId };
+  let current = await openBrokerRelay(socketPath, request);
+  const baseUrl = current.baseUrl;
+  const lifetime = new AbortController();
+  const reconnect = async () => {
+    await current.closed;
+    let retryDelay = 100;
+    while (!lifetime.signal.aborted) {
+      try {
+        await delay(retryDelay, undefined, { signal: lifetime.signal });
+        if (lifetime.signal.aborted) return;
+        const next = await openBrokerRelay(socketPath, request);
+        if (lifetime.signal.aborted || next.baseUrl !== baseUrl) {
+          next.stop();
+          if (lifetime.signal.aborted) return;
+          throw new Error("Sandbox egress address changed during recovery");
+        }
+        current = next;
+        retryDelay = 100;
+        await current.closed;
+      } catch {
+        retryDelay = Math.min(retryDelay * 2, 2_000);
+      }
+    }
+  };
+  void reconnect();
+  return {
+    baseUrl,
+    stop: () => {
+      lifetime.abort();
+      current.stop();
+    },
+  };
+};
 
 export const makeSessionSandboxRuntime = (
   socketPath: string,
@@ -478,11 +522,7 @@ export const makeSessionSandboxRuntime = (
     function* (sessionId) {
       const operation = "egress" as const;
       return yield* Effect.tryPromise({
-        try: () =>
-          openBrokerRelay(socketPath, {
-            operation,
-            sessionId,
-          }),
+        try: () => openResilientEgressProxy(socketPath, sessionId),
         catch: () =>
           new SandboxBrokerError({
             message: "Sandbox egress proxy request failed",

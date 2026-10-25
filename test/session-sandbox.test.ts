@@ -1,12 +1,14 @@
 import { mkdir, readFile, stat, unlink } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer, type Socket } from "node:net";
 import { dirname } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import {
   makeSessionSandboxRuntime,
   type SandboxBrokerRequest,
+  type SessionSandboxRelay,
   sandboxBrokerRequestTimeoutMs,
   sandboxContainerName,
   sandboxEnvironment,
@@ -297,6 +299,60 @@ describe("session sandbox", () => {
           await new Promise<void>((resolve, reject) =>
             server.close((error) => (error ? reject(error) : resolve())),
           );
+          await unlink(socketPath).catch(() => undefined);
+        }
+      }),
+  );
+
+  it.live(
+    "restores a lost egress lease and stops retrying after session cleanup",
+    () =>
+      Effect.promise(async () => {
+        const socketPath = paths("sandbox-egress-recovery.sock");
+        await mkdir(dirname(socketPath), { recursive: true });
+        const sockets: Socket[] = [];
+        const requests: unknown[] = [];
+        const server = createServer((socket) => {
+          sockets.push(socket);
+          socket.once("data", (data) => {
+            requests.push(JSON.parse(data.toString()));
+            socket.write(
+              `${JSON.stringify({ ok: true, result: { address: "127.0.0.1", port: 3128 } })}\n`,
+            );
+          });
+          socket.on("end", () => socket.end());
+        });
+        await new Promise<void>((resolve) =>
+          server.listen(socketPath, resolve),
+        );
+        let relay: SessionSandboxRelay | undefined;
+        try {
+          relay = await Effect.runPromise(
+            makeSessionSandboxRuntime(socketPath).openEgressProxy(
+              "session-egress",
+            ),
+          );
+          expect(relay.baseUrl).toBe("http://127.0.0.1:3128");
+          const first = sockets[0];
+          if (!first) throw new Error("Initial broker connection missing");
+          first.destroy();
+          for (let attempt = 0; requests.length < 2 && attempt < 100; attempt++)
+            await delay(10);
+          expect(requests).toEqual([
+            { operation: "egress", sessionId: "session-egress" },
+            { operation: "egress", sessionId: "session-egress" },
+          ]);
+          const recovered = sockets[1];
+          if (!recovered)
+            throw new Error("Recovered broker connection missing");
+          recovered.destroy();
+          relay.stop();
+          await delay(250);
+          expect(sockets).toHaveLength(2);
+        } finally {
+          relay?.stop();
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
           await unlink(socketPath).catch(() => undefined);
         }
       }),
