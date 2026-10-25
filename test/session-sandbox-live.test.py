@@ -353,6 +353,14 @@ class SandboxLiveTests(unittest.IsolatedAsyncioTestCase):
         await self.execute(session, self.uid, ["/bin/sh", "-ec", """
 mkdir -p /workspace/.omp-home
 git init -q
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Add File: .omp-home/patch-helper-probe
++Worker patch helper verified.
+*** End Patch
+PATCH
+test "$(cat .omp-home/patch-helper-probe)" = 'Worker patch helper verified.'
+rm .omp-home/patch-helper-probe
 mise exec -- node --version
 mise exec -- python --version
 timeout 120 /bin/sh -ec '
