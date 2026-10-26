@@ -227,6 +227,17 @@ and byte count. T3 receives the tools through its per-session MCP endpoint.
 Host setup and live acceptance requirements are in
 `deploy/mac-build/README.md`; source tests don't qualify a live Mac host.
 
+An independent backup builder uses `NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE` and
+`NATIVE_BUILD_BACKUP_SCRATCH_ROOT`, with separate paths from the primary. Its
+SSH config uses the same `Host partitura-native` alias pointed at the dedicated
+MacBook build account, with its own key and host pin. Each host requires separate
+qualification. Select `builder: "backup"` in any of the four native tools and
+keep that selection for the job's status, artifact and cancel calls. Omitting
+`builder` selects `"primary"`. The gateway never retries on another host. Jobs,
+recovery, cancellation and shutdown cleanup use the selected host's own client
+and store. This builds an artifact in the backup VM; simulator installation
+still requires the separate T3 ownership and install integration below.
+
 ## Optional existing T3 device backup
 
 `T3_DEVICE_BACKUP_CONFIG_JSON` or its `_FILE` alternative enables the

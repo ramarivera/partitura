@@ -134,6 +134,8 @@ export interface GatewayConfigShape {
   readonly sessionSandboxBrokerSocketPath?: string | undefined;
   /** Gateway-only SSH transport for optional native build host tools. */
   readonly nativeBuild?: NativeBuildConfig | undefined;
+  /** Explicit second builder, with its own dedicated transport and job store. */
+  readonly nativeBuildBackup?: NativeBuildConfig | undefined;
   readonly t3DeviceBackup?: T3DeviceBackupConfig | undefined;
   /** Present only when T3_MODE or T3_BASE_URL is set. */
   readonly t3Driver?: T3DriverConfig;
@@ -357,6 +359,24 @@ const GatewayConfigValues = Config.all({
   ),
   nativeBuildScratchRoot: Config.option(
     Config.String("NATIVE_BUILD_SCRATCH_ROOT"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildBackupSshConfigFile: Config.option(
+    Config.String("NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildBackupScratchRoot: Config.option(
+    Config.String("NATIVE_BUILD_BACKUP_SCRATCH_ROOT"),
   ).pipe(
     Config.map((value) =>
       Option.isSome(value) && value.value.trim().length > 0
@@ -1003,6 +1023,23 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
         return yield* configFailure(
           "NATIVE_BUILD_SSH_CONFIG_FILE and NATIVE_BUILD_SCRATCH_ROOT must be configured together",
         );
+      if (
+        (values.nativeBuildBackupSshConfigFile === undefined) !==
+        (values.nativeBuildBackupScratchRoot === undefined)
+      )
+        return yield* configFailure(
+          "NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE and NATIVE_BUILD_BACKUP_SCRATCH_ROOT must be configured together",
+        );
+      if (
+        values.nativeBuildBackupSshConfigFile !== undefined &&
+        (values.nativeBuildSshConfigFile === undefined ||
+          values.nativeBuildBackupSshConfigFile ===
+            values.nativeBuildSshConfigFile ||
+          values.nativeBuildBackupScratchRoot === values.nativeBuildScratchRoot)
+      )
+        return yield* configFailure(
+          "The backup native builder requires a primary configuration and separate transport and scratch paths",
+        );
       if (t3Driver?.connection._tag === "Launch") {
         // Launched daemons only get the proxy client key, like OMP workers.
         if (routing.cliproxyApiBaseUrl === undefined)
@@ -1026,6 +1063,15 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
               },
             }),
         ...routing,
+        ...(values.nativeBuildBackupSshConfigFile === undefined ||
+        values.nativeBuildBackupScratchRoot === undefined
+          ? {}
+          : {
+              nativeBuildBackup: {
+                sshConfigFile: values.nativeBuildBackupSshConfigFile,
+                scratchRoot: values.nativeBuildBackupScratchRoot,
+              },
+            }),
         ...(t3DeviceBackup === undefined ? {} : { t3DeviceBackup }),
         workerRepositoryAgeKeys,
         allowedOrganizationIds,

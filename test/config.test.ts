@@ -206,6 +206,47 @@ describe("GatewayConfig", () => {
     }
   });
 
+  test("requires independent transport and storage for the backup builder", async () => {
+    const primary = [
+      ["NATIVE_BUILD_SSH_CONFIG_FILE", "/run/secrets/primary-ssh"],
+      ["NATIVE_BUILD_SCRATCH_ROOT", "/app/data/native-primary"],
+    ] as const;
+    const backup = [
+      ["NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE", "/run/secrets/backup-ssh"],
+      ["NATIVE_BUILD_BACKUP_SCRATCH_ROOT", "/app/data/native-backup"],
+    ] as const;
+    for (const overrides of [
+      backup,
+      [...primary, backup[0]],
+      [...primary, backup[1]],
+      [
+        ...primary,
+        ...backup,
+        ["NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE", primary[0][1]] as const,
+      ],
+      [
+        ...primary,
+        ...backup,
+        ["NATIVE_BUILD_BACKUP_SCRATCH_ROOT", primary[1][1]] as const,
+      ],
+    ]) {
+      expect(
+        Result.isFailure(
+          await Effect.runPromise(configResult(valuesWith(overrides))),
+        ),
+      ).toBe(true);
+    }
+    const result = await Effect.runPromise(
+      configResult(valuesWith([...primary, ...backup])),
+    );
+    expect(Result.isSuccess(result)).toBe(true);
+    if (Result.isSuccess(result))
+      expect(result.success.nativeBuildBackup).toEqual({
+        sshConfigFile: "/run/secrets/backup-ssh",
+        scratchRoot: "/app/data/native-backup",
+      });
+  });
+
   test("loads required values from Docker secret files", async () => {
     const directory = await mkdtemp(
       join(testPath("temporary"), "gateway-secrets-"),

@@ -481,8 +481,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           typeof import("./native-build-client.js").createNativeBuildClient
         >
       >;
-      let nativeBuildClientPromise: Promise<NativeBuildClient> | undefined;
-      const nativeBuildJobs = new Map<SessionId, Set<string>>();
+      type NativeBuilder = "primary" | "backup";
+      const nativeBuildClients = new Map<
+        NativeBuilder,
+        Promise<NativeBuildClient>
+      >();
+      const nativeBuildJobs = new Map<
+        SessionId,
+        Map<string, { builder: NativeBuilder; job: string }>
+      >();
       const repositoryAgeIdentity = (run: AgentRun) =>
         Option.isSome(run.repositoryId) &&
         config.workerRepositoryAgeKeys !== undefined
@@ -490,19 +497,23 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               run.organizationId
             ]?.[run.repositoryId.value]
           : undefined;
-      const getNativeBuildClient = () => {
-        const nativeBuild: NativeBuildConfig | undefined = config.nativeBuild;
+      const getNativeBuildClient = (builder: NativeBuilder) => {
+        const nativeBuild: NativeBuildConfig | undefined =
+          builder === "backup" ? config.nativeBuildBackup : config.nativeBuild;
         if (nativeBuild === undefined)
-          return Promise.reject(new Error("Native build tools are disabled"));
-        nativeBuildClientPromise ??= import("./native-build-client.js")
+          return Promise.reject(new Error("Native builder is disabled"));
+        const existing = nativeBuildClients.get(builder);
+        if (existing) return existing;
+        const initialized = import("./native-build-client.js")
           .then(({ createNativeBuildClient }) =>
             createNativeBuildClient(nativeBuild),
           )
           .catch((error: unknown) => {
-            nativeBuildClientPromise = undefined;
+            nativeBuildClients.delete(builder);
             throw error;
           });
-        return nativeBuildClientPromise;
+        nativeBuildClients.set(builder, initialized);
+        return initialized;
       };
       const sandboxRuntime =
         sandboxMode !== "native" &&
@@ -687,12 +698,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const cancelSessionNativeBuilds = (sessionId: SessionId) =>
         Effect.promise(async () => {
           const jobs = nativeBuildJobs.get(sessionId);
-          if (jobs === undefined || nativeBuildClientPromise === undefined)
-            return;
+          if (jobs === undefined) return;
           try {
-            const client = await nativeBuildClientPromise;
-            for (const job of jobs) {
+            for (const { builder, job } of jobs.values()) {
               try {
+                const client = await getNativeBuildClient(builder);
                 const status = await client.status(sessionId, job);
                 if (status.state === "starting" || status.state === "running")
                   await client.cancel(sessionId, job);
@@ -700,8 +710,6 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 // Session cleanup must continue if the build host is down.
               }
             }
-          } catch {
-            // Session cleanup must continue if client initialization failed.
           } finally {
             nativeBuildJobs.delete(sessionId);
           }
@@ -717,15 +725,17 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               ),
             { discard: true, concurrency: "unbounded" },
           );
-          const nativeBuildClientForShutdown = nativeBuildClientPromise;
-          if (nativeBuildClientForShutdown !== undefined)
-            yield* Effect.promise(async () => {
-              try {
-                await (await nativeBuildClientForShutdown).close();
-              } catch {
-                // Shutdown cleanup must not prevent other finalizers.
-              }
-            });
+          yield* Effect.promise(async () => {
+            await Promise.all(
+              [...nativeBuildClients.values()].map(async (client) => {
+                try {
+                  await (await client).close();
+                } catch {
+                  // Shutdown cleanup must not prevent other finalizers.
+                }
+              }),
+            );
+          });
         }),
       );
 
@@ -1963,12 +1973,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   name: "native_build_start",
                   label: "Native build: start",
                   description:
-                    "Run the repository's .partitura/native-build.sh action in an isolated macOS VM for this commit and pull request.",
+                    "Run the repository's .partitura/native-build.sh action in an isolated macOS VM for this commit and pull request. Select primary or the separately configured backup builder explicitly. No automatic failover. Use the same builder for later status, artifact and cancel calls.",
                   parameters: {
                     type: "object",
                     additionalProperties: false,
                     required: ["commit", "pullRequest", "action"],
                     properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
                       commit: {
                         type: "string",
                         pattern: "^[a-f0-9]{40}$",
@@ -1994,6 +2005,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     additionalProperties: false,
                     required: ["job"],
                     properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
                       job: { type: "string", pattern: "^[a-f0-9]{32}$" },
                     },
                   },
@@ -2008,6 +2020,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     additionalProperties: false,
                     required: ["job"],
                     properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
                       job: { type: "string", pattern: "^[a-f0-9]{32}$" },
                     },
                   },
@@ -2022,6 +2035,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     additionalProperties: false,
                     required: ["job"],
                     properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
                       job: { type: "string", pattern: "^[a-f0-9]{32}$" },
                     },
                   },
@@ -2148,12 +2162,24 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             if (request.toolName.startsWith("native_build_")) {
               if (config.nativeBuild === undefined)
                 return fail("Native build tools are disabled");
+              if (
+                raw.builder !== undefined &&
+                raw.builder !== "primary" &&
+                raw.builder !== "backup"
+              )
+                return fail("Invalid native builder");
+              const builder = raw.builder === "backup" ? "backup" : "primary";
+              if (
+                builder === "backup" &&
+                config.nativeBuildBackup === undefined
+              )
+                return fail("The backup native builder is disabled");
               const job = raw.job;
               const nativeOperation = Effect.promise(async () => {
                 try {
                   if (workspacePath === undefined)
                     return fail("Native build workspace is unavailable");
-                  const client = await getNativeBuildClient();
+                  const client = await getNativeBuildClient(builder);
                   switch (request.toolName) {
                     case "native_build_start": {
                       if (
@@ -2180,16 +2206,25 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                         action: raw.action,
                       });
                       const jobs =
-                        nativeBuildJobs.get(run.sessionId) ?? new Set<string>();
-                      jobs.add(started.job);
+                        nativeBuildJobs.get(run.sessionId) ??
+                        new Map<
+                          string,
+                          { builder: NativeBuilder; job: string }
+                        >();
+                      jobs.set(`${builder}:${started.job}`, {
+                        builder,
+                        job: started.job,
+                      });
                       nativeBuildJobs.set(run.sessionId, jobs);
-                      return textResult(JSON.stringify(started), started);
+                      const result = { ...started, builder };
+                      return textResult(JSON.stringify(result), result);
                     }
                     case "native_build_status": {
                       if (typeof job !== "string")
                         return fail("job is required");
                       const status = await client.status(run.sessionId, job);
-                      return textResult(JSON.stringify(status), status);
+                      const result = { ...status, builder };
+                      return textResult(JSON.stringify(result), result);
                     }
                     case "native_build_artifact": {
                       if (typeof job !== "string")
@@ -2200,8 +2235,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                         workspacePath,
                         ...(workerUid === undefined ? {} : { workerUid }),
                       });
-                      nativeBuildJobs.get(run.sessionId)?.delete(job);
+                      nativeBuildJobs
+                        .get(run.sessionId)
+                        ?.delete(`${builder}:${job}`);
                       const workerArtifact = {
+                        builder,
                         path: sandboxHandles.has(run.sessionId)
                           ? `/workspace/.omp-home/native-build/${job}.tar`
                           : artifact.path,
@@ -2217,7 +2255,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                       if (typeof job !== "string")
                         return fail("job is required");
                       await client.cancel(run.sessionId, job);
-                      nativeBuildJobs.get(run.sessionId)?.delete(job);
+                      nativeBuildJobs
+                        .get(run.sessionId)
+                        ?.delete(`${builder}:${job}`);
                       return textResult("Native build canceled");
                     }
                     default:
