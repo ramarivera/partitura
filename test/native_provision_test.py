@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,33 +34,45 @@ class AccessPlanTests(unittest.TestCase):
         listed = module.sshd_values('allowusers ramarivera\n')
         self.assertEqual(module.access_plan('builder', ['staff'], listed), 'append')
         self.assertEqual(module.access_plan('ramarivera', ['staff'], listed), 'allowed')
+        patterned = module.sshd_values('allowusers build*@10.0.0.1\n')
+        self.assertEqual(module.access_plan('builder', ['staff'], patterned), 'append')
 
-    def test_refuses_explicit_denials_and_group_allowlists(self):
-        for output in ('denyusers builder\n', 'denygroups staff\n', 'allowgroups admin\n'):
+    def test_refuses_denials_including_patterns_and_group_allowlists(self):
+        for output in ('denyusers builder\n', 'denyusers build*\n', 'denyusers bui?der@10.0.0.1\n',
+                       'denygroups staff\n', 'denygroups st*\n', 'allowgroups admin\n',
+                       'allowusers !root\n'):
             with self.subTest(output=output), self.assertRaises(ValueError):
                 module.access_plan('builder', ['staff'], module.sshd_values(output))
+        self.assertEqual(module.access_plan('builder', ['staff'], module.sshd_values('allowgroups st*\n')), 'allowed')
 
 
 class AllowUsersEditTests(unittest.TestCase):
-    def test_appends_to_the_first_global_line_only(self):
-        edited = module.append_allowed_user(KEY_ONLY + 'AllowUsers other\n', 'builder')
-        self.assertIn('AllowUsers ramarivera openclaw-ssh builder\n', edited)
-        self.assertIn('AllowUsers other\n', edited)
+    def test_appends_before_an_inline_comment(self):
+        self.assertEqual(module.append_allowed_user('AllowUsers a b\n', 'builder'), 'AllowUsers a b builder\n')
+        self.assertEqual(module.append_allowed_user('AllowUsers a  # approved\n', 'builder'),
+                         'AllowUsers a builder  # approved\n')
 
-    def test_never_edits_inside_a_match_block(self):
-        text = 'Match User x\n    AllowUsers y\n'
-        self.assertIsNone(module.append_allowed_user(text, 'builder'))
-        self.assertIsNone(module.append_allowed_user('PermitTTY no\n', 'builder'))
+    def tree(self, files):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        (base / 'd').mkdir()
+        for name, text in files.items():
+            (base / name).write_text(text)
+        return base
 
-    def test_expands_the_include_glob_in_load_order(self):
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            (base / 'd').mkdir()
-            for name in ('90-b.conf', '100-a.conf'):
-                (base / 'd' / name).write_text('')
-            (base / 'sshd_config').write_text('Include d/*\n')
-            files = module.config_files(base / 'sshd_config')
-            self.assertEqual([path.name for path in files], ['sshd_config', '100-a.conf', '90-b.conf'])
+    def test_follows_sshd_parse_order_through_includes(self):
+        base = self.tree({'sshd_config': 'Include d/*\nAllowUsers main\n', 'd/90-b.conf': 'AllowUsers b\n',
+                          'd/100-a.conf': 'PermitTTY no\n'})
+        path, index = module.first_allowlist(base / 'sshd_config')
+        self.assertEqual((path.name, index), ('90-b.conf', 0))
+        base = self.tree({'sshd_config': 'AllowUsers main\nInclude d/*\n', 'd/90-b.conf': 'AllowUsers b\n'})
+        self.assertEqual(module.first_allowlist(base / 'sshd_config')[0].name, 'sshd_config')
+
+    def test_ignores_match_blocks_and_comments(self):
+        base = self.tree({'sshd_config': '# AllowUsers old\nInclude d/*\nMatch User x\n    AllowUsers y\n',
+                          'd/90-b.conf': 'Match User z\n  AllowUsers z\n'})
+        self.assertIsNone(module.first_allowlist(base / 'sshd_config'))
 
 
 class AdmitSshdTests(unittest.TestCase):
@@ -67,6 +80,8 @@ class AdmitSshdTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         base = Path(self.directory.name)
         (base / 'sshd_config.d').mkdir()
+        self.main = base / 'sshd_config'
+        self.main.write_text('Include sshd_config.d/*\n')
         self.config = base / 'sshd_config.d' / '90-key-only.conf'
         self.config.write_text(KEY_ONLY)
         os.chmod(self.config, 0o644)
@@ -86,7 +101,7 @@ class AdmitSshdTests(unittest.TestCase):
                 status = 0 if syntax_ok else 255
             elif '-T' in argv:
                 output = ''.join(f'allowusers {name}\n' for line in self.config.read_text().splitlines()
-                                 if line.startswith('AllowUsers') for name in line.split()[1:])
+                                 if line.startswith('AllowUsers') for name in line.split('#')[0].split()[1:])
             result = subprocess.CompletedProcess(argv, status, output, '')
             if kwargs.get('check'):
                 result.check_returncode()
@@ -94,7 +109,7 @@ class AdmitSshdTests(unittest.TestCase):
         return run
 
     def admit(self, apply, **options):
-        return module.admit_sshd('builder', apply, self.runner(**options), [self.config], self.backups, os.getuid())
+        return module.admit_sshd('builder', apply, self.runner(**options), self.main, self.backups, os.getuid())
 
     def test_check_mode_changes_nothing(self):
         self.assertIn('needs builder appended', self.admit(False))
@@ -137,21 +152,40 @@ sys.exit(0 if first == second else 1)
 '''
 
 
+ECHO_PROBE = r'''
+import sys, termios
+echo = termios.tcgetattr(sys.stdin.fileno())[3] & termios.ECHO
+sys.stdout.write('New password:'); sys.stdout.flush(); sys.stdin.readline()
+sys.stdout.write('Retype new password:'); sys.stdout.flush(); sys.stdin.readline()
+open(sys.argv[1], 'w').write('echo' if echo else 'quiet')
+'''
+
+
 class DrivePasswdTests(unittest.TestCase):
+    def run_script(self, text, *extra, timeout=30):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        script = Path(directory.name) / 'passwd.py'
+        script.write_text(text)
+        result = Path(directory.name) / 'result'
+        module.drive_passwd([sys.executable, str(script), str(result), *extra], bytearray(b'secret value'), timeout=timeout)
+        return result.read_text()
+
     def test_answers_both_hidden_prompts_without_argv_or_environment(self):
-        with tempfile.TemporaryDirectory() as directory:
-            script = Path(directory) / 'passwd.py'
-            script.write_text(FAKE_PASSWD)
-            result = Path(directory) / 'result'
-            module.drive_passwd([sys.executable, str(script), str(result)], bytearray(b'secret value'))
-            self.assertEqual(result.read_text(), 'same')
+        self.assertEqual(self.run_script(FAKE_PASSWD), 'same')
+
+    def test_echo_is_off_before_the_child_starts(self):
+        self.assertEqual(self.run_script(ECHO_PROBE), 'quiet')
 
     def test_reports_a_failed_change(self):
-        with tempfile.TemporaryDirectory() as directory:
-            script = Path(directory) / 'passwd.py'
-            script.write_text('import sys\nsys.exit(1)\n')
-            with self.assertRaises(ValueError):
-                module.drive_passwd([sys.executable, str(script)], bytearray(b'x'))
+        with self.assertRaises(ValueError):
+            self.run_script('import sys\nsys.exit(1)\n')
+
+    def test_stops_a_silent_child_at_the_deadline(self):
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            self.run_script('import time\ntime.sleep(30)\n', timeout=0.5)
+        self.assertLess(time.monotonic() - started, 5)
 
 
 class CredentialTests(unittest.TestCase):

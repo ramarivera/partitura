@@ -81,6 +81,15 @@ die() {
 }
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 root_sha() { sudo shasum -a 256 "$1" | awk '{print $1}'; }
+container_of() { diskutil info "$1" 2>/dev/null | awk -F': *' '/APFS Container:/{print $2}'; }
+# Build storage never shares an APFS container with macOS or a Time Machine backup.
+refuse_shared_container() {
+  [ "$1" != "$(container_of /)" ] || die "$1 is the system disk's container; use an external volume"
+  while IFS= read -r mount; do
+    [ -n "$mount" ] || continue
+    [ "$(container_of "$mount")" != "$1" ] || die "$1 holds the Time Machine destination at $mount"
+  done < <(tmutil destinationinfo 2>/dev/null | awk -F': *' '/^Mount Point/{print $2}')
+}
 socket_fits() { [ "$(printf %s "$1/vms/$base/control.sock" | wc -c)" -le 103 ]; }
 
 step "0 preflight (read-only, no sudo)"
@@ -156,14 +165,9 @@ socket_fits "$tart_home" || die "$tart_home/vms/$base/control.sock is over 103 b
 if [ -n "$container" ]; then
   [[ "$container" =~ ^disk[0-9]+$ ]] || die "--create-volume needs an APFS container such as disk9"
   diskutil apfs list "$container" >/dev/null 2>&1 || die "$container is not an APFS container"
-  # Never put build storage next to a Time Machine backup.
-  while IFS= read -r mount; do
-    [ -n "$mount" ] || continue
-    tm=$(diskutil info "$mount" 2>/dev/null | awk -F': *' '/APFS Container:/{print $2}')
-    [ "$tm" != "$container" ] || die "$container holds the Time Machine destination at $mount"
-  done < <(tmutil destinationinfo 2>/dev/null | awk -F': *' '/^Mount Point/{print $2}')
+  refuse_shared_container "$container"
   if [ -d "/Volumes/$VOLUME" ]; then
-    [ "$(diskutil info "/Volumes/$VOLUME" | awk -F': *' '/APFS Container:/{print $2}')" = "$container" ] \
+    [ "$(container_of "/Volumes/$VOLUME")" = "$container" ] \
       || die "/Volumes/$VOLUME already exists on another container"
   else
     free=$(diskutil apfs list "$container" | awk -F': *' '/Capacity Not Allocated/ && !n++ {split($2, a, " "); print a[1]}')
@@ -175,6 +179,9 @@ else
   volume_root=$(df "$existing" | awk 'NR==2{for (i = 9; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "")}')
   [ "$volume_root" != / ] && [ "$volume_root" != /System/Volumes/Data ] \
     || die "--tart-home must be on a dedicated external volume, not the system disk"
+  storage_container=$(container_of "$volume_root")
+  [ -n "$storage_container" ] || die "$volume_root is not an APFS volume"
+  refuse_shared_container "$storage_container"
   diskutil info "$volume_root" | grep -E 'Owners: +Enabled' >/dev/null \
     || die "ownership is disabled on $volume_root (sudo diskutil enableOwnership $volume_root)"
   [ "$(df -k "$volume_root" | awk 'NR==2{print $4}')" -gt "$MIN_STORAGE_KB" ] || die "less than 120 GB free on $volume_root"
@@ -249,9 +256,12 @@ bundle=$inputs/partitura-${commit:0:12}.bundle
   || die "could not bundle the Partitura checkout"
 sudo mkdir -p -m 0700 "$ROOT"
 if ! sudo test -e "$ROOT/checkout"; then
+  # Clone beside the final path and rename, so an interrupted clone never
+  # leaves a partial checkout that a rerun would treat as installed.
+  sudo rm -rf "$ROOT/checkout.partial"
   sudo install -m 0600 "$bundle" "$ROOT/source.bundle"
-  sudo -H "${ROOT_GIT[@]}" clone --quiet --no-hardlinks --template= "$ROOT/source.bundle" "$ROOT/checkout" \
-    || die "root checkout failed"
+  sudo -H "${ROOT_GIT[@]}" clone --quiet --no-hardlinks --template= "$ROOT/source.bundle" "$ROOT/checkout.partial" \
+    && sudo mv "$ROOT/checkout.partial" "$ROOT/checkout" || die "root checkout failed"
 fi
 [ "$(sudo -H "${ROOT_GIT[@]}" -C "$ROOT/checkout" rev-parse HEAD)" = "$commit" ] || die "root checkout is not at $commit"
 [ -z "$(sudo -H "${ROOT_GIT[@]}" -C "$ROOT/checkout" status --porcelain)" ] || die "root checkout is dirty"
@@ -296,7 +306,8 @@ fi
 step "8 build keychain"
 kc=/Users/$account/Library/Keychains/login.keychain-db
 asbuild() { sudo -H -u "$account" "$@"; }
-kc_mode() { asbuild "${PY[@]}" "$RMB/provision.py" keychain "$1"; }
+# The build account can't traverse root's checkout; hand it the helper on stdin.
+kc_mode() { sudo cat "$RMB/provision.py" | asbuild "${PY[@]}" - keychain "$1"; }
 set +e; kc_mode verify; rc=$?; set -e
 if [ "$rc" = 3 ]; then
   if sudo test -e "$kc"; then

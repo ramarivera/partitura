@@ -9,6 +9,7 @@ Subcommands (each runs with the identity provision-host.sh gives it):
 """
 import argparse
 import errno
+import fnmatch
 import glob
 import hashlib
 import importlib.util
@@ -17,11 +18,14 @@ import os
 from pathlib import Path
 import pwd
 import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 
 ACCOUNT = re.compile(r'[a-z][a-z0-9_-]{0,30}\Z')
@@ -116,44 +120,73 @@ def sshd_values(output):
 
 
 def access_plan(account, groups, values):
-    """Return 'allowed' or 'append', or raise when only a human should decide."""
-    if account in values['denyusers'] or set(groups) & set(values['denygroups']):
-        raise ValueError(f'sshd explicitly denies {account}; refusing to override')
-    if values['allowgroups'] and not set(groups) & set(values['allowgroups']):
+    """Return 'allowed' or 'append', or raise when only a human should decide.
+
+    sshd lists hold glob patterns, optionally host-qualified as user@host.
+    Denials are matched by their user part alone, so a host-limited denial
+    still stops the run rather than being guessed about.
+    """
+    patterns = [pattern for entries in values.values() for pattern in entries]
+    if any(pattern.startswith('!') for pattern in patterns):
+        raise ValueError('negated sshd access patterns need manual review')
+    if any(fnmatch.fnmatchcase(account, pattern.split('@', 1)[0]) for pattern in values['denyusers']) \
+            or any(fnmatch.fnmatchcase(group, pattern) for group in groups for pattern in values['denygroups']):
+        raise ValueError(f'sshd DenyUsers/DenyGroups matches {account}; refusing to override')
+    if values['allowgroups'] and not any(fnmatch.fnmatchcase(group, pattern)
+                                         for group in groups for pattern in values['allowgroups']):
         raise ValueError(f'sshd AllowGroups excludes {account}; add it by hand')
     if not values['allowusers'] or account in values['allowusers']:
         return 'allowed'
+    # A plain entry is unconditional, unlike a pattern that may be host-limited.
     return 'append'
 
 
-def config_files(main=SSHD_CONFIG):
-    """The main config plus its included files, in sshd's load order."""
-    files = []
-    for line in main.read_text().splitlines():
-        match = re.match(r'\s*Include\s+(\S+)', line, re.IGNORECASE)
-        if match:
-            pattern = match.group(1)
-            if not pattern.startswith('/'):
-                pattern = str(main.parent / pattern)
-            files.extend(sorted(Path(p) for p in glob.glob(pattern)))
-    return [main, *files]
+def global_directives(path, base=None, depth=0):
+    """Yield (path, line index, keyword) for global directives in sshd parse order.
+
+    Include expands in place, as sshd reads it. A Match line ends global scope
+    for the rest of its file.
+    """
+    if depth > 8:
+        raise ValueError('sshd Include nesting is too deep')
+    base = base or path.parent
+    for index, line in enumerate(path.read_text().splitlines()):
+        words = line.split()
+        if not words or words[0].startswith('#'):
+            continue
+        keyword = words[0].lower()
+        if keyword == 'match':
+            return
+        if keyword == 'include':
+            for pattern in words[1:]:
+                if pattern.startswith('#'):
+                    break
+                if not pattern.startswith('/'):
+                    pattern = str(base / pattern)
+                for included in sorted(glob.glob(pattern)):
+                    yield from global_directives(Path(included), base, depth + 1)
+            continue
+        yield path, index, keyword
 
 
-def append_allowed_user(text, account):
-    """Append the account to the first global AllowUsers line, or return None."""
-    lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if re.match(r'\s*Match\s', line, re.IGNORECASE):
-            return None
-        if re.match(r'\s*AllowUsers\s', line, re.IGNORECASE):
-            body = line.rstrip('\r\n')
-            ending = line[len(body):]
-            lines[index] = f'{body} {account}{ending}'
-            return ''.join(lines)
+def first_allowlist(main=SSHD_CONFIG):
+    """The file and line of the AllowUsers directive sshd applies, if any."""
+    for path, index, keyword in global_directives(main):
+        if keyword == 'allowusers':
+            return path, index
     return None
 
 
-def admit_sshd(account, apply=False, run=subprocess.run, files=None, backups=SSHD_BACKUPS, owner=0):
+def append_allowed_user(line, account):
+    """Add the account to an AllowUsers line, ahead of any inline comment."""
+    body = line.rstrip('\r\n')
+    ending = line[len(body):]
+    comment = re.search(r'\s+#', body)
+    code, rest = (body[:comment.start()], body[comment.start():]) if comment else (body, '')
+    return f'{code.rstrip()} {account}{rest}{ending}'
+
+
+def admit_sshd(account, apply=False, run=subprocess.run, main=SSHD_CONFIG, backups=SSHD_BACKUPS, owner=0):
     groups = run(['/usr/bin/id', '-Gn', account], capture_output=True, text=True, check=True).stdout.split()
     if {'admin', 'wheel'} & set(groups):
         raise ValueError('build account must be unprivileged')
@@ -165,12 +198,13 @@ def admit_sshd(account, apply=False, run=subprocess.run, files=None, backups=SSH
 
     if effective() == 'allowed':
         return f'sshd already admits {account}'
-    for path in files if files is not None else config_files():
-        edited = append_allowed_user(path.read_text(), account)
-        if edited is not None:
-            break
-    else:
+    found = first_allowlist(main)
+    if found is None:
         raise ValueError('sshd AllowUsers is set but no global AllowUsers line was found to extend')
+    path, index = found
+    lines = path.read_text().splitlines(keepends=True)
+    lines[index] = append_allowed_user(lines[index], account)
+    edited = ''.join(lines)
     if not apply:
         return f'sshd allowlist in {path} needs {account} appended'
     info = path.lstat()
@@ -217,21 +251,30 @@ def read_credential(home):
 def drive_passwd(argv, secret, prompts=2, timeout=30):
     """Answer `passwd`'s two hidden prompts on a private pseudo-terminal.
 
-    The secret never reaches argv, the environment or a log. Output is drained
-    to EOF because macOS blocks a session leader's exit until its tty drains.
+    The secret never reaches argv, the environment or a log. Echo is off before
+    the child starts, so the secret is not echoed back even if the child is slow
+    to disable it. Output is drained to EOF because macOS blocks a session
+    leader's exit until its tty drains.
     """
     pid, master = os.forkpty()
     if pid == 0:
         try:
+            attributes = termios.tcgetattr(0)
+            attributes[3] &= ~(termios.ECHO | termios.ECHONL)
+            termios.tcsetattr(0, termios.TCSANOW, attributes)
             os.execv(argv[0], argv)
         finally:
             os._exit(127)
-    seen, answered, deadline = b'', 0, time.monotonic() + timeout
+    seen, answered, deadline = bytearray(), 0, time.monotonic() + timeout
     try:
         while True:
-            if time.monotonic() > deadline:
-                os.kill(pid, 9)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
                 raise ValueError('passwd did not finish in time')
+            if not select.select([master], [], [], remaining)[0]:
+                continue
             try:
                 chunk = os.read(master, 1024)
             except OSError as error:
@@ -240,12 +283,13 @@ def drive_passwd(argv, secret, prompts=2, timeout=30):
                 raise
             if not chunk:
                 break
-            seen += chunk
-            if answered < prompts and seen.lower().rstrip().endswith(b':'):
+            seen.extend(chunk)
+            if answered < prompts and bytes(seen).rstrip().endswith(b':'):
                 os.write(master, bytes(secret) + b'\n')
                 answered += 1
-                seen = b''
+                seen.clear()
     finally:
+        seen.clear()
         os.close(master)
     _, status = os.waitpid(pid, 0)
     if answered != prompts or os.waitstatus_to_exitcode(status) != 0:
