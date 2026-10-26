@@ -293,3 +293,47 @@ repository task and artifact receipt, cross-session denial, cancellation and cra
 recovery. Then test a consumer repository's workflow separately. A successful
 consumer build doesn't prove that host setup works without that consumer's tools.
 Keep native acceptance open until the full deployed path passes.
+
+## Simulator artifact admission
+
+The backup install path must call `simulator_artifact.admitted_app` before
+acquiring the canonical T3 device lease. This admission module is source
+preparation; it isn't installed by the native host installer and doesn't expose
+an install command. T3 ownership, signed capabilities, durable replay protection
+and the install transport still require their separate integration.
+
+An ONYXIO workflow exports an uncompressed tar with exactly one `.app` tree
+under `artifacts/` and `artifacts/partitura-simulator.json`:
+
+```json
+{
+  "format": 1,
+  "app": "ONYXIO.app",
+  "organizationId": "the-owning-organization",
+  "runId": "the-owning-run",
+  "repository": "owner/onyxio",
+  "commit": "0123456789012345678901234567890123456789",
+  "bundleId": "com.example.onyxio"
+}
+```
+
+The installer compares every binding with authenticated job and capability data,
+and checks the complete tar's byte count and SHA-256 against the transfer
+receipt. Archive-provided identity alone never authorizes installation. Admission
+requires an arm64 simulator slice in every Mach-O image, a compatible minimum OS
+in the app and images, valid ad-hoc signatures and a nonempty `main.jsbundle`.
+A newer build SDK is allowed when the minimum OS is compatible.
+
+Admission limits are 2 GiB transferred, 4 GiB expanded, 50,000 entries and 512
+Mach-O images. Traversal, hardlinks, special files, sparse files, name collisions
+on case-insensitive or Unicode-normalizing filesystems, extended metadata and
+links outside the app are rejected. Internal relative framework links are
+supported. No xattrs or archive ownership are restored. Files stay in a private
+staging directory until the caller's leased install ends, then normal exit or
+failure removes that staging tree.
+
+Run `python3 -m unittest discover -s test -p simulator_artifact_test.py` for the
+focused checks. On macOS, this also compiles and ad-hoc signs a small simulator
+app using the selected Xcode SDK, then validates it without launching it or
+opening a simulator. Python can use the qualified Command Line Tools selection;
+the test compiler uses the global Xcode selection for its iOS SDK.
