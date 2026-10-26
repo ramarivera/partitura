@@ -186,7 +186,7 @@ async def mount_workspace_dependencies(uid: int) -> None:
 
 class Agent:
     def __init__(self, token: str, uid: int):
-        if not re.fullmatch(r"[a-f0-9]{64}", token) or not 1 <= uid <= 65535:
+        if not re.fullmatch(r"[a-f0-9]{64}", token) or not 1 <= uid <= 99999 or uid in (65534, 65535):
             raise ValueError("invalid guest configuration")
         self.token, self.uid = token, uid
         self.listeners = {}

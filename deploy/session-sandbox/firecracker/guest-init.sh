@@ -12,7 +12,7 @@ mount -t tmpfs -o mode=1777,nosuid,nodev,size=512m tmpfs /tmp
 mount -t cgroup2 none /sys/fs/cgroup
 mkdir -p /run/partitura-config /workspace /mise /var/lib/docker
 mount -t ext4 -o ro,nosuid,nodev,noexec /dev/vdb /run/partitura-config
-worker_uid=$(python3 -c 'import json; c=json.load(open("/run/partitura-config/config.json")); u=int(c["workerUid"]); assert 1 <= u <= 65535; print(u)')
+worker_uid=$(python3 -c 'import json; c=json.load(open("/run/partitura-config/config.json")); u=int(c["workerUid"]); assert 1 <= u <= 99999 and u not in (65534, 65535); print(u)')
 echo "worker:x:$worker_uid:$worker_uid:Session worker:/workspace/.omp-home:/bin/bash" >> /etc/passwd
 echo "worker:x:$worker_uid:" >> /etc/group
 export PARTITURA_WORKER_UID="$worker_uid"

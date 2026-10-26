@@ -3,7 +3,10 @@ import asyncio
 import importlib.util
 import json
 import os
+import shlex
 import socket
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,6 +17,29 @@ spec = importlib.util.spec_from_file_location("firecracker_guest", SOURCE)
 guest = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guest)
 TOKEN = "a" * 64
+
+
+class GuestIdentityTests(unittest.TestCase):
+    def test_init_and_agent_accept_supported_uid_boundaries(self):
+        init = SOURCE.with_name('guest-init.sh').read_text()
+        assignment = next(line for line in init.splitlines() if line.startswith('worker_uid=$('))
+        command = shlex.split(assignment[len('worker_uid=$('):-1])
+        self.assertEqual(command[:2], ['python3', '-c'])
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
+            config = Path(directory) / 'config.json'
+            code = command[2].replace('/run/partitura-config/config.json', str(config))
+            for uid in (1, 1001, 65533, 65536, 70000, 99999, 0, -1, 65534, 65535, 100000):
+                with self.subTest(uid=uid):
+                    config.write_text(json.dumps({'workerUid': str(uid)}))
+                    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=5)
+                    if uid in (0, -1, 65534, 65535, 100000):
+                        self.assertNotEqual(result.returncode, 0)
+                        with self.assertRaisesRegex(ValueError, 'invalid guest configuration'):
+                            guest.Agent(TOKEN, uid)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), str(uid))
+                        self.assertEqual(guest.Agent(TOKEN, uid).uid, uid)
 
 
 class GuestTests(unittest.IsolatedAsyncioTestCase):
