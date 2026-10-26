@@ -89,6 +89,51 @@ The toolbox deployment is optional fleet integration. The standalone host setup
 doesn't depend on the operator's toolbox, Mise configuration, fnox, or knowledge
 of a particular repository. It installs the pinned portable Mise binary into the
 guest and prepares the common tool cache there.
+### One-shot provisioning
+
+[provision-host.sh](provision-host.sh) provisions a new Mac in one run: one sudo
+prompt, and one new build-account password pasted twice. Run it as an
+administrator from a clean checkout of the commit you want installed:
+
+```bash
+bash deploy/mac-build/provision-host.sh \
+  --source-vm /Volumes/Fast/pnb/vms/macos-base --source-sha256 SOURCE_TREE_SHA256 \
+  --authorized-key "$(cat partitura-native-build.pub)" \
+  --create-volume disk9            # or --tart-home on an existing owned volume
+```
+
+Without `--apply` it runs only the read-only preflight. That downloads Tart and
+Mise into `~/dev/agentic-scratchpads/partitura/host-inputs` and checks them
+against the hashes pinned in the script, plus Tart's signing team. It also checks:
+
+- the Command Line Tools tree is root-owned and not group- or other-writable;
+- the source VM and build storage paths keep Tart's control socket under macOS's
+  103-byte Unix socket limit;
+- build storage is a dedicated volume with ownership enabled and 120 GB free,
+  never the system disk or a Time Machine destination's container;
+- the internal disk has 5 GiB free and Remote Login is on.
+
+Add `--apply` to provision. It creates the build volume and account, prepares and
+qualifies the base VM, installs the broker and restricted SSH policy from a
+root-owned checkout of the same commit, and admits the account to SSH. If an
+existing global `AllowUsers` line would refuse the account, it appends the
+account there. It keeps the previous file outside `sshd_config.d`, because that
+directory's include would load a backup. It restores the file if `sshd -t`
+fails. The credential writer reads the new password; root then sets the account
+password from that saved credential over a private pseudo-terminal, so the
+secret never appears in a process argument or environment. Last, it creates and
+verifies the build keychain. The run ends by printing the base hash and the host
+key line for the gateway's `known_hosts`. Every step is skipped when its result
+already exists, so a rerun after fixing a reported cause continues where it
+stopped.
+
+The source VM must be a clean Tart VM laid out as `<tart home>/vms/<name>`,
+with its tree hash computed by `host_setup.tree_sha256()`. Copy it from an
+existing builder rather than downloading a new image when the fleet should
+share one qualified source.
+
+### Manual setup
+
 Start from [settings.example.json](settings.example.json) in a private scratch
 directory. Its `REVIEWED_*` strings are required inputs, not valid defaults.
 Record a full Partitura commit and the hashes of its broker, guest runner,
