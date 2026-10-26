@@ -74,6 +74,7 @@ await Effect.runPromise(
         Layer.provide(
           ConfigProvider.layer(
             ConfigProvider.fromUnknown({
+              WORKER_SANDBOX_MODE: "native",
               LINEAR_CLIENT_ID: "client",
               LINEAR_CLIENT_SECRET: "client-secret",
               LINEAR_WEBHOOK_SECRET: "webhook-secret",

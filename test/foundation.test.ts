@@ -35,6 +35,7 @@ import { GatewayConfig } from "../src/services/config.js";
 import { redactionPaths } from "../src/services/logger.js";
 
 const configValues = new Map<string, string>([
+  ["WORKER_SANDBOX_MODE", "native"],
   ["LINEAR_CLIENT_ID", "client"],
   ["LINEAR_CLIENT_SECRET", "client-secret"],
   ["LINEAR_WEBHOOK_SECRET", "webhook-secret"],

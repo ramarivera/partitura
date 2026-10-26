@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+# Expose the patch runner already shipped in the pinned Codex binary to shell
+# callers as well as the native Codex tool. Accept a patch argument or stdin.
+if [ "$#" -eq 0 ]; then
+  set -- "$(cat)"
+fi
+exec /opt/codex/bin/codex --codex-run-as-apply-patch "$@"

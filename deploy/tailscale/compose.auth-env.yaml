@@ -1,0 +1,6 @@
+# Optional Docker Compose 2.24.4+ overlay. Your secret manager supplies the
+# environment value to Compose; only the sidecar receives its secret file.
+# Usage: docker compose -f compose.yaml -f compose.auth-env.yaml up -d
+secrets:
+  ts_authkey: !override
+    environment: PARTITURA_TAILSCALE_AUTH_KEY

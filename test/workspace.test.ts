@@ -26,6 +26,7 @@ import {
   WorkspaceId,
 } from "../src/domain/ids.js";
 import type { RepositoryRecord } from "../src/domain/models.js";
+import { acquireCloneLock } from "../src/services/clone-lock.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { buildGitHubExtraHeader } from "../src/services/github-app.js";
 import { WorkspaceRepo } from "../src/services/store/repositories.js";
@@ -194,6 +195,7 @@ const gatewayConfigLayer = (workspaceRoot: string) =>
         ConfigProvider.fromUnknown(
           Object.fromEntries(
             new Map([
+              ["WORKER_SANDBOX_MODE", "native"],
               ["LINEAR_CLIENT_ID", "workspace-test-client"],
               ["LINEAR_CLIENT_SECRET", "workspace-test-client-secret"],
               ["LINEAR_WEBHOOK_SECRET", "workspace-test-webhook-secret"],
@@ -491,88 +493,156 @@ describe("Workspace", () => {
       }),
   );
 
-  it.live("refreshes GitHub credentials when reusing a workspace", () =>
-    Effect.gen(function* () {
-      const fixture = yield* gitFixture;
-      const id = sessionId("github-reuse-refresh");
-      const record = repositoryRecord({
-        id: "github-reuse-refresh",
-        url: "https://github.com/octo-org/private-repo.git",
-      });
-      yield* fixtureIo("workspace root creation", () =>
-        mkdir(fixture.workspaceRoot, { recursive: true }),
-      );
-      const target = join(fixture.workspaceRoot, safeSessionKey(id));
-      yield* fixtureIo("workspace target creation", () => mkdir(target));
-      yield* runGit(["init"], target);
-      yield* runGit(
-        [
-          "config",
-          "--local",
-          "http.https://github.com/.extraheader",
-          buildGitHubExtraHeader("stale-token"),
-        ],
-        target,
-      );
-      yield* runGit(
-        [
-          "config",
-          "--local",
-          "--add",
-          "http.https://github.com/.extraheader",
-          "X-User: retained",
-        ],
-        target,
-      );
-      yield* fixtureIo("workspace marker creation", () =>
-        writeFile(
-          join(target, MARKER_FILE),
-          JSON.stringify({
-            repositoryId: record.id,
-            url: record.url,
-            ref: record.ref,
-          }),
-        ),
-      );
-      let tokenCalls = 0;
-      const workspace = yield* makeWorkspace({
-        workspaceRoot: fixture.workspaceRoot,
-        repo: { listRepositories: () => Effect.succeed([]) },
-        githubApp: {
-          getBotIdentity: () =>
-            Effect.succeed({
-              name: "test-app[bot]",
-              email: "98765+test-app[bot]@users.noreply.github.com",
+  it.live(
+    "removes stale gateway GitHub credentials when reusing a workspace",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const id = sessionId("github-reuse-refresh");
+        const record = repositoryRecord({
+          id: "github-reuse-refresh",
+          url: "https://github.com/octo-org/private-repo.git",
+        });
+        yield* fixtureIo("workspace root creation", () =>
+          mkdir(fixture.workspaceRoot, { recursive: true }),
+        );
+        const target = join(fixture.workspaceRoot, safeSessionKey(id));
+        yield* fixtureIo("workspace target creation", () => mkdir(target));
+        yield* runGit(["init"], target);
+        yield* runGit(
+          [
+            "config",
+            "--local",
+            "http.https://github.com/.extraheader",
+            buildGitHubExtraHeader("stale-token"),
+          ],
+          target,
+        );
+        yield* runGit(
+          [
+            "config",
+            "--local",
+            "--add",
+            "http.https://github.com/.extraheader",
+            "X-User: retained",
+          ],
+          target,
+        );
+        yield* fixtureIo("workspace marker creation", () =>
+          writeFile(
+            join(target, MARKER_FILE),
+            JSON.stringify({
+              repositoryId: record.id,
+              url: record.url,
+              ref: record.ref,
             }),
-          getInstallationToken: () => {
-            tokenCalls += 1;
-            return Effect.succeed("fresh-token");
+          ),
+        );
+        let tokenCalls = 0;
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({
+                name: "test-app[bot]",
+                email: "98765+test-app[bot]@users.noreply.github.com",
+              }),
+            getInstallationToken: () => {
+              tokenCalls += 1;
+              return Effect.succeed("fresh-token");
+            },
           },
-        },
-      });
-      yield* workspace.materialize(id, record);
-      expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
-      expect(yield* readGitConfig("user.email", target)).toBe(
-        "98765+test-app[bot]@users.noreply.github.com",
-      );
-      yield* runGit(["commit", "--allow-empty", "-m", "worker commit"], target);
-      yield* runGit(["config", "--local", "--unset", "user.email"], target);
-      yield* workspace.materialize(id, record);
-      expect(yield* readGitConfig("user.email", target)).toBe(
-        "98765+test-app[bot]@users.noreply.github.com",
-      );
-      yield* runGit(["config", "--local", "--unset", "user.name"], target);
-      yield* workspace.refreshGitHubExtraHeader(id, record, target);
-      expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
-      expect(tokenCalls).toBe(3);
-      expect(
-        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
-      ).toEqual(["X-User: retained", buildGitHubExtraHeader("fresh-token")]);
-      yield* workspace.clearGitHubExtraHeader(id, target);
-      expect(
-        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
-      ).toEqual(["X-User: retained"]);
-    }),
+        });
+        yield* workspace.materialize(id, record);
+        expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
+        expect(yield* readGitConfig("user.email", target)).toBe(
+          "98765+test-app[bot]@users.noreply.github.com",
+        );
+        yield* runGit(
+          ["commit", "--allow-empty", "-m", "worker commit"],
+          target,
+        );
+        yield* runGit(["config", "--local", "--unset", "user.email"], target);
+        yield* workspace.materialize(id, record);
+        expect(yield* readGitConfig("user.email", target)).toBe(
+          "98765+test-app[bot]@users.noreply.github.com",
+        );
+        yield* runGit(["config", "--local", "--unset", "user.name"], target);
+        yield* workspace.refreshGitHubExtraHeader(id, record, target);
+        expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
+        expect(tokenCalls).toBe(0);
+        expect(
+          yield* readGitConfigAll(
+            "http.https://github.com/.extraheader",
+            target,
+          ),
+        ).toEqual(["X-User: retained"]);
+        yield* workspace.clearGitHubExtraHeader(id, target);
+        expect(
+          yield* readGitConfigAll(
+            "http.https://github.com/.extraheader",
+            target,
+          ),
+        ).toEqual(["X-User: retained"]);
+      }),
+  );
+
+  it.live(
+    "replaces stale broker rewrites for each worker launch and clears them",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const id = sessionId("github-broker-rewrite");
+        const record = repositoryRecord({
+          id: "github-broker-rewrite",
+          url: "https://github.com/octo-org/private-repo.git",
+        });
+        const target = join(fixture.workspaceRoot, safeSessionKey(id));
+        yield* fixtureIo("workspace target creation", () =>
+          mkdir(target, { recursive: true }),
+        );
+        yield* runGit(["init"], target);
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({ name: "bot", email: "bot@example.test" }),
+            getInstallationToken: () => Effect.succeed("fresh-token"),
+          },
+        });
+        const first = yield* Effect.acquireRelease(
+          workspace.openGitBroker(id, record),
+          (broker) => Effect.sync(() => broker?.stop()),
+        );
+        expect(first).toBeDefined();
+        if (first === undefined) return;
+        yield* workspace.configureGitBroker(id, target, first);
+        expect(yield* readGitConfig("push.negotiate", target)).toBe("true");
+        expect(yield* readGitConfig(first.gitConfigKey, target)).toBe(
+          record.url,
+        );
+
+        const second = yield* Effect.acquireRelease(
+          workspace.openGitBroker(id, record),
+          (broker) => Effect.sync(() => broker?.stop()),
+        );
+        expect(second).toBeDefined();
+        if (second === undefined) return;
+        yield* workspace.configureGitBroker(id, target, second);
+        expect(
+          yield* readGitConfig(first.gitConfigKey, target),
+        ).toBeUndefined();
+        expect(yield* readGitConfig(second.gitConfigKey, target)).toBe(
+          record.url,
+        );
+
+        yield* workspace.clearGitBrokerConfig(id, target);
+        expect(
+          yield* readGitConfig(second.gitConfigKey, target),
+        ).toBeUndefined();
+      }),
   );
 
   it.live(
@@ -606,18 +676,28 @@ describe("Workspace", () => {
         const refreshed = yield* Effect.result(
           workspace.refreshGitHubExtraHeader(id, record, inner),
         );
-        // Refresh must get past identity setup and stop at credential
-        // persistence, so the assertions below exercise the identity guard.
-        expect(Result.isFailure(refreshed)).toBe(true);
-        if (Result.isFailure(refreshed)) {
-          expect(refreshed.failure.message).toBe(
-            "Could not persist GitHub credential",
-          );
-        }
+        expect(Result.isSuccess(refreshed)).toBe(true);
         expect(yield* readGitConfig("user.name", outer)).toBeUndefined();
         expect(yield* readGitConfig("user.email", outer)).toBeUndefined();
         expect(
           yield* readGitConfig("http.https://github.com/.extraheader", outer),
+        ).toBeUndefined();
+        const broker = yield* Effect.acquireRelease(
+          workspace.openGitBroker(id, record),
+          (value) => Effect.sync(() => value?.stop()),
+        );
+        expect(broker).toBeDefined();
+        if (broker === undefined) return;
+        yield* workspace.configureGitBroker(id, inner, broker);
+        expect(
+          yield* readGitConfig(broker.gitConfigKey, outer),
+        ).toBeUndefined();
+        yield* fixtureIo("unsafe Git directory link", () =>
+          symlink(join(outer, ".git"), join(inner, ".git")),
+        );
+        yield* workspace.configureGitBroker(id, inner, broker);
+        expect(
+          yield* readGitConfig(broker.gitConfigKey, outer),
         ).toBeUndefined();
       }),
   );
@@ -1307,12 +1387,90 @@ it.live(
       expect(clone?.[1]?.env?.GIT_ASKPASS).toBe("");
       expect(clone?.[1]?.env).not.toHaveProperty("LINEAR_CLIENT_SECRET");
       expect(
-        yield* readGitConfig("http.https://github.com/.extraheader", target),
-      ).toBe(header);
+        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
+      ).toEqual([]);
+      const fetch = calls.find(
+        ([command]) => Array.isArray(command) && command.includes("fetch"),
+      );
+      expect(fetch?.[1]?.env?.GIT_CONFIG_VALUE_0).toBe(header);
     }),
 );
 
 describe("Workspace recovery regressions", () => {
+  it.live(
+    "hydrates private repository blobs before credential-free checkout",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        yield* runGit(
+          ["config", "uploadpack.allowFilter", "true"],
+          fixture.source,
+        );
+        yield* runGit(["checkout", "-b", "requested-ref"], fixture.source);
+        yield* fixtureIo("write requested snapshot", () =>
+          writeFile(join(fixture.source, "README.txt"), "requested snapshot\n"),
+        );
+        yield* runGit(["commit", "-am", "requested snapshot"], fixture.source);
+        yield* runGit(["checkout", "main"], fixture.source);
+        // file:// uses upload-pack and honors partial-clone filtering. Ordinary
+        // local-path clones copy all objects and conceal missing checkout blobs.
+        yield* fixtureIo("configure filtering transport", () =>
+          writeFile(
+            join(fixture.root, "gitconfig"),
+            `[url "file://${fixture.source}"]\n\tinsteadOf = ${fixture.url}\n`,
+          ),
+        );
+        const nativeSpawn = Bun.spawn;
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            vi.spyOn(Bun, "spawn").mockImplementation((command, options) => {
+              if (Array.isArray(command) && command.includes("checkout")) {
+                expect(options?.env?.GIT_CONFIG_VALUE_0).toBeUndefined();
+                // Model the private origin refusing access once the gateway's
+                // ephemeral authentication is gone. Checkout must be offline.
+                return nativeSpawn(
+                  [
+                    "git",
+                    "-c",
+                    "protocol.file.allow=never",
+                    ...command.slice(1),
+                  ],
+                  options,
+                );
+              }
+              return nativeSpawn(command, options);
+            }),
+          ),
+          (spy) => Effect.sync(() => spy.mockRestore()),
+        );
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({
+                name: "fixture[bot]",
+                email: "fixture@example.com",
+              }),
+            getInstallationToken: () => Effect.succeed("ghs_private_fixture"),
+          },
+        });
+        const target = yield* workspace.materialize(
+          "private-blobs",
+          repositoryRecord({
+            id: "private-blobs",
+            url: fixture.url,
+            ref: "requested-ref",
+          }),
+        );
+        expect(
+          yield* fixtureIo("read checked-out blob", () =>
+            readFile(join(target, "README.txt"), "utf8"),
+          ),
+        ).toBe("requested snapshot\n");
+      }),
+  );
+
   it.live("retries cleanly when fetch fails after cloning", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
@@ -1336,7 +1494,7 @@ describe("Workspace recovery regressions", () => {
         yield* fixtureIo("list workspace root", () =>
           readdir(fixture.workspaceRoot),
         ),
-      ).toEqual([]);
+      ).toEqual([".clone-locks"]);
       const target = yield* workspace.materialize("atomic-session", {
         ...repository,
         ref: "HEAD",
@@ -1397,6 +1555,61 @@ describe("Workspace recovery regressions", () => {
             readFile(join(fixture.workspaceRoot, stale, "partial.txt"), "utf8"),
           ),
         ).toBe("incomplete");
+      }),
+  );
+
+  it.live(
+    "reclaims unlocked clone instances and preserves a live gateway lock",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const activeOwner = "a".repeat(32);
+        const deadOwner = "b".repeat(32);
+        const lock = yield* Effect.acquireRelease(
+          fixtureIo("lock live clone", async () => {
+            await mkdir(fixture.workspaceRoot, { recursive: true });
+            const lock = await acquireCloneLock(
+              fixture.workspaceRoot,
+              activeOwner,
+            );
+            if (lock === undefined) throw new Error("Initial lock missing");
+            return lock;
+          }),
+          (lock) => Effect.promise(() => lock.release()),
+        );
+        const prefix = `.${safeSessionKey("instances")}-clone-v2-`;
+        const active = `${prefix}${activeOwner}-active`;
+        const dead = `${prefix}${deadOwner}-dead00`;
+        yield* fixtureIo("seed clone instances", async () => {
+          for (const name of [active, dead])
+            await mkdir(join(fixture.workspaceRoot, name));
+        });
+        const make = () =>
+          makeWorkspace({
+            workspaceRoot: fixture.workspaceRoot,
+            repo: { listRepositories: () => Effect.succeed([]) },
+            githubApp: undefined,
+          });
+        const repository = repositoryRecord({
+          id: "instances",
+          url: fixture.url,
+          ref: "HEAD",
+        });
+        const first = yield* make();
+        yield* first.materialize("first-instance", repository);
+        const names = yield* fixtureIo("read preserved clone", () =>
+          readdir(fixture.workspaceRoot),
+        );
+        expect(names).toContain(active);
+        expect(names).not.toContain(dead);
+        yield* Effect.promise(() => lock.release());
+        const restarted = yield* make();
+        yield* restarted.materialize("restart-instance", repository);
+        expect(
+          yield* fixtureIo("read recovered instance", () =>
+            readdir(fixture.workspaceRoot),
+          ),
+        ).not.toContain(active);
       }),
   );
 

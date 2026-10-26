@@ -1,4 +1,8 @@
 import { TERMINAL_RUN_STATES } from "../domain/models.js";
+import type {
+  EffectiveRunSettings,
+  SettingName,
+} from "../services/agent-settings.js";
 import { THEME_CONTROLS } from "./theme";
 
 export type RunDetailLevel = "debug" | "info" | "warn" | "result" | "error";
@@ -43,6 +47,7 @@ export interface RunDetailModel {
     readonly url: string | null;
   } | null;
   readonly events: readonly RunDetailEvent[];
+  readonly settings?: EffectiveRunSettings | null;
 }
 
 const LEVELS: readonly RunDetailLevel[] = [
@@ -212,6 +217,35 @@ export function renderRunDetailBody(
       ${rerunButton}
     </section>`
     : "";
+  const settingsMarkup =
+    model.settings == null
+      ? ""
+      : `<section class="run-facts" aria-labelledby="run-settings-heading">
+    <h2 id="run-settings-heading">Effective settings</h2>
+    <dl>${(["driver", "model", "effort", "mode"] as const)
+      .map((key: SettingName) => {
+        const value =
+          key === "driver"
+            ? model.settings?.driver
+            : key === "model"
+              ? model.settings?.modelAlias === null ||
+                model.settings?.modelAlias === undefined
+                ? (model.settings?.ompModel ??
+                  (model.settings?.t3Model === null
+                    ? "environment default"
+                    : `${model.settings?.t3Model?.instanceId}/${model.settings?.t3Model?.model}`))
+                : `${model.settings.modelAlias} (${model.settings.driver === "t3" ? `${model.settings.t3Model?.instanceId}/${model.settings.t3Model?.model}` : model.settings.ompModel})`
+              : key === "effort"
+                ? (model.settings?.effort ?? "runtime default")
+                : model.settings?.runtimeMode;
+        const source = model.settings?.sources[key] ?? "environment";
+        return fact(
+          key === "mode" ? "Runtime mode" : key,
+          `${present(String(value))} <span class="hint">from ${present(source)}</span>`,
+        );
+      })
+      .join("")}</dl>
+  </section>`;
   const filters = LEVELS.map(
     (level) =>
       `<button type="button" class="run-filter" data-run-level-toggle="${level}" aria-pressed="true">${level} <span>${counts[level]}</span></button>`,
@@ -228,6 +262,7 @@ export function renderRunDetailBody(
   </header>
 
   ${issueMarkup}
+  ${settingsMarkup}
 
   <section class="run-facts" aria-labelledby="run-facts-heading">
     <h2 id="run-facts-heading">Run details</h2>

@@ -148,6 +148,11 @@ describe("renderAdminPage", () => {
     expect(html).toContain("/api/admin/nix-cache");
     expect(html).toContain("/api/admin/preview");
     expect(html).toContain("/api/admin/logout");
+    expect(html).toContain("/api/admin/agent-settings");
+    expect(html).toContain(
+      'id="agent-settings-full-access" type="checkbox" checked',
+    );
+    expect(html).toContain("model aliases");
     expect(html).toContain('name="nixPackages"');
     expect(html).toContain("Nix package cache");
 
@@ -427,6 +432,31 @@ describe("renderRunDetailPage", () => {
     expect(html).not.toContain("renderer-secret");
     expect(html).not.toContain("renderer-token");
     expect(html).toContain("redacted");
+  });
+
+  test("shows the frozen effective settings and each setting source", () => {
+    const html = renderRunDetailPage({
+      ...terminalRun,
+      settings: {
+        driver: "t3",
+        modelAlias: "codex",
+        ompModel: null,
+        t3Model: { instanceId: "cliproxy", model: "gpt-6-sol" },
+        effort: "high",
+        runtimeMode: "full-access",
+        warnings: [],
+        sources: {
+          driver: "issue-label",
+          model: "project-label",
+          effort: "admin-default",
+          mode: "environment",
+        },
+      },
+    });
+    expect(html).toContain("Effective settings");
+    expect(html).toContain("codex (cliproxy/gpt-6-sol)");
+    expect(html).toContain("from issue-label");
+    expect(html).toContain("from project-label");
   });
 });
 

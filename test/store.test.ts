@@ -51,6 +51,7 @@ const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 const configProvider = ConfigProvider.fromUnknown(
   Object.fromEntries(
     new Map([
+      ["WORKER_SANDBOX_MODE", "native"],
       ["LINEAR_CLIENT_ID", "test"],
       ["LINEAR_CLIENT_SECRET", "test"],
       ["LINEAR_WEBHOOK_SECRET", "test"],
@@ -374,6 +375,132 @@ describe("Store repositories", () => {
         );
       }),
     ),
+  );
+
+  it.live(
+    "only schedules canceled sessions for prompts received after stop",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const runs = yield* RunRepo;
+          const inputs = yield* RunInputRepo;
+          const sessionId = makeSessionId("stopped-scheduler");
+          yield* runs.create({
+            sessionId,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
+          for (const [id, kind] of [
+            ["old-prompt", "prompted"],
+            ["stop", "stop"],
+          ] as const) {
+            yield* inputs.enqueue({
+              id: makeInputId(id),
+              sessionId,
+              kind,
+              body: id,
+              payload: {},
+              createdAt: 100,
+            });
+          }
+          yield* runs.update(sessionId, { state: "canceled" });
+          yield* inputs.markProcessed(makeInputId("stop"));
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
+          yield* inputs.enqueue({
+            id: makeInputId("new-prompt"),
+            sessionId,
+            kind: "prompted",
+            body: "continue",
+            payload: {},
+            createdAt: 100,
+          });
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([
+            sessionId,
+          ]);
+          expect(
+            (yield* inputs.pending(sessionId)).map((input) => input.id),
+          ).toEqual([makeInputId("old-prompt"), makeInputId("new-prompt")]);
+          expect(yield* inputs.latestActionableInput(sessionId)).toMatchObject(
+            Option.some({ id: makeInputId("new-prompt") }),
+          );
+          yield* inputs.markProcessed(makeInputId("new-prompt"));
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
+          const revoked = makeSessionId("access-revoked");
+          yield* runs.create({
+            sessionId: revoked,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
+          yield* inputs.enqueue({
+            id: makeInputId("revoked-prompt"),
+            sessionId: revoked,
+            kind: "prompted",
+            body: "continue",
+            payload: {},
+          });
+          yield* runs.update(revoked, { state: "canceled" });
+          expect(yield* inputs.listSessionsWithPendingInputs()).toEqual([]);
+        }),
+      ),
+  );
+
+  it.live(
+    "ignores historical catch-up prompts across cancellation without dropping fresh follow-ups",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const runs = yield* RunRepo;
+          const inputs = yield* RunInputRepo;
+          const sessionId = makeSessionId("historical-catchup");
+          yield* runs.create({
+            sessionId,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
+          yield* inputs.enqueue({
+            id: makeInputId("stop-catchup"),
+            sessionId,
+            kind: "stop",
+            body: "stop",
+            payload: {},
+            createdAt: 100,
+          });
+          const recover = (id: string, createdAt: number) =>
+            inputs.enqueue({
+              id: makeInputId(id),
+              sessionId,
+              kind: "prompted",
+              body: "continue",
+              payload: { source: "reconciler.catchup" },
+              createdAt,
+            });
+          // Protect the interval between accepting a stop and completing cleanup.
+          expect(yield* recover("before-stop", 99)).toBe(false);
+          expect(yield* recover("at-stop", 100)).toBe(false);
+          yield* runs.update(sessionId, { state: "canceled" });
+          expect(yield* recover("late-original-delegation", 99)).toBe(false);
+          expect(yield* recover("at-cancellation", 100)).toBe(false);
+          expect(yield* recover("fresh-resume", 101)).toBe(true);
+          // A live webhook keeps its arrival-order semantics, even at equal timestamps.
+          expect(
+            yield* inputs.enqueue({
+              id: makeInputId("live-followup"),
+              sessionId,
+              kind: "prompted",
+              body: "continue",
+              payload: {},
+              createdAt: 100,
+            }),
+          ).toBe(true);
+          expect(
+            (yield* inputs.pending(sessionId)).map((input) => input.id),
+          ).toEqual([
+            makeInputId("stop-catchup"),
+            makeInputId("fresh-resume"),
+            makeInputId("live-followup"),
+          ]);
+        }),
+      ),
   );
 
   it.live("recovers active runs and leases after a process restart", () =>
@@ -1689,7 +1816,12 @@ describe("pure invariants", () => {
                 expect(latest).toEqual(Option.none());
               } else {
                 expect(latest).toEqual(
-                  Option.some({ body, kind, payload: { marker } }),
+                  Option.some({
+                    id: input.id,
+                    body,
+                    kind,
+                    payload: { marker },
+                  }),
                 );
               }
 

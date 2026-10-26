@@ -41,6 +41,7 @@ const RunRowState = Schema.Struct({
     "orphaned",
   ]),
   desired_state: Schema.Literals(["running", "canceled"]),
+  cancellation_at: Schema.Number,
 });
 
 type RunRowState = Schema.Schema.Type<typeof RunRowState>;
@@ -90,7 +91,10 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
             () =>
               db
                 .query<RunRowState, [string]>(
-                  "SELECT state, desired_state FROM agent_run WHERE session_id=?",
+                  `SELECT state, desired_state,
+                    COALESCE((SELECT MAX(created_at) FROM run_input
+                      WHERE session_id=agent_run.session_id AND kind='stop'), updated_at) AS cancellation_at
+                  FROM agent_run WHERE session_id=?`,
                 )
                 .get(sessionId),
             "RunInputRepo.getRunState",
@@ -135,6 +139,19 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
         yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
 
         const tx = Effect.gen(function* () {
+          yield* tryDb(() => {
+            if (
+              input.kind !== "stop" &&
+              db
+                .query(
+                  "SELECT 1 FROM workspace WHERE session_id=? AND state='deleting'",
+                )
+                .get(input.sessionId) !== null
+            )
+              throw new Error(
+                "Workspace deletion is in progress; retry the input",
+              );
+          }, "RunInputRepo.deletionFence");
           const run = yield* getRunState(input.sessionId);
           if (Option.isNone(run)) {
             return yield* Effect.fail(
@@ -146,6 +163,21 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
           // not at enqueue time.
 
           const createdAt = input.createdAt ?? (yield* Clock.currentTimeMillis);
+          // A poll can discover an original delegation only after a stop. Check
+          // inside this transaction so a concurrent stop also fences recovery.
+          // Live webhooks retain arrival ordering and can explicitly resume.
+          if (
+            input.kind === "prompted" &&
+            typeof input.payload === "object" &&
+            input.payload !== null &&
+            "source" in input.payload &&
+            input.payload.source === "reconciler.catchup" &&
+            (run.value.desired_state === "canceled" ||
+              run.value.state === "canceled") &&
+            (!Number.isFinite(createdAt) ||
+              createdAt <= run.value.cancellation_at)
+          )
+            return false;
           const insertResult = yield* tryDb(
             () =>
               db
@@ -222,7 +254,7 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
           () =>
             db
               .query<RunInputRow, [string]>(
-                "SELECT id, session_id, kind, body, payload_json, created_at FROM run_input WHERE session_id=? AND processed_at IS NULL ORDER BY created_at, id",
+                "SELECT id, session_id, kind, body, payload_json, created_at FROM run_input WHERE session_id=? AND processed_at IS NULL ORDER BY rowid",
               )
               .all(sessionId),
           "RunInputRepo.pending",
@@ -235,6 +267,7 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
         "RunInputRepo.latestActionableInput",
       )(function* (sessionId: SessionId): Effect.fn.Return<
         Option.Option<{
+          readonly id: string;
           readonly body: string;
           readonly kind: InputKind;
           readonly payload: unknown;
@@ -246,12 +279,17 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
           () =>
             db
               .query<
-                { body: string; kind: InputKind; payload_json: string },
+                {
+                  id: string;
+                  body: string;
+                  kind: InputKind;
+                  payload_json: string;
+                },
                 [string]
               >(`
-                SELECT body, kind, payload_json FROM run_input
+                SELECT id, body, kind, payload_json FROM run_input
                 WHERE session_id=? AND kind!='stop'
-                ORDER BY created_at DESC, id DESC
+                ORDER BY rowid DESC
                 LIMIT 1
               `)
               .get(sessionId),
@@ -265,7 +303,12 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
               message: "Invalid JSON in run_input.payload_json",
             }),
         });
-        return Option.some({ body: row.body, kind: row.kind, payload });
+        return Option.some({
+          id: row.id,
+          body: row.body,
+          kind: row.kind,
+          payload,
+        });
       });
 
       const listSessionsWithPendingInputs = Effect.fn(
@@ -282,6 +325,15 @@ export class RunInputRepo extends Context.Service<RunInputRepo>()(
                   FROM agent_run r
                   JOIN run_input i ON i.session_id=r.session_id AND i.processed_at IS NULL
                   WHERE r.state NOT IN ('succeeded','failed','canceled')
+                    OR (
+                      r.state='canceled' AND r.desired_state='canceled'
+                      AND i.kind='prompted'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM run_input stop
+                        WHERE stop.session_id=r.session_id AND stop.kind='stop'
+                          AND stop.rowid>i.rowid
+                      )
+                    )
                   ORDER BY r.session_id
                 `)
               .all(),

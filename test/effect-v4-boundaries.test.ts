@@ -53,6 +53,7 @@ const httpServices = GatewayServicesLive.pipe(
   Layer.provide(
     ConfigProvider.layer(
       ConfigProvider.fromUnknown({
+        WORKER_SANDBOX_MODE: "native",
         LINEAR_CLIENT_ID: "dummy-client",
         LINEAR_CLIENT_SECRET: "dummy-secret",
         LINEAR_WEBHOOK_SECRET: "dummy-webhook",

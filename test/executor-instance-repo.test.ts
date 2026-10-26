@@ -13,6 +13,7 @@ const key = Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64");
 const configProvider = ConfigProvider.fromUnknown(
   Object.fromEntries(
     new Map<string, string>([
+      ["WORKER_SANDBOX_MODE", "native"],
       ["LINEAR_CLIENT_ID", "test"],
       ["LINEAR_CLIENT_SECRET", "test"],
       ["LINEAR_WEBHOOK_SECRET", "test"],

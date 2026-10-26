@@ -21,6 +21,7 @@ import {
   transact,
   tryDb,
 } from "./sqlite-client.js";
+import { assertWorkspaceAvailable } from "./workspace-deletion.js";
 
 const DriverSessionRef = Schema.Struct({
   driver: Schema.Literals(["omp", "t3"]),
@@ -238,26 +239,35 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
         }): Effect.fn.Return<void, DatabaseError> {
           yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
           const now = yield* Clock.currentTimeMillis;
-          yield* tryDb(
-            () =>
-              db
-                .query(`
+          yield* transact(
+            db,
+            Effect.gen(function* () {
+              yield* tryDb(
+                () => assertWorkspaceAvailable(db, input.sessionId, input.path),
+                "WorkspaceRepo.deletionFence",
+              );
+              yield* tryDb(
+                () =>
+                  db
+                    .query(`
               INSERT INTO workspace (session_id, canonical_path, repository_id, repository_url, repository_ref, state, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT(session_id) DO UPDATE SET canonical_path=excluded.canonical_path, repository_id=excluded.repository_id,
                 repository_url=excluded.repository_url, repository_ref=excluded.repository_ref, state=excluded.state, updated_at=excluded.updated_at
             `)
-                .run(
-                  input.sessionId,
-                  input.path,
-                  input.repositoryId,
-                  input.url,
-                  input.ref,
-                  input.state,
-                  now,
-                  now,
-                ),
-            "WorkspaceRepo.setWorkspace",
+                    .run(
+                      input.sessionId,
+                      input.path,
+                      input.repositoryId,
+                      input.url,
+                      input.ref,
+                      input.state,
+                      now,
+                      now,
+                    ),
+                "WorkspaceRepo.setWorkspace",
+              );
+            }),
           );
         },
       );

@@ -1,0 +1,25 @@
+[Unit]
+Description=Partitura per-session sandbox lifecycle broker request
+After=network.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+TimeoutStopSec=20s
+User=root
+Group=root
+EnvironmentFile=/etc/partitura-sandbox/broker.env
+ExecStart=/usr/bin/python3 /opt/partitura-sandbox/broker.py
+ExecStopPost=/usr/bin/python3 /opt/partitura-sandbox/broker.py --cleanup-firewall
+StandardInput=socket
+NoNewPrivileges=true
+PrivateTmp=true
+StateDirectory=partitura-sandbox partitura-vms
+StateDirectoryMode=0700
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/partitura-sandbox /var/lib/partitura-sandbox /var/lib/partitura-vms -/run/xtables.lock
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0077

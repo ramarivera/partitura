@@ -225,6 +225,20 @@ export const ADMIN_BODY = `
       </div>
     </section>
 
+    <section class="panel" aria-labelledby="agent-settings-heading">
+      <div class="panel-header">
+        <h2 id="agent-settings-heading">Run settings</h2>
+        <span class="hint">Organization defaults apply to new runs. Each run keeps its settings snapshot across retries.</span>
+      </div>
+      <div class="panel-body">
+        <div id="agent-settings-status" role="status" aria-live="polite"></div>
+        <label class="checkbox" for="agent-settings-full-access"><input id="agent-settings-full-access" type="checkbox" checked> Allow full-access runtime mode from issue or project labels</label>
+        <div class="field full"><label for="agent-settings-json">Defaults, label prefixes, and model aliases (JSON)</label><textarea id="agent-settings-json" rows="16" spellcheck="false" aria-describedby="agent-settings-help"></textarea>
+          <span class="hint" id="agent-settings-help">Set <code>defaults.ompModel</code> and <code>defaults.t3Model</code> for driver-specific defaults, or <code>defaults.model</code> for a shared fallback. Aliases map to <code>omp</code> model IDs and/or a T3 <code>instanceId</code>, <code>model</code>, and typed options. Labels use driver:, model:, effort:, and mode: prefixes by default. Full-access labels are allowed by default.</span></div>
+        <div class="form-actions"><button type="button" class="btn btn-primary" id="agent-settings-save">Save run settings</button></div>
+      </div>
+    </section>
+
     <section class="panel" aria-labelledby="preview-heading">
       <div class="panel-header">
         <h2 id="preview-heading">Route preview</h2>
@@ -293,6 +307,7 @@ export const ADMIN_SCRIPT = `
   var MCP_DETAIL = function (id) { return MCP_BASE + "/" + encodeURIComponent(id); };
   var LOGOUT_URL = "/api/admin/logout";
   var PROMPT_TEMPLATES_URL = "/api/admin/prompt-templates";
+  var AGENT_SETTINGS_URL = "/api/admin/agent-settings";
   var EXECUTOR_BASE = "/api/admin/executor-instance";
   var EXECUTOR_TOOLKITS = "/api/admin/executor/toolkits";
   var EXECUTOR_ATTACH = "/api/admin/executor/attach";
@@ -1326,6 +1341,10 @@ export const ADMIN_SCRIPT = `
       state.installation = data.installation || null;
       state.repositories = Array.isArray(data.repositories) ? data.repositories : [];
       state.mcpServers = Array.isArray(data.mcpServers) ? data.mcpServers : [];
+      var settingsField = el("agent-settings-json");
+      if (settingsField && data.agentSettings) settingsField.value = JSON.stringify(data.agentSettings, null, 2);
+      var fullAccessToggle = el("agent-settings-full-access");
+      if (fullAccessToggle && data.agentSettings) fullAccessToggle.checked = data.agentSettings.allowFullAccessViaLabel !== false;
       state.executorInstance = data.executorInstance || null;
       if (!preserveExecutorToolkits) state.executorToolkits = [];
       renderInstallation(state.installation);
@@ -1370,6 +1389,22 @@ export const ADMIN_SCRIPT = `
       setAriaBusy("repos-list", false);
       setStatus("warn", "load error");
     }
+  }
+
+  async function saveAgentSettings() {
+    var status = el("agent-settings-status");
+    var button = el("agent-settings-save");
+    try {
+      var payload = JSON.parse(el("agent-settings-json").value);
+      payload.allowFullAccessViaLabel = !!el("agent-settings-full-access").checked;
+      if (button) button.disabled = true;
+      var result = await fetchJSON(AGENT_SETTINGS_URL, { method: "PUT", body: payload });
+      if (result && result.redirecting) return;
+      el("agent-settings-json").value = JSON.stringify(result.data.settings, null, 2);
+      if (status) status.textContent = "Saved. New runs will use these settings.";
+    } catch (err) {
+      if (status) status.textContent = err && err.message ? err.message : "Could not save run settings.";
+    } finally { if (button) button.disabled = false; }
   }
 
 
@@ -1434,6 +1469,8 @@ export const ADMIN_SCRIPT = `
     });
     var promptSave = el("prompt-templates-save");
     if (promptSave) promptSave.addEventListener("click", savePromptTemplates);
+    var agentSettingsSave = el("agent-settings-save");
+    if (agentSettingsSave) agentSettingsSave.addEventListener("click", saveAgentSettings);
 
     var list = el("repos-list");
     if (list) list.addEventListener("click", handleRepoRowClick);

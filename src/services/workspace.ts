@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import {
   lstat,
@@ -22,12 +22,14 @@ import {
 import type { OrganizationId } from "../domain/ids.js";
 import type { RepositoryRecord } from "../domain/models.js";
 import { isWithin } from "../util/paths.js";
+import { acquireCloneLock } from "./clone-lock.js";
 import { GatewayConfig } from "./config.js";
 import {
   buildGitHubExtraHeader,
   GitHubApp,
   type GitHubAppTokenService,
 } from "./github-app.js";
+import { startGitHubGitBroker } from "./github-git-broker.js";
 import { detachedProcessGroup, signalProcessTree } from "./process.js";
 import { WorkspaceRepo } from "./store/repositories.js";
 import {
@@ -810,6 +812,8 @@ export const makeWorkspace = (input: {
   readonly githubApp: GitHubAppTokenService | undefined;
 }) =>
   Effect.gen(function* () {
+    const runtime = yield* Effect.context<never>();
+    const runPromise = Effect.runPromiseWith(runtime);
     const hostKey = createHash("sha256")
       .update(hostname())
       .digest("hex")
@@ -836,6 +840,27 @@ export const makeWorkspace = (input: {
                   let removed = 0;
                   for await (const entry of entries) {
                     if (++scanned > 10_000 || removed >= 100) break;
+                    const lockedOwner =
+                      /^\.[a-f0-9]{32}-clone-v2-([a-f0-9]{32})-[A-Za-z0-9]+$/u.exec(
+                        entry.name,
+                      );
+                    if (lockedOwner !== null && entry.isDirectory()) {
+                      const ownerId = lockedOwner[1];
+                      if (ownerId === undefined) continue;
+                      const lock = await acquireCloneLock(root, ownerId);
+                      if (lock === undefined) continue;
+                      try {
+                        await removeWorkerWorkspace(
+                          join(root, entry.name),
+                          root,
+                          workerUid,
+                        );
+                        removed++;
+                      } finally {
+                        await lock.release();
+                      }
+                      continue;
+                    }
                     const owner =
                       /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
                         entry.name,
@@ -904,6 +929,29 @@ export const makeWorkspace = (input: {
       cwd: string | undefined,
       sessionId: string,
     ) => runGit(args, cwd, sessionId, input.gitTimeoutMs);
+    const hasGitRepository = (
+      target: string,
+      sessionId: string,
+    ): Effect.Effect<boolean, WorkspaceError> =>
+      Effect.promise(() =>
+        lstat(join(target, ".git")).then(
+          (info) =>
+            !info.isSymbolicLink() && (info.isDirectory() || info.isFile()),
+          () => false,
+        ),
+      ).pipe(
+        Effect.flatMap((ownsGit) =>
+          ownsGit
+            ? runGitOutput(["rev-parse", "--git-dir"], target, sessionId).pipe(
+                Effect.as(true),
+              )
+            : Effect.succeed(false),
+        ),
+        Effect.catchIf(
+          (error) => error.message.includes("not a git repository"),
+          () => Effect.succeed(false),
+        ),
+      );
     const resolve = Effect.fn("Workspace.resolve")(function* (
       context: unknown,
     ): Effect.fn.Return<RepositoryResolution, DatabaseError | RowDecodeError> {
@@ -958,23 +1006,130 @@ export const makeWorkspace = (input: {
       "Workspace.refreshGitHubExtraHeader",
     )(function* (
       sessionId: string,
-      repository: RepositoryRecord,
+      _repository: RepositoryRecord,
       target: string,
     ): Effect.fn.Return<void, WorkspaceError> {
-      const githubExtraHeader =
-        input.githubApp === undefined
-          ? undefined
-          : yield* mintGitHubExtraHeader(
-              input.githubApp,
-              repository,
-              sessionId,
-            );
       yield* configureGitIdentity(sessionId, target);
-      if (githubExtraHeader === undefined) {
-        yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
-        return;
-      }
-      yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
+      // Installation tokens stay in the gateway. Workers get a session-bound
+      // Git broker URL at launch, never a credential in repository config.
+      yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
+    });
+
+    const clearGitBrokerConfig = Effect.fn("Workspace.clearGitBrokerConfig")(
+      function* (
+        sessionId: string,
+        target: string,
+      ): Effect.fn.Return<void, WorkspaceError> {
+        const hasGitDir = yield* hasGitRepository(target, sessionId);
+        if (!hasGitDir) return;
+        const entries = yield* runGitOutput(
+          [
+            "config",
+            "--local",
+            "--get-regexp",
+            "^url\\.http://[^[:space:]]*/git/[A-Za-z0-9_-]+/[^/[:space:]]+/[^/[:space:]]+\\.insteadOf$",
+          ],
+          target,
+          sessionId,
+          input.gitTimeoutMs,
+          undefined,
+          true,
+        );
+        const keys = entries
+          .split(/\r?\n/u)
+          .map((entry) => entry.slice(0, entry.indexOf(" ")))
+          .filter((key) => key.length > 0);
+        yield* Effect.forEach(
+          keys,
+          (key) =>
+            git(["config", "--local", "--unset-all", key], target, sessionId),
+          { discard: true },
+        );
+      },
+    );
+
+    const configureGitBroker = Effect.fn("Workspace.configureGitBroker")(
+      function* (
+        sessionId: string,
+        target: string,
+        broker: ReturnType<typeof startGitHubGitBroker>,
+        relayBaseUrl?: string,
+      ): Effect.fn.Return<void, WorkspaceError> {
+        const hasGitDir = yield* hasGitRepository(target, sessionId);
+        if (!hasGitDir) return;
+        const config =
+          relayBaseUrl === undefined
+            ? { key: broker.gitConfigKey, value: broker.gitConfigValue }
+            : broker.gitConfigFor(relayBaseUrl);
+        yield* clearGitBrokerConfig(sessionId, target);
+        // A long-lived shallow checkout may no longer contain an advertised
+        // branch tip. Negotiate common objects before packing instead of
+        // resending the entire snapshot through the bounded session broker.
+        yield* git(
+          ["config", "--local", "--replace-all", "push.negotiate", "true"],
+          target,
+          sessionId,
+        );
+        yield* git(
+          ["config", "--local", "--replace-all", config.key, config.value],
+          target,
+          sessionId,
+        );
+      },
+    );
+
+    const openGitBroker = Effect.fn("Workspace.openGitBroker")(function* (
+      sessionId: string,
+      repository: RepositoryRecord,
+      bindHost?: string,
+    ) {
+      if (!isHttpsGitHubRepositoryUrl(repository.url)) return undefined;
+      const candidate = parseRepositorySuggestionCandidate(repository.url);
+      if (
+        candidate === null ||
+        candidate.hostname.toLowerCase() !== "github.com"
+      )
+        return undefined;
+      const [owner, repositoryName] = candidate.repositoryFullName.split("/");
+      if (!owner || !repositoryName) return undefined;
+      const acquireToken =
+        input.githubApp === undefined
+          ? Effect.succeed(undefined)
+          : input.githubApp
+              .getInstallationToken(
+                owner,
+                repositoryName,
+                repository.organizationId,
+              )
+              .pipe(
+                Effect.catch((error) =>
+                  error.reason === "not_installed"
+                    ? Effect.succeed(undefined)
+                    : Effect.fail(
+                        workspaceFailure(
+                          "Could not acquire GitHub installation credentials",
+                          "git_failed",
+                          sessionId,
+                        )(error),
+                      ),
+                ),
+              );
+      // Fail startup on denied credentials, then use the App service's expiring
+      // cache for each request so long runs can push after the first hour.
+      yield* acquireToken;
+      return yield* Effect.try({
+        try: () =>
+          startGitHubGitBroker({
+            repository,
+            tokenForRequest: (signal) => runPromise(acquireToken, { signal }),
+            ...(bindHost === undefined ? {} : { bindHost }),
+          }),
+        catch: workspaceFailure(
+          "Could not start GitHub Git broker",
+          "git_failed",
+          sessionId,
+        ),
+      });
     });
 
     const configureGitIdentity = Effect.fn("Workspace.configureGitIdentity")(
@@ -987,7 +1142,8 @@ export const makeWorkspace = (input: {
         // into whatever repository encloses the target.
         const ownsGitDir = yield* Effect.promise(() =>
           lstat(join(target, ".git")).then(
-            () => true,
+            (info) =>
+              !info.isSymbolicLink() && (info.isDirectory() || info.isFile()),
             () => false,
           ),
         );
@@ -1041,7 +1197,10 @@ export const makeWorkspace = (input: {
       sessionId: string,
       target: string,
     ): Effect.Effect<void, never> =>
-      unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
+      Effect.andThen(
+        unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs),
+        clearGitBrokerConfig(sessionId, target).pipe(Effect.ignore),
+      );
 
     const materialize = Effect.fn("Workspace.materialize")(function* (
       sessionId: string,
@@ -1203,13 +1362,30 @@ export const makeWorkspace = (input: {
 
       yield* Effect.scoped(
         Effect.gen(function* () {
+          const cloneOwner = randomBytes(16).toString("hex");
+          yield* Effect.acquireRelease(
+            Effect.tryPromise({
+              try: async () => {
+                const lock = await acquireCloneLock(canonicalRoot, cloneOwner);
+                if (lock === undefined)
+                  throw new Error("Clone owner collision");
+                return lock;
+              },
+              catch: workspaceFailure(
+                "acquire clone ownership",
+                "git_failed",
+                sessionId,
+              ),
+            }),
+            (lock) => Effect.promise(() => lock.release()),
+          );
           const staging = yield* Effect.acquireRelease(
             Effect.tryPromise({
               try: () =>
                 mkdtemp(
                   join(
                     canonicalRoot,
-                    `.${safeSessionKey(sessionId)}-clone-${hostKey}-${process.pid}-`,
+                    `.${safeSessionKey(sessionId)}-clone-v2-${cloneOwner}-`,
                   ),
                 ),
               catch: workspaceFailure(
@@ -1238,7 +1414,9 @@ export const makeWorkspace = (input: {
           const cloneArgs = [
             "clone",
             "--no-checkout",
-            "--filter=blob:none",
+            // Checkout runs without gateway credentials. Fetch complete blobs
+            // now so it never needs an authenticated promisor download.
+            "--depth=1",
             "--",
             repository.url,
             staging,
@@ -1259,20 +1437,13 @@ export const makeWorkspace = (input: {
                 sessionId,
               ),
             });
-          if (githubExtraHeader !== undefined) {
-            yield* persistGitHubExtraHeader(
-              staging,
-              sessionId,
-              githubExtraHeader,
-            );
-          }
-          // If anything after persisting the header fails, drop it so the next
-          // attempt doesn't inherit a stale/expired credential.
           yield* Effect.gen(function* () {
-            yield* git(
+            yield* runGit(
               ["fetch", "--depth=1", "--", "origin", repository.ref],
               staging,
               sessionId,
+              input.gitTimeoutMs,
+              githubExtraHeader,
             );
             yield* git(
               ["checkout", "--detach", "--force", "FETCH_HEAD", "--"],
@@ -1285,17 +1456,7 @@ export const makeWorkspace = (input: {
               repository,
               sessionId,
             );
-          }).pipe(
-            Effect.onError(() =>
-              githubExtraHeader === undefined
-                ? Effect.void
-                : unsetGitHubExtraHeader(
-                    staging,
-                    sessionId,
-                    input.gitTimeoutMs,
-                  ),
-            ),
-          );
+          });
 
           yield* Effect.tryPromise({
             try: () => rename(staging, target),
@@ -1339,6 +1500,9 @@ export const makeWorkspace = (input: {
       resolve,
       materialize,
       refreshGitHubExtraHeader,
+      openGitBroker,
+      configureGitBroker,
+      clearGitBrokerConfig,
       clearGitHubExtraHeader,
     };
   });

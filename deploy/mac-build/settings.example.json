@@ -1,0 +1,43 @@
+{
+  "enabled": false,
+  "host": "generic-mac-host",
+  "account": "partitura-build",
+  "guest_user": "partitura",
+  "authorized_key": "",
+  "source": {
+    "partitura_repository": "/Users/operator/dev/partitura",
+    "broker_commit": "REVIEWED_PARTITURA_COMMIT",
+    "broker_sha256": "REVIEWED_BROKER_SHA256",
+    "guest_runner_sha256": "REVIEWED_GUEST_RUNNER_SHA256",
+    "native_host_sha256": "REVIEWED_NATIVE_HOST_LAUNCHER_SHA256",
+    "install_host_sha256": "REVIEWED_INSTALLER_SHA256",
+    "qualifier_source": "/Users/operator/dev/partitura/deploy/mac-build/qualify-base.sh",
+    "qualifier_sha256": "REVIEWED_QUALIFIER_SHA256",
+    "credential_writer_sha256": "REVIEWED_CREDENTIAL_WRITER_SHA256"
+  },
+  "tart": {
+    "source_app": "/Users/operator/dev/agentic-scratchpads/partitura/host-inputs/tart.app",
+    "installed_app": "/Library/Partitura/NativeBuild/tart.app",
+    "executable_relative_path": "Contents/MacOS/tart",
+    "sha256": "REVIEWED_TART_EXECUTABLE_SHA256"
+  },
+  "base": {
+    "name": "partitura-macos-base",
+    "source_name": "clean-macos-base",
+    "source_path": "/Users/operator/dev/agentic-scratchpads/partitura/preparation/tart/vms/clean-macos-base",
+    "source_sha256": "REVIEWED_CLEAN_VM_TREE_SHA256",
+    "mise_binary": "/Users/operator/dev/agentic-scratchpads/partitura/host-inputs/mise-macos-arm64",
+    "mise_version": "2026.10.15",
+    "mise_sha256": "826c4833fa7437a63f6027b86bc10c8b61b1163dc793c03ecde92f68ad167890",
+    "node_version": "24.22.1",
+    "python_version": "3.13.17",
+    "dedicated_path": "/Volumes/Builds/partitura/tart/vms/partitura-macos-base",
+    "sha256": "",
+    "qualification_receipt": "/Library/Partitura/NativeBuild/qualification/partitura-macos-base.json"
+  },
+  "runtime": {
+    "root": "/Users/partitura-build/dev/agentic-scratchpads/partitura/native-build",
+    "tart_home": "/Volumes/Builds/partitura/tart"
+  },
+  "predecessor_manifest_sha256": ""
+}

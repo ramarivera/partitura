@@ -33,6 +33,7 @@ export const openDriverWorker = (
   input: OpenSessionInput,
   legacy?: RpcWorkerHandle,
   stallTimeoutMs = 300_000,
+  toolStallTimeoutMs = 1_800_000,
 ) =>
   Effect.gen(function* () {
     const parentScope = yield* Effect.scope;
@@ -45,6 +46,7 @@ export const openDriverWorker = (
     let lastProgressAt = yield* Clock.currentTimeMillis;
     let awaitingOutcome = false;
     let ownedTurnId: string | undefined;
+    const activeTools = new Set<string>();
     const listeners = new Set<(event: RpcEvent) => void>();
     const questions = new Map<string, ReadonlyArray<UserQuestion>>();
     const emit = (event: RpcEvent) => {
@@ -120,11 +122,13 @@ export const openDriverWorker = (
             yield* Effect.sleep(Math.min(1_000, stallTimeoutMs));
             const lastActivityAt = yield* session.lastActivityAt ??
               Effect.succeed(lastProgressAt);
+            const idleTimeoutMs =
+              activeTools.size > 0 ? toolStallTimeoutMs : stallTimeoutMs;
             if (
               awaitingOutcome &&
               (yield* Clock.currentTimeMillis) -
                 Math.max(lastProgressAt, lastActivityAt) >=
-                stallTimeoutMs
+                idleTimeoutMs
             ) {
               awaitingOutcome = false;
               if (ownedTurnId !== undefined)
@@ -133,7 +137,7 @@ export const openDriverWorker = (
                   .pipe(Effect.catch(() => Effect.void));
               emit({
                 type: "error",
-                message: `T3 stalled for ${stallTimeoutMs}ms`,
+                message: `T3 stalled for ${idleTimeoutMs}ms`,
               });
             }
           }),
@@ -235,6 +239,10 @@ export const openDriverWorker = (
               Stream.runForEach((event) =>
                 Effect.gen(function* () {
                   lastProgressAt = yield* Clock.currentTimeMillis;
+                  if (event._tag === "ToolStarted")
+                    activeTools.add(event.toolCallId);
+                  if (event._tag === "ToolEnded")
+                    activeTools.delete(event.toolCallId);
                   // Outcomes are watched from sendTurn so historical terminal runs in a
                   // resumed snapshot cannot finish the new authority attempt.
                   if (session.ref.driver === "t3" && event._tag === "TurnEnded")

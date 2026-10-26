@@ -137,8 +137,11 @@ runs must be provided after `recoveredServices`.
   `PRAGMA table_info`. New columns need a default or must be nullable so old
   rows stay valid. Don't drop or rename columns in place; follow the
   `activity_projection_v2` copy-and-swap pattern if a rebuild is unavoidable.
-- `Retention` runs its sweep synchronously in a `db.transaction(...).immediate()`
-  because workspace removal holds a reopen fence that must not yield.
+- `Retention` claims workspaces in a short immediate transaction by setting
+  `workspace.state='deleting'`, removes contents asynchronously as the worker uid,
+  then finalizes metadata in another transaction. Reopen, new path references,
+  leases and uid recycling respect that durable fence. Kernel flock serializes
+  sweepers across processes; failed/interrupted claims survive restart.
 - Run-event pagination: `RunEventRepo.list(sessionId, { limit, cursor })` with
   `{ createdAt, sourceKey }` cursors; the admin run JSON route reads `limit`
   (default 100) and `cursor` query params.
@@ -168,7 +171,7 @@ Summary only. `docs/security.md` is authoritative.
   escalation. Unset in native dev means same-uid workers.
 - Workspace roots are mode 0700 and owned by the session uid.
   `prepareWorkerWorkspace` (async, clone/resume) and
-  `prepareWorkerWorkspaceSync` (retention) chown with a no-follow descriptor
+  `prepareWorkerWorkspaceSync` chown with a no-follow descriptor
   walk and reject foreign hardlinks.
 - Writes into worker-controlled trees (MCP config, Git credential headers,
   cleanup) run as the worker uid through `src/workspace-worker.ts`, started

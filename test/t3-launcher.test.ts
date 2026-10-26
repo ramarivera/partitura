@@ -151,12 +151,20 @@ describe("T3 launcher pure parts", () => {
       cliproxyApiBaseUrl: "https://cliproxyapi.example.test/",
       launch: launchConfig("t3"),
       runtimeMode: "auto",
-      defaultModel: { instanceId: "codex-cliproxy", model: "gpt-6-sol" },
+      defaultModel: {
+        instanceId: "codex-cliproxy",
+        model: "gpt-6-sol",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
     });
     const text = JSON.stringify(rendered);
     expect(text).not.toContain("proxy-client-key");
     expect(text).not.toMatch(/ANTHROPIC_(?:AUTH_TOKEN|API_KEY)|apiKey/u);
     const instances = rendered.settings.providerInstances;
+    expect(rendered.settings.defaultModelSelection).toEqual({
+      instanceId: "codex-cliproxy",
+      model: "gpt-6-sol",
+    });
     expect(
       Object.entries(instances)
         .filter(([, instance]) => instance.enabled)
@@ -171,7 +179,68 @@ describe("T3 launcher pure parts", () => {
       'base_url = "https://cliproxyapi.example.test/v1"',
     );
     expect(rendered.codexConfig).toContain('env_key = "CLIPROXYAPI_API_KEY"');
+    expect(rendered.claudeConfig).toEqual({ mcpServers: {} });
   });
+
+  it("adds the session Linear MCP endpoint to both provider homes", () => {
+    const rendered = renderT3LaunchSettings({
+      cwd: "/app/workspaces/s1",
+      cliproxyApiBaseUrl: "https://cliproxyapi.example.test",
+      launch: launchConfig("t3"),
+      runtimeMode: "auto",
+      defaultModel: { instanceId: "codex-cliproxy", model: "gpt-6-sol" },
+      linearMcp: {
+        url: "http://127.0.0.1:43210/mcp",
+        authorizationHeader: "Bearer session-linear-secret",
+      },
+    });
+    expect(rendered.codexConfig).toContain("[mcp_servers.linear]");
+    expect(rendered.codexConfig).toContain(
+      'url = "http://127.0.0.1:43210/mcp"',
+    );
+    expect(rendered.codexConfig).toContain(
+      'http_headers = { Authorization = "Bearer session-linear-secret" }',
+    );
+    expect(rendered.claudeConfig).toEqual({
+      mcpServers: {
+        linear: {
+          type: "http",
+          url: "http://127.0.0.1:43210/mcp",
+          headers: { Authorization: "Bearer session-linear-secret" },
+        },
+      },
+    });
+  });
+
+  it.live(
+    "writes sandbox provider settings into the gateway-owned workspace",
+    () =>
+      Effect.promise(async () => {
+        const cwd = workspaceFor("sandbox-settings");
+        const rendered = renderT3LaunchSettings({
+          cwd: "/workspace",
+          cliproxyApiBaseUrl: "https://cliproxyapi.example.test",
+          launch: launchConfig("t3"),
+          runtimeMode: "auto",
+          defaultModel: { instanceId: "codex-cliproxy", model: "gpt-6-sol" },
+        });
+        await workspaceProcess(cwd, "t3-config", rendered);
+        const paths = t3SessionPaths(cwd);
+        const settings = JSON.parse(
+          readFileSync(join(paths.t3Home, "userdata", "settings.json"), "utf8"),
+        );
+        expect(
+          settings.providerInstances["codex-cliproxy"].config.homePath,
+        ).toBe("/workspace/.omp-home/t3/codex-cliproxy");
+        expect(
+          settings.providerInstances["claude-cliproxy"].config.homePath,
+        ).toBe("/workspace/.omp-home/t3/claude-cliproxy");
+        expect(readFileSync(join(paths.codexHome, "config.toml"), "utf8")).toBe(
+          rendered.codexConfig,
+        );
+        expect(JSON.stringify(settings)).not.toContain(cwd);
+      }),
+  );
 });
 
 describe("T3 launcher lifecycle", () => {

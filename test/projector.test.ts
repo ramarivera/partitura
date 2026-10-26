@@ -81,6 +81,8 @@ const mockLinear = LinearGateway.of({
   listSessionActivities: unused,
   getIssue: unused,
   updateIssue: unused,
+  workspaceRead: unused,
+  workspaceWrite: unused,
   addSessionExternalUrls: unused,
   teamStartedStates: unused,
   repositorySuggestions: unused,

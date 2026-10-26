@@ -60,6 +60,7 @@ const configProvider = ConfigProvider.fromUnknown(
   Object.fromEntries(
     new Map<string, string>([
       ["PUBLIC_URL", PUBLIC_URL],
+      ["WORKER_SANDBOX_MODE", "native"],
       ["LINEAR_CLIENT_ID", "client"],
       ["LINEAR_CLIENT_SECRET", "secret"],
       ["LINEAR_WEBHOOK_SECRET", "webhook"],
@@ -974,6 +975,7 @@ describe("admin run-event pagination", () => {
           "lastActivityAt",
           "run",
           "sessionId",
+          "settings",
           "state",
         ]);
         const detail = yield* Schema.decodeUnknownEffect(detailSchema)(body);

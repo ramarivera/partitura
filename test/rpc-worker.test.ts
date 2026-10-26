@@ -109,6 +109,45 @@ describe("RpcWorker", () => {
       }).pipe(Effect.provide(Live)),
   );
 
+  it.live(
+    "uses run-created proxies while dropping inherited proxy and Mise settings",
+    () =>
+      Effect.gen(function* () {
+        const worker = yield* RpcWorker.use((service) =>
+          service.spawn({
+            command: [
+              process.execPath,
+              "-e",
+              `
+              if (process.env.HTTP_PROXY !== "http://session-proxy:8080" ||
+                  process.env.HTTPS_PROXY !== "http://session-proxy:8080" ||
+                  process.env.NO_PROXY !== "localhost,127.0.0.1")
+                throw new Error("Run proxy settings were lost");
+              for (const name of ["ALL_PROXY", "MISE_CONFIG_DIR", "MISE_TRUSTED_CONFIG_PATHS"])
+                if (process.env[name] !== undefined)
+                  throw new Error("Inherited gateway setting reached worker: " + name);
+              await import(${JSON.stringify(fixture)});
+            `,
+            ],
+            cwd: process.cwd(),
+            env: {
+              HTTP_PROXY: "http://gateway-secret:8080",
+              ALL_PROXY: "http://gateway-secret:8080",
+              MISE_CONFIG_DIR: "/gateway/config",
+              MISE_TRUSTED_CONFIG_PATHS: "/gateway",
+            },
+            injectedEnv: {
+              HTTP_PROXY: "http://session-proxy:8080",
+              HTTPS_PROXY: "http://session-proxy:8080",
+              NO_PROXY: "localhost,127.0.0.1",
+            },
+          }),
+        );
+        yield* worker.start();
+        yield* worker.stop();
+      }).pipe(Effect.provide(Live)),
+  );
+
   it.effect("negotiates v2 and exposes session id/file/state", () =>
     Effect.gen(function* () {
       const rpc = yield* RpcWorker;

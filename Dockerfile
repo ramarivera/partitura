@@ -43,6 +43,29 @@ WORKDIR /opt/omp-extensions
 COPY deploy/worker-extensions/package.json deploy/worker-extensions/bun.lock ./
 RUN bun install --frozen-lockfile --production --omit=optional --ignore-scripts
 
+FROM oven/bun:1.3.14 AS common-tools
+ARG TARGETARCH
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+COPY deploy/build-tools/fetch-mise.sh /usr/local/bin/fetch-mise
+RUN case "$TARGETARCH" in amd64) platform=linux-x64 ;; arm64) platform=linux-arm64 ;; *) exit 64 ;; esac \
+  && bash /usr/local/bin/fetch-mise "$platform" /usr/local/bin/mise
+COPY deploy/build-tools/mise.toml /opt/partitura/build-tools/mise.toml
+ENV MISE_DATA_DIR=/opt/partitura/mise
+ENV MISE_TRUSTED_CONFIG_PATHS=/opt/partitura/build-tools
+ENV MISE_YES=1
+WORKDIR /opt/partitura/build-tools
+RUN /usr/local/bin/mise install \
+  && install -d /opt/partitura/bin \
+  && for tool in node python python3; do \
+       ln -s "$(/usr/local/bin/mise which "$tool")" "/opt/partitura/bin/$tool"; \
+     done \
+  && node_root="$(dirname "$(dirname "$(/usr/local/bin/mise which node)")")" \
+  && ln -s "$node_root/lib/node_modules/npm/bin/npm-cli.js" /opt/partitura/bin/npm \
+  && ln -s "$node_root/lib/node_modules/npm/bin/npx-cli.js" /opt/partitura/bin/npx \
+  && chmod -R go-w /opt/partitura
+
 FROM oven/bun:1.3.14 AS build
 WORKDIR /app
 COPY package.json bun.lock* ./
@@ -54,14 +77,14 @@ RUN bun run build
 FROM oven/bun:1.3.14
 WORKDIR /app
 ENV NODE_ENV=production
-ENV PATH="/opt/nix/bin:/app/node_modules/.bin:${PATH}"
+ENV PATH="/opt/partitura/bin:/opt/nix/bin:/app/node_modules/.bin:${PATH}"
 ENV NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 # Install a pinned single-user Nix while building the image. Docker copies the
 # populated /nix into gateway-nix when it initializes the named volume.
 # Share config and binaries without traversing bun's private HOME. Leave store
 # ownership to the installer; the gateway prepares packages as root.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates curl git libatomic1 openssh-client ripgrep xz-utils util-linux \
+  && apt-get install -y --no-install-recommends bash build-essential ca-certificates cmake curl git libatomic1 libssl-dev openssh-client pkg-config ripgrep xz-utils util-linux \
   && install -d -m 0755 -o bun -g bun /nix /app/data /app/logs /app/nix-roots /app/workspaces /home/bun/.omp/natives \
   && curl --fail --location --retry 3 --output /tmp/nix-install https://releases.nixos.org/nix/nix-2.30.3/install \
   && echo "8ff029ac2a49134441dc14c9168abb04506710834d7390039a8c1800dd998cd9  /tmp/nix-install" | sha256sum --check --strict \
@@ -71,14 +94,16 @@ RUN apt-get update \
   && install -d -m 0755 /etc/nix \
   && printf '%s\n' 'experimental-features = nix-command flakes' 'sandbox = false' 'build-users-group =' > /etc/nix/nix.conf \
   && ln -s "$(readlink -f /home/bun/.nix-profile)" /opt/nix \
-  && apt-get purge -y --auto-remove curl xz-utils \
   && rm -rf /var/lib/apt/lists/*
+COPY --from=common-tools /usr/local/bin/mise /usr/local/bin/mise
+COPY --from=common-tools /opt/partitura /opt/partitura
 COPY --from=omp /usr/local/bin/omp /usr/local/bin/omp
 COPY --from=agent-clis /opt/claude /opt/claude
 COPY --from=agent-clis /opt/codex /opt/codex
 COPY --from=agent-clis /opt/t3 /opt/t3
 COPY --from=worker-extensions /opt/omp-extensions /opt/omp-extensions
 COPY deploy/agent-clis/claude-cliproxy /usr/local/bin/claude-cliproxy
+COPY --chmod=0755 deploy/agent-clis/apply_patch /usr/local/bin/apply_patch
 RUN ln -s /opt/claude/bin/claude /usr/local/bin/claude \
   && ln -s /opt/codex/bin/codex /usr/local/bin/codex \
   && ln -s /opt/t3/t3 /usr/local/bin/t3 \
@@ -97,6 +122,7 @@ RUN chown -Rh root:root /home/bun /app \
   && chmod 0700 /app/data /app/logs \
   && chmod 0755 /app/nix-roots /app/workspaces
 COPY docker-entrypoint.sh /usr/local/bin/gateway-entrypoint
+COPY deploy/tailscale/gateway-supervisor.ts /usr/local/bin/gateway-supervisor.ts
 RUN chmod 0755 /usr/local/bin/gateway-entrypoint
 # Entrypoint defaults to a 64-slot range, or one slot for legacy WORKER_UID.
 ENV HOME=/root

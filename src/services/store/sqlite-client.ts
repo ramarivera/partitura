@@ -284,6 +284,18 @@ const migrate = (db: Database): void => {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (organization_id, kind)
     );
+    CREATE TABLE IF NOT EXISTS agent_settings (
+      organization_id TEXT PRIMARY KEY,
+      settings_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS run_settings (
+      session_id TEXT PRIMARY KEY REFERENCES agent_run(session_id) ON DELETE CASCADE,
+      organization_id TEXT NOT NULL,
+      settings_json TEXT NOT NULL,
+      sources_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS admin_session_org ON admin_session(organization_id);
     CREATE INDEX IF NOT EXISTS agent_run_org_issue ON agent_run(organization_id, issue_id);
     CREATE UNIQUE INDEX IF NOT EXISTS repository_default

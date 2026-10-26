@@ -14,7 +14,15 @@ export const retireWorkerIdentitySync = (
   sessionId: string,
   uid: number,
   workspaceRoot: string,
+  completingDeletion = false,
 ): boolean => {
+  if (
+    !completingDeletion &&
+    db
+      .query("SELECT 1 FROM workspace WHERE session_id=? AND state='deleting'")
+      .get(sessionId) !== null
+  )
+    return false;
   try {
     stopWorkerUidProcessesSync(uid);
     cleanupWorkerSharedFilesSync(uid);
@@ -43,14 +51,29 @@ export const retireWorkerIdentitySync = (
 
 /** Synchronous transactions make allocation atomic across gateway connections. */
 export const makeWorkerIdentityRepo = (db: Database) => {
-  const acquire = (sessionId: string, workspaceRoot?: string) =>
+  const acquire = (
+    sessionId: string,
+    workspaceRoot?: string,
+    options?: { readonly retireTerminal?: boolean },
+  ) =>
     tryDb(
       () =>
         db
           .transaction(() => {
+            if (
+              db
+                .query(
+                  "SELECT 1 FROM workspace WHERE session_id=? AND state='deleting'",
+                )
+                .get(sessionId) !== null
+            )
+              throw new Error("Workspace deletion is in progress");
             const range = workerUidRange(process.env);
             if (range === undefined) return undefined;
-            if (workspaceRoot !== undefined) {
+            if (
+              workspaceRoot !== undefined &&
+              options?.retireTerminal !== false
+            ) {
               const retired = db
                 .query<{ session_id: string; uid: number }, [string, number]>(
                   `SELECT i.session_id, i.uid FROM worker_identity i JOIN agent_run r ON r.session_id=i.session_id

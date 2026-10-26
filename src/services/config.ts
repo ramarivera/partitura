@@ -11,9 +11,15 @@ import {
 } from "effect";
 import type { LogLevel } from "../domain/models.js";
 import { RUNTIME_MODES, type RuntimeMode } from "../drivers/driver.js";
+import type { NativeBuildConfig } from "./native-build-client.js";
+import {
+  parseT3DeviceBackupConfig,
+  type T3DeviceBackupConfig,
+} from "./t3-device-backup.js";
 import { modelProvider } from "./worker-profile.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
+export type WorkerSandboxMode = "native" | "firecracker" | "sysbox";
 
 const isLogFileFrequency = (value: string): value is LogFileFrequency =>
   LOG_FILE_FREQUENCIES.some((frequency) => frequency === value);
@@ -116,12 +122,27 @@ export interface GatewayConfigShape {
   /** Dedicated Partitura client key, passed only into worker environments. */
   readonly cliproxyApiKey?: Redacted.Redacted<string> | undefined;
   readonly workerDefaultModel?: string | undefined;
+  /** Org/repository-bound scoped identities. Never inherit a gateway age key. */
+  readonly workerRepositoryAgeKeys?: Redacted.Redacted<
+    Readonly<Record<string, Readonly<Record<string, string>>>>
+  >;
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
   readonly workerExtensionPaths?: ReadonlyArray<string>;
   readonly workerClaudeExecutable?: string;
+  /** Firecracker is the default. Isolated runtimes fail closed without their broker. */
+  readonly workerSandboxMode?: WorkerSandboxMode | undefined;
+  readonly sessionSandboxBrokerSocketPath?: string | undefined;
+  /** Gateway-only SSH transport for optional native build host tools. */
+  readonly nativeBuild?: NativeBuildConfig | undefined;
+  /** Explicit second builder, with its own dedicated transport and job store. */
+  readonly nativeBuildBackup?: NativeBuildConfig | undefined;
+  readonly t3DeviceBackup?: T3DeviceBackupConfig | undefined;
   /** Present only when T3_MODE or T3_BASE_URL is set. */
   readonly t3Driver?: T3DriverConfig;
 }
+
+const isWorkerSandboxMode = (value: string): value is WorkerSandboxMode =>
+  value === "native" || value === "firecracker" || value === "sysbox";
 
 const positiveInteger = (name: string, fallback: number) =>
   Config.String(name).pipe(
@@ -302,6 +323,67 @@ const logFile = Config.all({
 );
 
 const GatewayConfigValues = Config.all({
+  workerSandboxMode: Config.String("WORKER_SANDBOX_MODE").pipe(
+    Config.withDefault("firecracker"),
+    Config.mapEffect((value) => {
+      const mode = value.trim();
+      return isWorkerSandboxMode(mode)
+        ? Effect.succeed(mode)
+        : Effect.fail(
+            new Config.ConfigError(
+              new ConfigProvider.SourceError({
+                message:
+                  "WORKER_SANDBOX_MODE must be native, firecracker, or sysbox",
+              }),
+            ),
+          );
+    }),
+  ),
+  sessionSandboxBrokerSocketPath: Config.option(
+    Config.String("SESSION_SANDBOX_BROKER_SOCKET"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildSshConfigFile: Config.option(
+    Config.String("NATIVE_BUILD_SSH_CONFIG_FILE"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildScratchRoot: Config.option(
+    Config.String("NATIVE_BUILD_SCRATCH_ROOT"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildBackupSshConfigFile: Config.option(
+    Config.String("NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
+  nativeBuildBackupScratchRoot: Config.option(
+    Config.String("NATIVE_BUILD_BACKUP_SCRATCH_ROOT"),
+  ).pipe(
+    Config.map((value) =>
+      Option.isSome(value) && value.value.trim().length > 0
+        ? resolve(value.value.trim())
+        : undefined,
+    ),
+  ),
   logLevel,
   logFile,
   mcpOAuthAllowLoopbackHttp: Config.Boolean(
@@ -820,6 +902,56 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       const linearClientSecret = yield* requiredValue("LINEAR_CLIENT_SECRET");
       const linearWebhookSecret = yield* requiredValue("LINEAR_WEBHOOK_SECRET");
       const tokenEncryptionKey = yield* requiredValue("TOKEN_ENCRYPTION_KEY");
+      const rawRepositoryAgeKeys = yield* optionalValue(
+        "WORKER_REPOSITORY_AGE_KEYS_JSON",
+      );
+      const workerRepositoryAgeKeys = yield* Effect.try({
+        try: () => {
+          const value: unknown = JSON.parse(rawRepositoryAgeKeys ?? "{}");
+          if (
+            typeof value !== "object" ||
+            value === null ||
+            Array.isArray(value) ||
+            Buffer.byteLength(rawRepositoryAgeKeys ?? "{}") > 2 * 1024 * 1024
+          )
+            throw new Error("invalid map");
+          const result: Record<string, Record<string, string>> = Object.create(
+            null,
+          );
+          for (const [organizationId, repositories] of Object.entries(value)) {
+            if (
+              !/^[A-Za-z0-9_-]{1,128}$/u.test(organizationId) ||
+              typeof repositories !== "object" ||
+              repositories === null ||
+              Array.isArray(repositories)
+            )
+              throw new Error("invalid binding");
+            const bindings: Record<string, string> = Object.create(null);
+            for (const [repositoryId, identity] of Object.entries(
+              repositories,
+            )) {
+              if (
+                !/^[A-Za-z0-9_-]{1,128}$/u.test(repositoryId) ||
+                typeof identity !== "string" ||
+                identity.trim().length === 0 ||
+                Buffer.byteLength(identity) > 256 * 1024 ||
+                identity.includes("\0")
+              )
+                throw new Error("invalid identity");
+              bindings[repositoryId] = identity;
+            }
+            result[organizationId] = bindings;
+          }
+          return Redacted.make(result);
+        },
+        catch: () =>
+          new Config.ConfigError(
+            new ConfigProvider.SourceError({
+              message:
+                "WORKER_REPOSITORY_AGE_KEYS_JSON must bind organization and repository IDs to bounded scoped age identities",
+            }),
+          ),
+      });
       const githubAppId = yield* optionalValue("GITHUB_APP_ID");
       const githubAppPrivateKey = yield* optionalValue(
         "GITHUB_APP_PRIVATE_KEY",
@@ -862,6 +994,52 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       }
       const routing = yield* workerModelRouting();
       const t3Driver = yield* t3DriverConfig();
+      const deviceBackupInput = yield* optionalValue(
+        "T3_DEVICE_BACKUP_CONFIG_JSON",
+      );
+      const t3DeviceBackup =
+        deviceBackupInput === undefined
+          ? undefined
+          : yield* Effect.try({
+              try: () => parseT3DeviceBackupConfig(deviceBackupInput),
+              catch: () =>
+                new Config.ConfigError(
+                  new ConfigProvider.SourceError({
+                    message: "Invalid T3_DEVICE_BACKUP_CONFIG_JSON",
+                  }),
+                ),
+            });
+      if (
+        values.workerSandboxMode !== "native" &&
+        values.sessionSandboxBrokerSocketPath === undefined
+      )
+        return yield* configFailure(
+          `WORKER_SANDBOX_MODE=${values.workerSandboxMode} requires SESSION_SANDBOX_BROKER_SOCKET`,
+        );
+      if (
+        (values.nativeBuildSshConfigFile === undefined) !==
+        (values.nativeBuildScratchRoot === undefined)
+      )
+        return yield* configFailure(
+          "NATIVE_BUILD_SSH_CONFIG_FILE and NATIVE_BUILD_SCRATCH_ROOT must be configured together",
+        );
+      if (
+        (values.nativeBuildBackupSshConfigFile === undefined) !==
+        (values.nativeBuildBackupScratchRoot === undefined)
+      )
+        return yield* configFailure(
+          "NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE and NATIVE_BUILD_BACKUP_SCRATCH_ROOT must be configured together",
+        );
+      if (
+        values.nativeBuildBackupSshConfigFile !== undefined &&
+        (values.nativeBuildSshConfigFile === undefined ||
+          values.nativeBuildBackupSshConfigFile ===
+            values.nativeBuildSshConfigFile ||
+          values.nativeBuildBackupScratchRoot === values.nativeBuildScratchRoot)
+      )
+        return yield* configFailure(
+          "The backup native builder requires a primary configuration and separate transport and scratch paths",
+        );
       if (t3Driver?.connection._tag === "Launch") {
         // Launched daemons only get the proxy client key, like OMP workers.
         if (routing.cliproxyApiBaseUrl === undefined)
@@ -875,7 +1053,27 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       }
       return {
         ...values,
+        ...(values.nativeBuildSshConfigFile === undefined ||
+        values.nativeBuildScratchRoot === undefined
+          ? {}
+          : {
+              nativeBuild: {
+                sshConfigFile: values.nativeBuildSshConfigFile,
+                scratchRoot: values.nativeBuildScratchRoot,
+              },
+            }),
         ...routing,
+        ...(values.nativeBuildBackupSshConfigFile === undefined ||
+        values.nativeBuildBackupScratchRoot === undefined
+          ? {}
+          : {
+              nativeBuildBackup: {
+                sshConfigFile: values.nativeBuildBackupSshConfigFile,
+                scratchRoot: values.nativeBuildBackupScratchRoot,
+              },
+            }),
+        ...(t3DeviceBackup === undefined ? {} : { t3DeviceBackup }),
+        workerRepositoryAgeKeys,
         allowedOrganizationIds,
         gatewayAdminOrganizationIds,
         githubAppAllowedOwners,

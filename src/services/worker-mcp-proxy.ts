@@ -6,11 +6,13 @@ import { MCP_MAX_RESPONSE_BYTES, safeMcpFetch } from "./safe-http.js";
 
 export interface WorkerMcpProxy {
   readonly servers: ReadonlyArray<McpServerRecord>;
+  readonly port: number;
   readonly stop: () => void;
 }
 
 interface ProxyOptions {
   readonly servers: ReadonlyArray<McpServerRecord>;
+  readonly bindHost?: string;
   readonly allowLoopbackHttp: boolean;
   readonly accessToken: (
     server: McpServerRecord,
@@ -34,7 +36,7 @@ const responseHeaders = [
   "mcp-protocol-version",
 ];
 
-/** One capability and listener per worker lifetime, bound only to IPv4 loopback. */
+/** One capability and listener per worker lifetime. */
 export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
   const bearer = randomBytes(32).toString("base64url");
   const expected = Buffer.from(`Bearer ${bearer}`);
@@ -50,7 +52,7 @@ export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
     return { server, path };
   });
   const listener = Bun.serve({
-    hostname: "127.0.0.1",
+    hostname: options.bindHost ?? "127.0.0.1",
     port: 0,
     idleTimeout: 0,
     maxRequestBodySize: MCP_MAX_RESPONSE_BYTES,
@@ -234,13 +236,21 @@ export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
     },
     error: () => new Response("MCP gateway request failed", { status: 502 }),
   });
+  if (listener.port === undefined) {
+    lifetime.abort();
+    listener.stop(true);
+    throw new Error("Worker MCP proxy did not receive a port");
+  }
   return {
     servers: inputs.map(({ server, path }) => ({
       ...server,
-      url: Option.some(`http://127.0.0.1:${listener.port}${path}`),
+      url: Option.some(
+        `http://${options.bindHost ?? "127.0.0.1"}:${listener.port}${path}`,
+      ),
       headers: { Authorization: `Bearer ${bearer}` },
       env: {},
     })),
+    port: listener.port,
     stop: () => {
       lifetime.abort();
       listener.stop(true);

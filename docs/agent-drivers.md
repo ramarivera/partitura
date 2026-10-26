@@ -14,10 +14,16 @@ field; omitting it on update preserves the value.
 
 For each new run, the authority reads the repository record and the issue's
 current Linear labels. `driver:t3` or `driver:omp` overrides the default. Matching
-ignores case and surrounding whitespace. Conflicting overrides fail the run
-attempt instead of depending on label order. No gateway restart is required.
-A persisted session ref keeps its driver across retries and follow-up turns;
-changing labels doesn't migrate an existing conversation between runtimes.
+ignores case and surrounding whitespace. Conflicting overrides warn on the
+Linear issue and fall through to organization defaults or the repository's
+default driver. No gateway restart is required. A persisted session ref keeps
+its driver across retries and follow-up turns; changing labels doesn't migrate
+an existing conversation between runtimes.
+
+The authority freezes the run's settings when its first worker starts, after
+repository selection. A run waiting for repository selection uses the defaults
+and labels available at dispatch. Retries and follow-up turns reuse the frozen
+settings, even if an administrator changes the defaults or issue labels.
 
 ## Repository routing
 
@@ -50,8 +56,9 @@ Both modes take `T3_PROVIDER_INSTANCE` and `T3_MODEL`. Launch mode accepts only
 
 For a T3 run the authority prepares the workspace exactly as for OMP: it
 allocates the session uid, chowns the workspace (mode 0700), prepends the
-repository's Nix PATH, and on resume re-mints the repository-scoped GitHub App
-credential into `.git/config`. Then it:
+repository's Nix PATH, and connects the workspace's GitHub remote to a
+session-scoped Git broker URL. The broker keeps installation credentials in the
+gateway and revokes the URL when the session ends. Then it:
 
 1. Writes `$T3CODE_HOME/userdata/settings.json` and the Codex `config.toml` as
    the worker uid through `src/workspace-worker.ts` (`t3-config`). State lives
@@ -105,10 +112,9 @@ transport encryption. This opt-in does not verify the endpoint's network.
 
 ### Git and pull requests
 
-Launched T3 agents use the same credential path as OMP workers: the GitHub
-App installation token scoped to the run's repository, persisted as
-`http.https://github.com/.extraheader` in the workspace's mode-0600 Git config
-and re-minted on resume. It expires after an hour and never reaches the T3 API.
+Launched T3 agents and OMP workers use a repository-scoped Git HTTP broker.
+The workspace holds a revocable session URL, while GitHub App installation
+tokens stay in the gateway and refresh through the App service's expiring cache.
 Workspace preparation also sets repo-local `user.name` and `user.email` for both
 drivers, including reused checkouts. The GitHub App slug comes from `GET /app`;
 `GET /users/<slug>[bot]` supplies the bot user ID, which differs from the App ID.
@@ -119,9 +125,10 @@ If the App slug itself can't be read, preparation logs a warning and preserves
 any existing identity. Git config writes run as the workspace owner and never
 change global configuration.
 
-The T3 worker contract tells the agent to push a branch, open the PR through the
-GitHub REST API with that credential, and include the PR URL in its final
-response, which the authority links to the Linear session. The GitHub App
+The worker pushes a branch, calls `github_create_pull_request` with its head,
+base and title, then includes the PR URL in its final response. The gateway
+binds PR creation to the run's repository and links the result to Linear.
+The GitHub App
 installation needs Contents and Pull requests write access on the repository.
 Both modes refuse retained non-gateway Git credentials and config includes
 before opening T3. Launch mode checks as the session uid and allows only the
@@ -162,10 +169,11 @@ The API needs only `orchestration:read` and `orchestration:operate` scopes.
 
 ## Gaps
 
-- Linear host tools (`linear_get_issue`, `linear_create_comment`, ...) aren't
-  available to T3 agents. Activity, plans, questions and the PR link are
-  projected without them. Exposing them needs a gateway MCP endpoint with a
-  per-session bearer (bead `sym-gmy.6`).
+- Launched T3 agents receive Linear tools and `github_create_pull_request`
+  through a gateway MCP endpoint with a per-session bearer. Git pushes use the
+  session's Git broker. These paths require live qualification alongside the
+  selected provider and sandbox; a passing contract test alone doesn't prove
+  an agent can complete the workflow.
 - Organization MCP servers configured for OMP workers aren't rendered into T3
   provider settings yet.
 - Native same-uid mode (no `WORKER_UID_BASE`) runs each daemon with a private
@@ -175,3 +183,100 @@ The API needs only `orchestration:read` and `orchestration:operate` scopes.
 The in-process T3 tests prove gateway behavior against the pinned contract,
 and the launcher tests run a real child process through the lifecycle. They
 don't establish the deployed Linear-session-to-PR acceptance target.
+
+The T3 watchdog interrupts a turn after five minutes without progress. While
+a tool is running, it allows up to thirty minutes without progress so quiet
+dependency installs and builds can finish. Tool completion restores the
+five-minute budget. Hung tools still reach the bounded timeout.
+## Per-run settings
+
+Each new run resolves its driver, model alias, effort, and runtime mode from
+issue labels, project labels, organization settings, then the existing runtime
+configuration. The effective values and sources are stored in `run_settings`
+before a worker starts, so retries and gateway recovery reuse the same choice.
+Organization edits and label changes affect later runs without restarting the
+gateway.
+
+The admin console's Run settings panel stores organization-scoped defaults,
+label prefixes, and model aliases. An OMP alias names a curated `provider/model`
+from the worker profile. A T3 alias names a configured provider instance and
+model, with typed option values. Labels only select a configured alias; they
+can't supply provider options or credentials. The full-access label toggle is
+enabled by default.
+
+OMP 18.8.6 receives `--model` and `--thinking` for the selected model and effort.
+Its approval modes map to the CLI's supported `--approval-mode` values:
+`approval-required` uses `always-ask`, `auto` and `auto-accept-edits` use
+`write`, and `full-access` uses `yolo`. The worker uid and workspace security
+boundaries still apply. T3 receives the selected `ModelSelection` and runtime
+mode through its normal session start request and, for a launched daemon, its
+per-session settings file.
+
+Unknown labels and multiple values for the same setting generate a Linear issue
+comment and fall through to the next settings tier. They don't stop the run.
+
+## Optional native build tools
+
+OMP and T3 workers can use `native_build_start`, `native_build_status`,
+`native_build_artifact`, and `native_build_cancel` when the gateway has both
+`NATIVE_BUILD_SSH_CONFIG_FILE` and `NATIVE_BUILD_SCRATCH_ROOT` configured.
+The gateway opens the SSH client on first use. The SSH config and scratch path
+stay on the gateway, and job IDs are scoped to the session that started them.
+Artifact delivery returns only a path inside that session workspace, its SHA-256,
+and byte count. T3 receives the tools through its per-session MCP endpoint.
+Host setup and live acceptance requirements are in
+`deploy/mac-build/README.md`; source tests don't qualify a live Mac host.
+
+An independent backup builder uses `NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE` and
+`NATIVE_BUILD_BACKUP_SCRATCH_ROOT`, with separate paths from the primary. Its
+SSH config uses the same `Host partitura-native` alias pointed at the dedicated
+MacBook build account, with its own key and host pin. Each host requires separate
+qualification. Select `builder: "backup"` in any of the four native tools and
+keep that selection for the job's status, artifact and cancel calls. Omitting
+`builder` selects `"primary"`. The gateway never retries on another host. Jobs,
+recovery, cancellation and shutdown cleanup use the selected host's own client
+and store. This builds an artifact in the backup VM; simulator installation
+still requires the separate T3 ownership and install integration below.
+
+## Optional existing T3 device backup
+
+`T3_DEVICE_BACKUP_CONFIG_JSON` or its `_FILE` alternative enables the
+`t3_device_backup` host tool for explicitly configured organizations. Both OMP
+and T3 workers receive it through the existing session host-tool bridge.
+Configure `baseUrl`, `tokenFile`, `workspaceRoot`, `organizationHosts`,
+`instanceId`, and `model`. The URL must use HTTPS or loopback HTTP. Paths must
+be absolute and normalized, and the workspace must already exist on the T3
+server. Host IDs come from that server's device configuration.
+
+Provision a dedicated T3 bearer with `orchestration:read` and
+`orchestration:operate` scopes into the gateway's secret store. Choose its
+expiry and rotation policy explicitly. Never reuse a conversation's MCP
+credential or send the bearer or operator SSH keys to workers. The gateway
+reads the bearer file on every connection. It creates an idle run-owned thread
+without an initial message, so device operations don't start model inference.
+The provider and model fields identify that idle thread's existing selection.
+
+The tool lists simulators on configured hosts, opens a stopped unclaimed
+simulator, reads device details, launches or terminates an installed app, and
+closes the run's device. Screenshot and accessibility operations use the existing
+authenticated T3 device proxy after checking run ownership. Screenshot results
+remain image content through the worker bridge. Inspection bodies have a 512 KiB
+streaming limit and a 20-second timeout; redirects are refused. It refuses
+physical devices, foreign hosts and other threads' sessions. Cancellation and worker cleanup release the run's sessions,
+including ownership recovered from T3 after a gateway restart. Cleanup leaves
+a simulator running if another thread has attached to it. Existing T3 device
+support and agent consent must already be enabled.
+
+This supplements the disposable VM route for device checks. T3's existing
+remote-device bridge provides discovery, streaming and control; it doesn't
+provide remote Xcode builds, app transfer or Metro forwarding. This host tool
+exposes device lifecycle, installed-app actions, screenshots, accessibility
+inspection and input through the same authenticated device proxy. Input supports
+normalized taps, named keys and short text. iOS waits for input admission and
+screen configuration before sending HID packets; text supports up to 32 ASCII
+characters, newline and tab. Android text supports up to 300 UTF-8 bytes. Input
+never retries automatically. Its result reports dispatch, not observed UI behavior;
+inspect accessibility or a screenshot afterward, including after a failed call,
+before deciding whether another action is needed. Build and app transfer aren't
+implemented by this tool. Native build acceptance and live backup acceptance
+remain separate checks.

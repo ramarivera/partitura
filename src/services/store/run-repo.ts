@@ -24,6 +24,7 @@ import {
   transact,
   tryDb,
 } from "./sqlite-client.js";
+import { assertWorkspaceAvailable } from "./workspace-deletion.js";
 
 const AgentRunRow = Schema.Struct({
   session_id: Schema.String,
@@ -237,6 +238,17 @@ export class RunRepo extends Context.Service<RunRepo>()("RunRepo", {
       yield* transact(
         db,
         Effect.gen(function* () {
+          yield* tryDb(
+            () =>
+              assertWorkspaceAvailable(
+                db,
+                sessionId,
+                patch.workspacePath === undefined
+                  ? undefined
+                  : Option.getOrNull(patch.workspacePath),
+              ),
+            "RunRepo.workspaceDeletionFence",
+          );
           const current = yield* get(sessionId);
           if (Option.isNone(current)) {
             return yield* Effect.fail(
@@ -380,6 +392,7 @@ export class RunRepo extends Context.Service<RunRepo>()("RunRepo", {
               SET state='queued', desired_state='running', attempt=0,
                 terminal_reason=NULL, next_attempt_at=NULL, updated_at=?
               WHERE session_id=? AND state='canceled'
+                AND NOT EXISTS (SELECT 1 FROM workspace w WHERE w.session_id=agent_run.session_id AND w.state='deleting')
             `)
             .run(now, sessionId),
         "RunRepo.reopen",
@@ -514,6 +527,7 @@ export class RunRepo extends Context.Service<RunRepo>()("RunRepo", {
             .query(`
               UPDATE agent_run SET lease_owner=?, lease_expires_at=?, updated_at=?
               WHERE session_id=? AND state NOT IN ('succeeded','failed','canceled')
+                AND NOT EXISTS (SELECT 1 FROM workspace w WHERE w.session_id=agent_run.session_id AND w.state='deleting')
                 AND (lease_owner IS NULL OR lease_owner=? OR lease_expires_at<?)
             `)
             .run(owner, at + leaseDurationMs, at, sessionId, owner, at),

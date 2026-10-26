@@ -1,0 +1,341 @@
+# Optional Tailscale sidecar
+
+Use [deploy/tailscale/compose.yaml](../deploy/tailscale/compose.yaml) when a Docker
+gateway needs a private tailnet address and workers need ordinary outbound TCP to
+tailnet hosts. Tailscale lives only in the sidecar. The gateway image, its child
+processes, and SSH client don't need a Tailscale binary, socket, or auth key.
+This is an opt-in, standalone Compose project. It doesn't change the default image.
+
+Bring your own tailnet and auth key. Partitura doesn't require a particular
+tailnet, device, build host, or tag. With Docker Compose 2.24.4 or newer, have your
+secret manager provide `PARTITURA_TAILSCALE_AUTH_KEY` in the command environment,
+then start with `docker compose -f compose.yaml -f compose.auth-env.yaml up -d`.
+The overlay turns that environment input into a Compose secret file mounted only
+in the sidecar. The key isn't passed to the gateway or workers. The default
+`compose.yaml` supports `TS_AUTHKEY_FILE` instead, for an existing secret file.
+The other gateway credentials below are still required.
+
+`TS_HOSTNAME` chooses the node name. `TS_EXTRA_ARGS` optionally configures
+`tailscale up` arguments, including tags allowed by your own tailnet policy.
+Remote host addresses belong to repository or deployment configuration. The
+example Mac policy below is optional and contains no required host addresses.
+
+The gateway shares the sidecar's network namespace. A kernel `tailscale0` interface
+provides both incoming HTTP on port 3000 and outbound worker traffic. The optional
+Serve overlay terminates tailnet HTTPS on port 443 and proxies to localhost:3000.
+No host ports are published. Gateway admin authentication and webhook signature
+checks still apply.
+
+## Session runtime prerequisites
+
+The gateway defaults to `WORKER_SANDBOX_MODE=firecracker`. Before starting this
+stack, install the [session broker and Firecracker artifacts](../deploy/session-sandbox/README.md)
+on the Docker host. Set these optional values in this directory's `.env` to
+select the runtime or a different host socket directory:
+
+```dotenv
+WORKER_SANDBOX_MODE=firecracker
+SESSION_SANDBOX_BROKER_DIR=/run/partitura-sandbox
+SESSION_SANDBOX_BROKER_SOCKET=/run/partitura-sandbox/broker.sock
+```
+
+`SESSION_SANDBOX_BROKER_DIR` is the host directory. Compose mounts it read-only
+at `/run/partitura-sandbox` in the gateway. `SESSION_SANDBOX_BROKER_SOCKET` is the
+socket path inside that container, so keep it under this mounted directory.
+The mount covers the directory so a systemd socket restart doesn't leave the
+gateway pointing at an old socket inode. The directory must already exist;
+Compose refuses to create it. Keep it root-owned with mode 0750 and the socket
+root:root with mode 0660, matching the supplied socket unit. Only the root
+gateway receives this mount; the Tailscale sidecar and workers don't receive it.
+
+Configure `/etc/partitura-sandbox/broker.env` on the host with
+`PARTITURA_WORKSPACE_ROOT=/app/workspaces` and
+`PARTITURA_WORKSPACE_HOST_ROOT` set to the actual host mountpoint of this stack's
+`partitura-tailnet_gateway-workspaces` volume. Find it with
+`docker volume inspect partitura-tailnet_gateway-workspaces --format '{{.Mountpoint}}'`
+after the volume exists. If you override the Compose project name, use that
+project's volume name. The broker maps the gateway's logical workspace paths
+into this host directory. `/app/workspaces` itself isn't the host mountpoint.
+Choose the broker's public-web or explicit allowlist policy and qualify Firecracker's KVM,
+guest artifacts and restricted SFTP runtime before dispatching sessions.
+
+Both isolated backends need the gateway's Docker network identity for relays.
+For the default project name, configure the host broker with
+`PARTITURA_GATEWAY_CONTAINER=partitura-tailnet-gateway-1`,
+`PARTITURA_GATEWAY_NETWORK_CONTAINER=partitura-tailnet-tailscale-1`, and
+`PARTITURA_GATEWAY_NETWORK=partitura-tailnet_default`. The network owner is the
+Tailscale container because the gateway shares its namespace. If you change
+the project name, service names or network configuration, use their actual
+Docker names. Keep the gateway outside session networks and configure any
+required scoped host firewall exceptions through the broker's documented setup.
+
+Set `WORKER_SANDBOX_MODE=sysbox` explicitly for the Docker-based backend.
+Install and qualify Sysbox and its pinned worker image as described in the
+broker guide. It uses the same socket and host workspace mapping as Firecracker.
+
+For local development with gateway-owned worker processes, set
+`WORKER_SANDBOX_MODE=native` explicitly. It doesn't use the broker. The common
+Compose mount still requires an existing root-owned directory; a native-only
+host can supply an empty mode-0750 directory through
+`SESSION_SANDBOX_BROKER_DIR`. An unavailable isolated runtime fails the session;
+the gateway doesn't switch to native execution.
+
+## Important webhook limitation
+
+Tailscale Serve is private to your tailnet. Linear's hosted webhook sender and
+agent callbacks can't reach a private `*.ts.net` address. This example alone is
+therefore insufficient for a working hosted Linear integration. Keep a separately
+reachable public HTTPS ingress for Linear's required webhook/callback routes and
+configure `PUBLIC_URL` to that canonical public URL when using those integrations.
+An ingress container can join the same namespace and proxy to localhost:3000;
+publish its ports on the **tailscale service**, or route to it on a Docker network
+attached to that service. Restrict public routes and preserve signature/auth checks.
+The private admin UI and outbound Mac access can still use the tailnet.
+This example doesn't enable Funnel or configure a public ingress.
+
+## Setup
+
+1. Use a Linux Docker engine with `/dev/net/tun` and support for `NET_ADMIN` and
+   `NET_RAW`. On Docker Desktop these requirements apply inside its Linux VM.
+   Rootless engines may not support the required device/capabilities.
+2. Enable MagicDNS in the tailnet. Choose a policy for your required services and
+   create a pre-approved, short-lived auth key. The optional example below uses
+   `tag:partitura`; use your own tags or an untagged key instead. For an always-on gateway,
+   use a non-ephemeral node and keep its state volume. Ephemeral keys suit disposable
+   deployments: the node disappears after disconnecting, and its next registration
+   needs a usable key. Auth-key expiry and node-key expiry are separate settings.
+3. From this directory, create local configuration and a secrets directory:
+
+   ```nu
+   cd deploy/tailscale
+   cp .env.example .env
+   mkdir secrets
+   chmod 700 secrets
+   ```
+
+   Have your secret manager write these files, with no quotes or variable names:
+   `secrets/ts_authkey`, `secrets/linear_client_id`,
+   `secrets/linear_client_secret`, `secrets/linear_webhook_secret`, and
+   `secrets/token_encryption_key`. Follow the gateway's normal credential setup;
+   the encryption key must be a valid 32-byte key encoded as base64.
+   Paths can instead point outside the checkout through the `.env` `*_FILE` values.
+   Don't put actual credentials in `.env`, Compose arguments, or shell history.
+
+   Local Compose secrets are read-only file mounts, not an encrypted secret store.
+   Gateway source files must be root-owned with mode 0400, including the four
+   gateway files above. Startup rejects insecure `_FILE` mounts. Protect their
+   parent directory from worker writes. Compose file secrets don't implement
+   ownership remapping with `uid`/`gid`/`mode`; set ownership and permissions on
+   the Docker host. See [gateway security](security.md) for the complete policy.
+   Only the sidecar receives the Tailscale key. Its native
+   `TS_AUTHKEY=file:/run/secrets/ts_authkey` support avoids exporting the key value.
+   `TS_AUTHKEY_FILE` in `.env` selects the **host file**, not a containerboot option.
+   The gateway reads `TOKEN_ENCRYPTION_KEY_FILE` directly. Compose preserves the
+   image entrypoint and wraps its normal `bun dist/index.js` command with a small
+   health supervisor; no shell export of the encryption key is needed.
+4. Set `TS_HOSTNAME`, `PUBLIC_URL` and `LINEAR_ALLOWED_ORGANIZATION_IDS` in `.env`.
+   Production startup requires the allowed organization list. Configure
+   `GATEWAY_ADMIN_ORGANIZATION_IDS` and `GITHUB_APP_ALLOWED_OWNERS_JSON` as described
+   in [gateway security](security.md) before using those administrative features.
+   With only private HTTPS, use the
+   node's actual full `https://partitura.<tailnet>.ts.net` name. For Linear delivery,
+   use the public URL described above. Optionally add your actual tailnet search
+   suffix to `resolv.conf` for short hostnames.
+5. For HTTPS, enable HTTPS certificates in the Tailscale admin console, then run:
+
+   ```nu
+   docker compose -f compose.yaml -f compose.serve.yaml config --quiet
+   docker compose -f compose.yaml -f compose.serve.yaml up -d --build
+   docker compose -f compose.yaml -f compose.serve.yaml ps
+   ```
+
+   Omit `-f compose.serve.yaml` for plain tailnet HTTP on port 3000. The checked-in
+   Serve JSON uses containerboot's `${TS_CERT_DOMAIN}` substitution, not Compose
+   environment interpolation. It mounts the config directory so updates are watched.
+   If HTTPS isn't configured for the tailnet, Serve won't become usable.
+
+Keep `tailscale-state` across recreations. `TS_AUTH_ONCE=true` reuses its identity.
+After enrollment, replace the local auth-key file with an empty file to remove the
+spent credential while retaining the required mount. Never delete the state volume
+as routine maintenance, and don't clone it into another running deployment.
+
+## Minimal tailnet policy example
+
+Merge this fragment into your existing policy and replace the example admin email
+and builder tag. Existing broad allow rules remain additive; remove overlapping
+allow-all rules if these restrictions are intended to enforce isolation.
+
+```json
+{
+  "tagOwners": {
+    "tag:partitura": ["autogroup:admin"],
+    "tag:mac-builder": ["autogroup:admin"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["admin@example.com"],
+      "dst": ["tag:partitura:443", "tag:partitura:3000"]
+    },
+    {
+      "action": "accept",
+      "src": ["tag:partitura"],
+      "dst": ["tag:mac-builder:22"]
+    }
+  ]
+}
+```
+
+Tag the Mac appropriately, or replace its tag with a narrowly scoped host alias.
+Remove the port 3000 grant if clients should use only HTTPS. Serve doesn't firewall
+the gateway's direct port 3000 listener. No exit node, subnet routing, or Tailscale
+SSH server is enabled on the gateway.
+
+## Worker access to a Mac build host
+
+Enable Remote Login on the Mac and authorize a dedicated build account and SSH
+key. Provision a read-only SSH configuration, private key and verified `known_hosts`
+entry for the **worker's** home/UID using your existing worker credential mechanism.
+Don't disable host-key checking or give the gateway the Docker socket. A worker
+can then run an ordinary SSH command, including from a tool invocation:
+
+```nu
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes builder@mac-builder.your-tailnet.ts.net 'xcodebuild -version'
+```
+
+The full MagicDNS name works without a DNS search suffix. Repository workflow
+commands can use the same SSH destination for builds, signing and artifact transfer.
+No credentials, test build, or tailnet registration are included in this example.
+
+Tailscale transport and Tailscale SSH are separate. macOS normally uses Apple's
+OpenSSH Remote Login server; a Tailscale network grant to port 22 doesn't replace
+its user/key checks. Tailscale SSH on a supported target intercepts port 22 and
+requires a separate `ssh` policy, including a suitable `accept` rule for unattended
+workers. macOS Tailscale SSH requires the open-source `tailscaled` variant;
+the normal GUI variants use OpenSSH Remote Login. Don't enable `--ssh` on this
+gateway just to make outbound SSH work. Match
+the target's actual server and port, and provision the matching credentials.
+
+## DNS and networking choices
+
+The sidecar deliberately uses `TS_ACCEPT_DNS=false`, preserving Docker DNS for
+bootstrap/control-plane lookups. The gateway bind-mounts its own `resolv.conf` with
+only `nameserver 100.100.100.100`, Tailscale's Quad100 resolver. Kernel TUN routes
+this address to tailscaled. MagicDNS answers and ordinary DNS forwarding follow
+the tailnet's DNS policy. Workers inherit the gateway's mount and network namespaces,
+including after a UID drop. DNS stops working if tailscaled is unavailable; no
+public fallback resolver silently bypasses tailnet DNS policy.
+
+If a tagged node's ACL denies access to a tailnet-wide private DNS resolver,
+MagicDNS can work while public queries return SERVFAIL. Either grant that node
+access to the intended resolver through your reviewed tailnet policy, or
+deliberately use `nameserver 127.0.0.11` in the gateway resolver file if the
+Docker host already resolves both public names and your MagicDNS names. That
+choice uses the Docker host's DNS policy. A second nameserver after Quad100
+isn't a reliable fallback because some clients stop on SERVFAIL. Recreate the
+gateway after replacing its bind-mounted resolver file, then verify both public
+queries and a full MagicDNS hostname from inside the gateway. Hosts without
+working MagicDNS need the default Quad100 configuration and resolver access.
+
+`TS_ACCEPT_DNS=true` lets tailscaled manage the **sidecar's** resolver. It doesn't
+guarantee that another container's independently mounted `/etc/resolv.conf` is
+updated. Keep the explicit gateway resolver even if enabling it. Don't set `dns`,
+`hostname`, `networks`, or `ports` on the gateway when using `network_mode: service:`;
+put network attachments and port publication on the sidecar. A private Docker
+service name isn't a MagicDNS name and may need a separate DNS forwarding design.
+
+`TS_USERSPACE=false`, `/dev/net/tun`, `NET_ADMIN` and `NET_RAW` belong only to the
+sidecar. Userspace mode removes those requirements, and can handle Serve ingress,
+but doesn't install transparent kernel routes for ordinary gateway/worker sockets.
+Simply setting `TS_USERSPACE=true` breaks this example's outbound SSH and Quad100
+resolver. A userspace alternative needs `TS_SOCKS5_SERVER` or an HTTP proxy plus
+explicit client proxy configuration, such as SSH `ProxyCommand` with a SOCKS-aware
+connector and remote DNS resolution. That isn't equivalent to this transparent
+deployment, so no userspace override is supplied.
+
+## Hardening and worker identities
+
+Both containers use `no-new-privileges`. The gateway keeps the image entrypoint
+and runs a Bun supervisor as PID 1, with exactly CHOWN, DAC_OVERRIDE, KILL,
+SETUID, SETGID and SETPCAP after `cap_drop: ALL`. The supervisor starts the
+gateway app and forwards shutdown signals. Workers drop to uid/gid 1001 through
+`setpriv`, with no supplementary groups, capabilities or privilege escalation. See
+[gateway security](security.md) for the authoritative worker and workspace policy.
+The entrypoint locks `/app/data` and `/app/logs` to root-owned mode 0700;
+`/app/workspaces` stays a separate writable volume. Never force `user: bun` or
+remove DAC_OVERRIDE or SETPCAP. The gateway receives no TUN device, Tailscale
+state, LocalAPI socket or auth key. Only the sidecar receives network capabilities.
+
+No network capability is needed by the supervisor or UID 1001 worker. The DNS file
+is world-readable, so dropping UID doesn't affect resolution. `no-new-privileges`
+allows a supervisor with existing identity-changing capabilities to drop UID; it
+prevents regaining privileges via setuid executables. Network namespace sharing
+doesn't share process, user or mount namespaces and doesn't undo a worker UID drop.
+
+Gateway and workers do share the same tailnet identity, so tailnet policy can't
+distinguish them by Unix UID. All peer containers in the namespace can also reach
+loopback listeners, including the sidecar health endpoint. Never mount the sidecar
+LocalAPI socket into workers. Separate identities require separate namespaces.
+
+## Troubleshooting and lifecycle
+
+- `tailscale` unhealthy: inspect `docker compose logs tailscale` and
+  `docker compose exec tailscale tailscale status`. `/healthz` checks that a tailnet
+  IP exists, not SSH reachability or gateway health. A logged-out node is correctly
+  unhealthy, and the gateway waits for it. Check key/tag permissions and TUN access.
+- Gateway unhealthy: inspect its logs and `/health`. Its reconciler can return 503;
+  a healthy Tailscale daemon doesn't prove the application is ready.
+- Names fail: run `docker compose exec gateway cat /etc/resolv.conf`, check MagicDNS
+  is enabled, and try the full `*.ts.net` name. A numeric tailnet IP working while
+  the name fails points to DNS. `tailscale ping` inside the sidecar alone doesn't
+  prove that a worker can resolve names or open SSH sockets.
+- SSH fails: distinguish DNS, tailnet port grants, target Remote Login, Unix user,
+  SSH key readability by the worker UID, and `known_hosts`. Test from an actual
+  worker; the supervisor's credentials may differ.
+- TUN/iptables errors: check the Linux VM/host's TUN and netfilter support. This
+  example uses upstream Tailscale, without Toolbox's host-specific iptables/MTU
+  patches. For stalled large transfers check path MTU and ICMP handling first.
+- The gateway supervisor polls the sidecar's loopback `/healthz` every five
+  seconds. If the endpoint stops responding for at least 60 seconds, it
+  gracefully stops the gateway app. The gateway's `unless-stopped` policy
+  restarts the container, which attaches it to the sidecar's current network
+  namespace. Any HTTP response counts as reachable, even an unhealthy status;
+  that avoids restarting the gateway when Tailscale is logged out but the
+  namespace is still current. A brief connection failure also doesn't restart
+  the app. Docker's `depends_on.restart: true` still covers explicit Compose
+  updates. If the supervisor isn't running, recreate both services with the
+  same full Compose invocation and `up -d --force-recreate`.
+
+## Image provenance and verification
+
+On 2026-10-23, `docker buildx imagetools inspect tailscale/tailscale:stable` and
+`docker buildx imagetools inspect tailscale/tailscale:v1.104.2` both returned the
+multi-platform index digest pinned in Compose. GitHub's
+[latest stable release](https://github.com/tailscale/tailscale/releases/tag/v1.104.2)
+was v1.104.2, published 2026-10-21. Refresh both tag and digest together after
+reviewing upstream releases; a floating `stable` tag alone isn't reproducible.
+
+Validate either configuration without reading secret contents or joining a tailnet:
+
+```nu
+docker compose -f deploy/tailscale/compose.yaml config --quiet
+docker compose -f deploy/tailscale/compose.yaml -f deploy/tailscale/compose.serve.yaml config --quiet
+```
+
+For a logged-out runtime probe, use an isolated scratch Compose override with an
+internal Docker network, fresh volumes, an empty auth-key file, dummy gateway
+credentials and `PUBLIC_URL=http://localhost:3000`. Set
+`WORKER_SANDBOX_MODE=native` for this UID-isolation probe and supply an empty,
+root-owned broker mount directory as described above. Temporarily use
+`condition: service_started` for the gateway and omit Serve. Assert `NeedsLogin`,
+an unhealthy sidecar, equal `/proc/self/ns/net` links, a responding gateway health
+endpoint through sidecar localhost, a root gateway with the six-capability policy,
+and a worker launched through `setpriv` as uid/gid 1001 with no capabilities. Tear
+down only that probe's containers and volumes. This tests local wiring; it cannot
+prove authenticated MagicDNS, tailnet HTTPS, policy or remote Mac builds.
+
+Primary references: [Docker parameters](https://tailscale.com/docs/features/containers/docker/docker-params),
+[pinned containerboot source](https://github.com/tailscale/tailscale/blob/v1.104.2/cmd/containerboot/main.go),
+[MagicDNS](https://tailscale.com/kb/1081/magicdns),
+[userspace networking](https://tailscale.com/kb/1112/userspace-networking),
+[Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh).

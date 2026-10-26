@@ -331,6 +331,16 @@ describe("T3 driver turns and events", () => {
           expect(server.commandsOf("run.interrupt")).toHaveLength(0);
           expect(events).toHaveLength(projectedCount);
         }
+        server.upsertItem(THREAD_ID, {
+          id: "long-command",
+          runId: "run-1",
+          type: "command_execution",
+          status: "completed",
+          ordinal: 1,
+          input: "long-command",
+          output: "finished",
+          exitCode: 0,
+        });
         yield* waitUntil(
           () =>
             events.some(
@@ -345,6 +355,49 @@ describe("T3 driver turns and events", () => {
           runId: "run-1",
         });
       }),
+  );
+
+  it.live("gives quiet tools a bounded longer idle budget", () =>
+    Effect.gen(function* () {
+      const server = yield* withServer;
+      const worker = yield* openDriverWorker(
+        driverFor(server),
+        openInput,
+        undefined,
+        200,
+        1_000,
+      );
+      const events: RpcEvent[] = [];
+      yield* worker.onEvent((event) => events.push(event));
+      yield* waitUntil(() => subscribeCount(server) === 1, "subscription");
+      yield* worker.prompt("quiet installation", "quiet-tool-input");
+      runningRun(server);
+      server.upsertItem(THREAD_ID, {
+        id: "quiet-command",
+        runId: "run-1",
+        type: "command_execution",
+        status: "running",
+        ordinal: 1,
+        input: "install",
+        output: "",
+      });
+      yield* waitUntil(
+        () => events.some((event) => event.type === "tool_execution_start"),
+        "tool start",
+      );
+      yield* Effect.sleep(500);
+      expect(server.commandsOf("run.interrupt")).toHaveLength(0);
+      yield* waitUntil(
+        () =>
+          events.some(
+            (event) =>
+              event.type === "error" &&
+              event.message === "T3 stalled for 1000ms",
+          ),
+        "hung tool watchdog",
+      );
+      expect(server.commandsOf("run.interrupt")).toHaveLength(1);
+    }),
   );
 
   it.live("maps a full run onto normalized events and an outcome", () =>
@@ -472,6 +525,30 @@ describe("T3 driver turns and events", () => {
       expect(new Set(keys).size).toBe(keys.length);
       for (const event of events) expect(event.cursor).toMatch(/^\d+$/u);
     }),
+  );
+
+  it.live.each(["preparing", "starting", "waiting"] as const)(
+    "queues a steer request while the active run is %s",
+    (status) =>
+      Effect.gen(function* () {
+        const server = yield* withServer;
+        const session = yield* driverFor(server).open(openInput);
+        yield* session.sendTurn({
+          clientRequestId: "starting-first",
+          text: "first",
+          delivery: "start",
+        });
+        server.updateRun(THREAD_ID, "run-1", { status });
+        const queued = yield* session.sendTurn({
+          clientRequestId: "starting-follow-up",
+          text: "follow up",
+          delivery: "steer",
+        });
+        expect(queued).toMatchObject({ turnId: "run-2", delivery: "queued" });
+        expect(
+          server.commandsOf("message.dispatch").at(-1)?.dispatchMode,
+        ).toEqual({ type: "queue_after_active" });
+      }),
   );
 
   it.live("queues behind an active run and steers into it", () =>

@@ -1,4 +1,11 @@
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@effect/vitest";
@@ -11,12 +18,14 @@ import {
   Fiber,
   Layer,
   Option,
+  Redacted,
   Result,
   Schedule,
   Schema,
 } from "effect";
 import { TestClock } from "effect/testing";
 import * as fc from "fast-check";
+import { vi } from "vitest";
 import {
   DatabaseError,
   InterruptedRunNoActionableInputError,
@@ -44,6 +53,7 @@ import {
 } from "../src/services/github-app.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
 import { McpOAuth } from "../src/services/mcp-oauth.js";
+import * as NativeBuild from "../src/services/native-build-client.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
@@ -61,8 +71,10 @@ import {
   SessionAuthority,
 } from "../src/services/session-authority.js";
 import {
+  AgentSettingsRepo,
   InstallationRepo,
   McpServerRepo,
+  ProjectionRepo,
   PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
@@ -75,6 +87,7 @@ import {
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
 import { WorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
+import * as T3DeviceBackup from "../src/services/t3-device-backup.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { tokenContext } from "../src/services/token-migration.js";
 import { safeSessionKey } from "../src/services/workspace.js";
@@ -125,6 +138,19 @@ describe("Linear worker prompt contract", () => {
 
   it("resolves the bundled deviation extension entrypoint", () => {
     expect(resolveDeviationExtensionPath()).not.toBeNull();
+  });
+
+  it("loads the image's bundled deviation extension for isolated workers", () => {
+    for (const mode of ["firecracker", "sysbox"] as const) {
+      expect(resolveDeviationExtensionPath(mode)).toBe(
+        "/app/dist/extensions/report-deviation.js",
+      );
+    }
+    expect(resolveDeviationExtensionPath("native")).toBe(
+      fileURLToPath(
+        new URL("../src/extensions/report-deviation.ts", import.meta.url),
+      ),
+    );
   });
 });
 
@@ -504,9 +530,9 @@ describe("SessionAuthority behavior invariants", () => {
     { timeout: 15_000 },
   );
 
-  it.effect(
-    "resumes a user-stopped run when a follow-up prompt arrives",
-    () =>
+  it.effect.each([true, false])(
+    "schedules a follow-up prompt when the preceding stop was already processed: %s",
+    (processStopFirst) =>
       withAuthority(() =>
         Effect.gen(function* () {
           const authority = yield* SessionAuthority;
@@ -530,7 +556,7 @@ describe("SessionAuthority behavior invariants", () => {
             issueId: Option.none(),
           });
           yield* runRepo.update(testSessionId, {
-            state: "running",
+            state: processStopFirst ? "running" : "succeeded",
             repositoryId: Option.some(repositoryId),
             workspacePath: Option.some(testPath("resume-workspace")),
             ompSessionFile: Option.some(
@@ -539,26 +565,38 @@ describe("SessionAuthority behavior invariants", () => {
           });
 
           yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("superseded-prompt"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "this prompt must be canceled by the later stop",
+            payload: {},
+            createdAt: 0,
+          });
+          yield* runInputRepo.enqueue({
             id: Schema.decodeUnknownSync(InputId)("stop-input"),
             sessionId: testSessionId,
             kind: "stop",
             body: "stop",
             payload: {},
           });
-          yield* authority.processSession(testSessionId);
+          if (processStopFirst) yield* authority.processRunnable();
 
           const stopped = yield* runRepo.get(testSessionId);
           expect(Option.isSome(stopped)).toBe(true);
-          if (Option.isSome(stopped)) {
+          if (Option.isSome(stopped) && processStopFirst) {
             expect(stopped.value.state).toBe("canceled");
             expect(stopped.value.desiredState).toBe("canceled");
           }
-          expect(projectorTerminals).toContainEqual({
-            sessionId: testSessionId,
-            sourceKey: `stop:${testSessionId}`,
-            kind: "response",
-            text: "Stopped as requested.",
-          });
+          expect(yield* runInputRepo.listSessionsWithPendingInputs()).toEqual(
+            processStopFirst ? [] : [testSessionId],
+          );
+          if (processStopFirst)
+            expect(projectorTerminals).toContainEqual({
+              sessionId: testSessionId,
+              sourceKey: `stop:${testSessionId}`,
+              kind: "response",
+              text: "Stopped as requested.",
+            });
 
           yield* runInputRepo.enqueue({
             id: Schema.decodeUnknownSync(InputId)("resume-input"),
@@ -567,7 +605,8 @@ describe("SessionAuthority behavior invariants", () => {
             body: "please continue the task",
             payload: {},
           });
-          yield* authority.processSession(testSessionId);
+          yield* authority.processRunnable();
+          if (!processStopFirst) yield* authority.processRunnable();
 
           const resumed = yield* runRepo.get(testSessionId);
           expect(Option.isSome(resumed)).toBe(true);
@@ -585,6 +624,7 @@ describe("SessionAuthority behavior invariants", () => {
           );
           expect(workerSpawnInputs[0]?.cwd).toBe(testPath("resume-workspace"));
           expect(workerPrompts).toEqual(["please continue the task"]);
+          expect(yield* runInputRepo.pending(testSessionId)).toEqual([]);
         }),
       ),
     { timeout: 15_000 },
@@ -654,6 +694,66 @@ describe("SessionAuthority behavior invariants", () => {
       }),
     ),
   );
+  it.live(
+    "persists independent retry notices for concurrent interrupted sessions",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runs = yield* RunRepo;
+          const inputs = yield* RunInputRepo;
+          const projections = yield* ProjectionRepo;
+          yield* InstallationRepo.use((repo) =>
+            repo.put(install(testOrganizationId)),
+          );
+          for (const name of ["retry-session-a", "retry-session-b"]) {
+            const sessionId = Schema.decodeUnknownSync(SessionId)(name);
+            const inputId = Schema.decodeUnknownSync(InputId)(`${name}-prompt`);
+            yield* runs.create({
+              sessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            yield* inputs.enqueue({
+              id: inputId,
+              sessionId,
+              kind: "prompted",
+              body: `Continue ${name}`,
+              payload: {},
+            });
+            yield* inputs.markProcessed(inputId);
+            const cwd = testPath(name);
+            yield* Effect.promise(() => mkdir(cwd, { recursive: true }));
+            yield* runs.update(sessionId, {
+              state: "orphaned",
+              workspacePath: Option.some(cwd),
+            });
+            yield* authority.processSession(sessionId);
+            const thought = projectorThoughts.find(
+              (item) =>
+                item.sessionId === sessionId &&
+                item.text.startsWith("Retrying"),
+            );
+            expect(thought).toBeDefined();
+            if (thought === undefined) throw new Error("missing retry notice");
+            // Persist the actual authority-produced key and payload through the
+            // real outbox. Its global primary key must accept both sessions.
+            yield* projections.enqueue({
+              sourceKey: Schema.decodeUnknownSync(SourceKey)(thought.sourceKey),
+              sessionId,
+              activityType: "thought",
+              payloadHash: name,
+              payload: { sessionId, text: thought.text },
+            });
+          }
+          expect(workerPrompts).toEqual([
+            "Continue retry-session-a",
+            "Continue retry-session-b",
+          ]);
+        }),
+      ),
+  );
+
   it.live("renders a prompted template when retrying an orphaned run", () =>
     withAuthority(() =>
       Effect.gen(function* () {
@@ -978,6 +1078,7 @@ const testConfigProvider = (
   valuesOverride: ReadonlyArray<readonly [string, string]> = [],
 ) => {
   const values: Array<readonly [string, string]> = [
+    ["WORKER_SANDBOX_MODE", "native"],
     ["LINEAR_CLIENT_ID", "test-client"],
     ["LINEAR_CLIENT_SECRET", "test-secret"],
     ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
@@ -1007,6 +1108,11 @@ const projectorEvents: Array<{
   readonly sessionId: string;
   readonly sequence: number;
   readonly event: RpcEvent;
+}> = [];
+const projectorThoughts: Array<{
+  readonly sessionId: string;
+  readonly sourceKey: string;
+  readonly text: string;
 }> = [];
 const projectorElicitations: Array<{
   readonly sessionId: string;
@@ -1055,7 +1161,11 @@ const signalElicitation = (): void => {
 
 let terminalFailure: DatabaseError | undefined;
 const mockProjector = ActivityProjector.of({
-  thought: () => Effect.succeed(true),
+  thought: (sessionId, sourceKey, text) =>
+    Effect.sync(() => {
+      projectorThoughts.push({ sessionId, sourceKey, text });
+      return true;
+    }),
   deviation: () => Effect.succeed(true),
   elicitation: (sessionId, sourceKey, text, options) =>
     Effect.sync(() => {
@@ -1186,6 +1296,7 @@ const toolCommentCalls: Array<{
   readonly sessionId: string;
   readonly body: string;
 }> = [];
+const workspaceWriteCalls: Array<{ readonly operation: string }> = [];
 let commentEnteredSignal: Deferred.Deferred<void> | undefined;
 let commentRelease: Deferred.Deferred<void> | undefined;
 const mockToolsGateway = LinearGateway.of({
@@ -1232,6 +1343,15 @@ const mockToolsGateway = LinearGateway.of({
         });
   },
   updateIssue: () => Effect.void,
+  workspaceRead: (input: {
+    readonly operation: string;
+    readonly input: unknown;
+  }) => Effect.succeed({ operation: input.operation, input: input.input }),
+  workspaceWrite: (input: { readonly operation: string }) =>
+    Effect.sync(() => {
+      workspaceWriteCalls.push(input);
+      return { ok: true };
+    }),
   addSessionExternalUrls: (input: {
     readonly sessionId: string;
     readonly urls: ReadonlyArray<{
@@ -1255,6 +1375,7 @@ const withAuthority = <A, E>(
     A,
     E,
     | SessionAuthority
+    | AgentSettingsRepo
     | RunRepo
     | RunInputRepo
     | RunEventRepo
@@ -1263,6 +1384,7 @@ const withAuthority = <A, E>(
     | McpOAuth
     | TokenCrypto
     | PromptTemplateRepo
+    | ProjectionRepo
     | WorkspaceRepo
     | NixEnvironment
     | GitHubApp
@@ -1272,9 +1394,13 @@ const withAuthority = <A, E>(
   options?: {
     readonly afterShutdown?: (db: SqliteClientShape["db"]) => void;
     readonly config?: ReadonlyArray<readonly [string, string]>;
+    readonly configOverride?:
+      | ((config: GatewayConfig["Service"]) => GatewayConfig["Service"])
+      | undefined;
     readonly withLinearGateway?: boolean;
     readonly githubApp?: GitHubAppTokenService;
     readonly workerUid?: string;
+    readonly workerIdentityRepo?: WorkerIdentityRepo["Service"];
   },
 ) =>
   Effect.scoped(
@@ -1299,6 +1425,7 @@ const withAuthority = <A, E>(
       workerStopBlock = undefined;
       projectionExpected = 0;
       projectorEvents.length = 0;
+      projectorThoughts.length = 0;
       projectorElicitations.length = 0;
       workerSpawnInputs.length = 0;
       workerPrompts.length = 0;
@@ -1308,6 +1435,7 @@ const withAuthority = <A, E>(
       nixPrepareBlock = undefined;
       projectorTerminals.length = 0;
       toolCommentCalls.length = 0;
+      workspaceWriteCalls.length = 0;
       orderEvents.length = 0;
       commentEnteredSignal = undefined;
       commentRelease = undefined;
@@ -1321,23 +1449,34 @@ const withAuthority = <A, E>(
         options?.withLinearGateway === true
           ? Layer.succeed(LinearGateway, mockToolsGateway)
           : (Layer.empty as Layer.Layer<LinearGateway>);
+      const gatewayConfig =
+        options?.configOverride === undefined
+          ? GatewayConfig.layer
+          : Layer.effect(
+              GatewayConfig,
+              GatewayConfig.pipe(Effect.map(options.configOverride)),
+            ).pipe(Layer.provide(GatewayConfig.layer));
       const dependencies = Layer.mergeAll(
-        GatewayConfig.layer,
+        gatewayConfig,
         TokenCrypto.layer,
+        AgentSettingsRepo.layer,
         InstallationRepo.layer,
         McpServerRepo.layer,
         McpOAuth.layer,
         PromptTemplateRepo.layer,
+        ProjectionRepo.layer,
         RunEventRepo.layer,
         RunInputRepo.layer,
         RunRepo.layer,
         WorkspaceRepo.layer,
-        options?.workerUid === undefined
-          ? WorkerIdentityRepo.layer
-          : Layer.succeed(WorkerIdentityRepo, {
-              acquire: () => Effect.succeed(options.workerUid),
-              release: () => Effect.void,
-            }),
+        options?.workerIdentityRepo !== undefined
+          ? Layer.succeed(WorkerIdentityRepo, options.workerIdentityRepo)
+          : options?.workerUid === undefined
+            ? WorkerIdentityRepo.layer
+            : Layer.succeed(WorkerIdentityRepo, {
+                acquire: () => Effect.succeed(options.workerUid),
+                release: () => Effect.void,
+              }),
         GitHubApp.layer,
         githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
@@ -1385,7 +1524,169 @@ const install = (organizationId: OrganizationId): Installation => ({
   canAccessAllPublicTeams: Option.none(),
 });
 
+describe("run settings startup snapshots", () => {
+  it.effect.each(["firecracker", "sysbox"] as const)(
+    "refuses a directly supplied %s config without a broker",
+    (runtime) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.result(
+          withAuthority(() => Effect.void, {
+            configOverride: (config) => ({
+              ...config,
+              workerSandboxMode: runtime,
+              sessionSandboxBrokerSocketPath: undefined,
+            }),
+          }),
+        );
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result))
+          expect(String(result.failure)).toContain(
+            "native execution is forbidden",
+          );
+        expect(workerSpawnInputs).toHaveLength(0);
+      }),
+  );
+
+  it.effect("reuses the frozen settings snapshot on a worker retry", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const runRepo = yield* RunRepo;
+        const inputRepo = yield* RunInputRepo;
+        const settingsRepo = yield* AgentSettingsRepo;
+        const workspacePath = testPath("run-settings-retry");
+        yield* InstallationRepo.use((repo) =>
+          repo.put(install(testOrganizationId)),
+        );
+        yield* Effect.promise(() => mkdir(workspacePath, { recursive: true }));
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.none(),
+        });
+        yield* runRepo.update(testSessionId, {
+          state: "orphaned",
+          repositoryId: Option.some(
+            Schema.decodeUnknownSync(WorkspaceId)("run-settings-retry-repo"),
+          ),
+          workspacePath: Option.some(workspacePath),
+        });
+        const enqueue = (id: string, label: string) =>
+          inputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)(id),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "continue",
+            payload: {
+              agentSession: { issue: { labels: [label] } },
+            },
+          });
+        yield* enqueue("run-settings-first", "mode:full-access");
+
+        yield* authority.processSession(testSessionId);
+        expect(workerSpawnInputs).toHaveLength(1);
+        expect(workerSpawnInputs[0]?.command).toContain("--approval-mode");
+        expect(workerSpawnInputs[0]?.command).toContain("yolo");
+        const firstSnapshot = Option.getOrThrow(
+          yield* settingsRepo.getSnapshot(testSessionId, testOrganizationId),
+        );
+        expect(firstSnapshot.settings.runtimeMode).toBe("full-access");
+
+        yield* authority.shutdown();
+        yield* settingsRepo.upsert(testOrganizationId, {
+          defaults: { mode: "approval-required" },
+        });
+        yield* runRepo.update(testSessionId, { state: "orphaned" });
+        yield* enqueue("run-settings-retry", "mode:auto");
+        yield* authority.processSession(testSessionId);
+
+        expect(workerSpawnInputs).toHaveLength(2);
+        expect(workerSpawnInputs[1]?.command).toContain("--approval-mode");
+        expect(workerSpawnInputs[1]?.command).toContain("yolo");
+        expect(workerSpawnInputs[1]?.command).not.toContain("always-ask");
+        expect(
+          Option.getOrThrow(
+            yield* settingsRepo.getSnapshot(testSessionId, testOrganizationId),
+          ).settings,
+        ).toEqual(firstSnapshot.settings);
+      }),
+    ),
+  );
+});
+
 describe("SessionAuthority team-access gate", () => {
+  it.live.each(["native", "firecracker", "sysbox"] as const)(
+    "uses safe uid retirement during initial %s workspace materialization",
+    (runtime) => {
+      const acquisitions: Array<
+        { readonly retireTerminal?: boolean } | undefined
+      > = [];
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            yield* InstallationRepo.use((repo) =>
+              repo.put(install(testOrganizationId)),
+            );
+            yield* WorkspaceRepo.use((repo) =>
+              repo.createRepository({
+                organizationId: testOrganizationId,
+                id: Schema.decodeUnknownSync(WorkspaceId)(
+                  "fresh-materialization-repo",
+                ),
+                url: "https://github.com/org/repo.git",
+                ref: "main",
+                isDefault: true,
+              }),
+            );
+            yield* RunRepo.use((repo) =>
+              repo.create({
+                sessionId: testSessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.none(),
+              }),
+            );
+            yield* RunInputRepo.use((repo) =>
+              repo.enqueue({
+                id: Schema.decodeUnknownSync(InputId)(
+                  "fresh-materialization-input",
+                ),
+                sessionId: testSessionId,
+                kind: "created",
+                body: "start",
+                payload: {},
+              }),
+            );
+            const result = yield* (yield* SessionAuthority)
+              .processSession(testSessionId)
+              .pipe(Effect.result);
+            expect(Result.isFailure(result)).toBe(true);
+            expect(acquisitions).toEqual([
+              { retireTerminal: runtime === "native" },
+            ]);
+            expect(workerSpawnInputs).toHaveLength(0);
+          }),
+        {
+          configOverride: (config) => ({
+            ...config,
+            workerSandboxMode: runtime,
+            sessionSandboxBrokerSocketPath: testPath("missing-broker.sock"),
+          }),
+          workerIdentityRepo: {
+            acquire: (_sessionId, _root, options) => {
+              acquisitions.push(options);
+              return Effect.fail(
+                new DatabaseError({
+                  message: "Reserved uid pool exhausted",
+                }),
+              );
+            },
+            release: () => Effect.void,
+          },
+        },
+      );
+    },
+  );
+
   it.live(
     "proceeds when the installation team-access snapshot is unknown (null)",
     () =>
@@ -1452,6 +1753,45 @@ describe("SessionAuthority team-access gate", () => {
         ).toEqual({ active: 0 });
       }),
     ),
+  );
+
+  it.live.each(["firecracker", "sysbox"] as const)(
+    "reserves a terminal uid when %s teardown is unavailable after restart",
+    (runtime) =>
+      withAuthority(
+        (db) =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            yield* InstallationRepo.use((repo) =>
+              repo.put(install(testOrganizationId)),
+            );
+            yield* RunRepo.use((repo) =>
+              repo.create({
+                sessionId: testSessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.some(testIssueId),
+              }),
+            );
+            db.query(
+              "INSERT INTO worker_identity(session_id, uid, active) VALUES (?, 21001, 1)",
+            ).run(testSessionId);
+            db.query(
+              "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
+            ).run(testSessionId);
+            yield* authority.processSession(testSessionId);
+            expect(
+              db
+                .query("SELECT active FROM worker_identity WHERE session_id=?")
+                .get(testSessionId),
+            ).toEqual({ active: 1 });
+          }),
+        {
+          config: [
+            ["WORKER_SANDBOX_MODE", runtime],
+            ["SESSION_SANDBOX_BROKER_SOCKET", testPath("missing-broker.sock")],
+          ],
+        },
+      ),
   );
 
   it.live("cancels when a known snapshot excludes the run's team", () =>
@@ -1936,7 +2276,574 @@ describe("SessionAuthority deferred stop handling", () => {
       ),
   );
 });
+describe("SessionAuthority repository age identities", () => {
+  it.live(
+    "selects native secrets from the exact run grant and ignores model secret inputs",
+    () => {
+      const requests: NativeBuild.NativeBuildRequest[] = [];
+      const job = {
+        job: "a".repeat(32),
+        sessionId: testSessionId,
+        commit: "b".repeat(40),
+        action: "test",
+        state: "starting" as const,
+      };
+      const client = vi
+        .spyOn(NativeBuild, "createNativeBuildClient")
+        .mockResolvedValue({
+          start: async (request) => {
+            requests.push(request);
+            return job;
+          },
+          status: async () => job,
+          cancel: async () => {},
+          close: async () => {},
+          artifact: async () => {
+            throw new Error("No fixture artifact");
+          },
+        });
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runs = yield* RunRepo;
+            const repositories = yield* WorkspaceRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            for (const [index, name] of [
+              "bound-repo",
+              "unbound-repo",
+            ].entries()) {
+              const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(name);
+              const sessionId = Schema.decodeUnknownSync(SessionId)(
+                `native-age-session-${index}`,
+              );
+              const cwd = testPath(`native-age-workspace-${index}`);
+              yield* repositories.createRepository({
+                id: repositoryId,
+                organizationId: testOrganizationId,
+                url: "https://github.com/fixture/scoped.git",
+                ref: "main",
+              });
+              yield* runs.create({
+                sessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.none(),
+              });
+              yield* runs.update(sessionId, {
+                state: "orphaned",
+                repositoryId: Option.some(repositoryId),
+                workspacePath: Option.some(cwd),
+                ompSessionFile: Option.some(join(cwd, "session.jsonl")),
+              });
+              yield* authority.processSession(sessionId);
+              const listener = hostToolListener;
+              if (listener === undefined)
+                throw new Error("Missing host tool listener");
+              const result = yield* listener({
+                id: `native-age-${index}`,
+                toolCallId: `native-age-${index}`,
+                toolName: "native_build_start",
+                arguments: {
+                  commit: job.commit,
+                  pullRequest: 31,
+                  action: "test",
+                  secretFiles: {
+                    "repository-age-identity": "model-injected-key",
+                  },
+                  organizationId: "foreign-org",
+                  repositoryId: "unbound-repo",
+                },
+              });
+              expect(result.isError).not.toBe(true);
+              expect(requests[index]?.secretFiles).toEqual(
+                index === 0
+                  ? { "repository-age-identity": "scoped-fixture-key" }
+                  : undefined,
+              );
+            }
+            expect(JSON.stringify(requests)).not.toContain("foreign-org-key");
+            expect(JSON.stringify(requests)).not.toContain(
+              "model-injected-key",
+            );
+          }),
+        {
+          configOverride: (config) => ({
+            ...config,
+            nativeBuild: {
+              sshConfigFile: testPath("native-age/ssh_config"),
+              scratchRoot: testPath("native-age/jobs"),
+            },
+            workerRepositoryAgeKeys: Redacted.make({
+              [testOrganizationId]: { "bound-repo": "scoped-fixture-key" },
+              "foreign-org": { "unbound-repo": "foreign-org-key" },
+            }),
+          }),
+        },
+      ).pipe(Effect.ensuring(Effect.sync(() => client.mockRestore())));
+    },
+  );
+
+  it.live(
+    "materializes only the run's org/repository key and passes a private file pointer",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runs = yield* RunRepo;
+            const repositories = yield* WorkspaceRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            for (const [index, repositoryName] of [
+              "bound-repo",
+              "unbound-repo",
+            ].entries()) {
+              const repositoryId =
+                Schema.decodeUnknownSync(WorkspaceId)(repositoryName);
+              const sessionId = Schema.decodeUnknownSync(SessionId)(
+                `age-session-${index}`,
+              );
+              const cwd = testPath(`age-workspace-${index}`);
+              yield* repositories.createRepository({
+                id: repositoryId,
+                organizationId: testOrganizationId,
+                url: "https://github.com/fixture/scoped.git",
+                ref: "main",
+              });
+              yield* runs.create({
+                sessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.none(),
+              });
+              yield* runs.update(sessionId, {
+                state: "orphaned",
+                repositoryId: Option.some(repositoryId),
+                workspacePath: Option.some(cwd),
+                ompSessionFile: Option.some(join(cwd, "session.jsonl")),
+              });
+              yield* authority.processSession(sessionId);
+              const environment = workerSpawnInputs[index]?.env;
+              expect(environment).toBeDefined();
+              if (index === 0) {
+                const path = join(
+                  cwd,
+                  ".omp-home",
+                  ".config",
+                  "sops",
+                  "age",
+                  "keys.txt",
+                );
+                expect(environment?.FNOX_AGE_KEY_FILE).toBe(path);
+                expect(
+                  yield* Effect.promise(() => readFile(path, "utf8")),
+                ).toBe("scoped-fixture-key");
+                const metadata = yield* Effect.promise(() => stat(path));
+                expect(metadata.mode & 0o777).toBe(0o400);
+                expect(metadata.uid).toBe(process.getuid?.());
+                yield* (yield* RunInputRepo).applyStop(sessionId);
+                yield* authority.processSession(sessionId);
+                yield* Effect.promise(async () => {
+                  await expect(readFile(path)).rejects.toMatchObject({
+                    code: "ENOENT",
+                  });
+                });
+              } else
+                expect(environment).not.toHaveProperty("FNOX_AGE_KEY_FILE");
+              expect(JSON.stringify(workerSpawnInputs[index])).not.toContain(
+                "scoped-fixture-key",
+              );
+              expect(JSON.stringify(workerSpawnInputs[index])).not.toContain(
+                "foreign-org-key",
+              );
+            }
+          }),
+        {
+          config: [
+            [
+              "WORKER_REPOSITORY_AGE_KEYS_JSON",
+              JSON.stringify({
+                [testOrganizationId]: { "bound-repo": "scoped-fixture-key" },
+                "foreign-org": { "unbound-repo": "foreign-org-key" },
+              }),
+            ],
+          ],
+        },
+      ),
+  );
+});
+
 describe("SessionAuthority host-tool mutation gate", () => {
+  it.live(
+    "routes T3 device backup through the current run and refuses operations after stop",
+    () => {
+      const calls: Array<unknown> = [];
+      const releases: Array<unknown> = [];
+      const backup = vi
+        .spyOn(T3DeviceBackup, "makeT3DeviceBackup")
+        .mockReturnValue({
+          call: (organizationId, sessionId, arguments_) =>
+            Effect.sync(() => {
+              calls.push({ organizationId, sessionId, arguments_ });
+              return { devices: [] };
+            }),
+          release: (organizationId, sessionId) =>
+            Effect.sync(() => {
+              releases.push({ organizationId, sessionId });
+            }),
+        });
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runs = yield* RunRepo;
+            const inputs = yield* RunInputRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            yield* runs.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            const cwd = testPath("device-backup-authority");
+            yield* runs.update(testSessionId, {
+              state: "orphaned",
+              workspacePath: Option.some(cwd),
+              ompSessionFile: Option.some(join(cwd, "session.jsonl")),
+            });
+            yield* authority.processSession(testSessionId);
+            expect(registeredHostTools.map((tool) => tool.name)).toContain(
+              "t3_device_backup",
+            );
+            const listener = hostToolListener;
+            if (listener === undefined)
+              throw new Error("Missing host tool listener");
+            const call = {
+              id: "device-call",
+              toolCallId: "device-tool",
+              toolName: "t3_device_backup",
+              arguments: {
+                operation: "list",
+                organizationId: "foreign",
+                sessionId: "foreign",
+              },
+            };
+            const result = yield* listener(call);
+            expect(result.isError).not.toBe(true);
+            expect(calls).toEqual([
+              {
+                organizationId: testOrganizationId,
+                sessionId: testSessionId,
+                arguments_: call.arguments,
+              },
+            ]);
+            yield* inputs.applyStop(testSessionId);
+            const refused = yield* listener(call);
+            expect(refused.isError).toBe(true);
+            expect(calls).toHaveLength(1);
+            yield* authority.processSession(testSessionId);
+            expect(releases).toContainEqual({
+              organizationId: testOrganizationId,
+              sessionId: testSessionId,
+            });
+          }),
+        {
+          configOverride: (config) => ({
+            ...config,
+            t3DeviceBackup: {
+              baseUrl: "https://t3.example.test",
+              tokenFile: "/run/secrets/t3-backup",
+              workspaceRoot: "/srv/device-backup",
+              organizationHosts: { [testOrganizationId]: ["mac"] },
+              instanceId: "configured-provider",
+              model: "configured-model",
+            },
+          }),
+        },
+      ).pipe(Effect.ensuring(Effect.sync(() => backup.mockRestore())));
+    },
+  );
+
+  it.live(
+    "creates a repo-bound PR without Linear and refuses creation after stop",
+    () => {
+      const requests: Array<{ url: string; authorization: string | null }> = [];
+      const fetchMock = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async (url, init) => {
+          requests.push({
+            url: String(url),
+            authorization: new Headers(init?.headers).get("authorization"),
+          });
+          return new Response(
+            JSON.stringify([
+              {
+                number: 42,
+                html_url: "https://github.com/acme/widgets/pull/42",
+                head: { ref: "fix/issue", repo: { full_name: "acme/widgets" } },
+                base: { ref: "main", repo: { full_name: "acme/widgets" } },
+              },
+            ]),
+            { status: 200 },
+          );
+        });
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runs = yield* RunRepo;
+            const inputs = yield* RunInputRepo;
+            const repositories = yield* WorkspaceRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            const repositoryId =
+              Schema.decodeUnknownSync(WorkspaceId)("pr-repository");
+            yield* repositories.createRepository({
+              id: repositoryId,
+              organizationId: testOrganizationId,
+              url: "https://github.com/acme/widgets.git",
+              ref: "main",
+            });
+            yield* runs.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            yield* runs.update(testSessionId, {
+              state: "orphaned",
+              repositoryId: Option.some(repositoryId),
+              workspacePath: Option.some(testPath("pr-authority")),
+              ompSessionFile: Option.some(
+                testPath("pr-authority/session.jsonl"),
+              ),
+            });
+            yield* authority.processSession(testSessionId);
+            const listener = hostToolListener;
+            expect(listener).toBeDefined();
+            if (listener === undefined) return;
+            const call = {
+              id: "pr-call",
+              toolCallId: "pr-tool",
+              toolName: "github_create_pull_request",
+              arguments: {
+                head: "fix/issue",
+                base: "main",
+                title: "Fix issue",
+              },
+            };
+            const result = yield* listener(call);
+            expect(result.isError).not.toBe(true);
+            expect(result.details).toMatchObject({
+              url: "https://github.com/acme/widgets/pull/42",
+            });
+            expect(JSON.stringify(result)).not.toContain("ghs_pr_private");
+            expect(requests).toEqual([
+              {
+                url: "https://api.github.com/repos/acme/widgets/pulls?state=open&head=acme%3Afix%2Fissue&base=main",
+                authorization: "Bearer ghs_pr_private",
+              },
+            ]);
+            yield* inputs.applyStop(testSessionId);
+            const refused = yield* listener(call);
+            expect(refused.isError).toBe(true);
+            expect(requests).toHaveLength(1);
+          }),
+        {
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({
+                name: "partitura[bot]",
+                email: "partitura@example.test",
+              }),
+            getInstallationToken: (owner, name, org) => {
+              expect([owner, name, org]).toEqual([
+                "acme",
+                "widgets",
+                testOrganizationId,
+              ]);
+              return Effect.succeed("ghs_pr_private");
+            },
+          },
+        },
+      ).pipe(Effect.ensuring(Effect.sync(() => fetchMock.mockRestore())));
+    },
+  );
+  for (const builder of ["primary", "backup"] as const) {
+    it.live(
+      `retries ${builder} native recovery without using the other builder`,
+      () => {
+        const root = testPath(`native-recovery-${builder}`);
+        const scratch = join(root, "jobs");
+        const ssh = join(root, "ssh");
+        const configFile = join(root, "ssh_config");
+        const job = "b".repeat(32);
+        return withAuthority(
+          () =>
+            Effect.gen(function* () {
+              yield* Effect.promise(async () => {
+                await chmod(root, 0o700);
+                await mkdir(scratch, { mode: 0o700 });
+                await writeFile(configFile, "# private transport fixture\n", {
+                  mode: 0o600,
+                });
+                await writeFile(
+                  ssh,
+                  '#!/bin/sh\n[ -f "$(dirname "$0")/online" ] || exit 1\nexit 0\n',
+                  { mode: 0o700 },
+                );
+                await writeFile(
+                  join(scratch, `${job}.json`),
+                  JSON.stringify({
+                    job,
+                    sessionId: testSessionId,
+                    commit: "a".repeat(40),
+                    action: "test",
+                    state: "running",
+                  }),
+                  { mode: 0o600 },
+                );
+              });
+              const authority = yield* SessionAuthority;
+              const installations = yield* InstallationRepo;
+              const runs = yield* RunRepo;
+              yield* installations.put(install(testOrganizationId));
+              yield* runs.create({
+                sessionId: testSessionId,
+                organizationId: testOrganizationId,
+                issueId: Option.some(testIssueId),
+              });
+              yield* runs.update(testSessionId, {
+                state: "orphaned",
+                workspacePath: Option.some(
+                  testPath("native-recovery-workspace"),
+                ),
+                ompSessionFile: Option.some(
+                  testPath("native-recovery-workspace/session.jsonl"),
+                ),
+              });
+              yield* authority.processSession(testSessionId);
+              const listener = hostToolListener;
+              if (listener === undefined)
+                throw new Error("host tool listener missing");
+              const request = {
+                id: "native-status",
+                toolCallId: "native-status",
+                toolName: "native_build_status",
+                arguments: { job, builder },
+              };
+              expect((yield* listener(request)).isError).toBe(true);
+              yield* Effect.promise(() => writeFile(join(root, "online"), ""));
+              const recovered = yield* listener(request);
+              expect(recovered.isError).not.toBe(true);
+              expect(recovered.content).toMatchObject([
+                {
+                  type: "text",
+                  text: expect.stringContaining('"state":"interrupted"'),
+                },
+              ]);
+              const persisted = yield* Effect.promise(() =>
+                readFile(join(scratch, `${job}.json`), "utf8"),
+              );
+              expect(JSON.parse(persisted)).toMatchObject({
+                sessionId: testSessionId,
+                state: "interrupted",
+              });
+            }),
+          {
+            configOverride: (config) => ({
+              ...config,
+              nativeBuild:
+                builder === "primary"
+                  ? {
+                      sshConfigFile: configFile,
+                      scratchRoot: scratch,
+                      sshExecutable: ssh,
+                    }
+                  : {
+                      sshConfigFile: join(root, "unavailable-primary"),
+                      scratchRoot: join(root, "primary-jobs"),
+                    },
+              ...(builder === "backup"
+                ? {
+                    nativeBuildBackup: {
+                      sshConfigFile: configFile,
+                      scratchRoot: scratch,
+                      sshExecutable: ssh,
+                    },
+                  }
+                : {}),
+            }),
+          },
+        );
+      },
+    );
+  }
+
+  it.live("refuses native build mutations after stop", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some(testPath("native-build-mutation-gate")),
+            ompSessionFile: Option.some(
+              testPath("native-build-mutation-gate/session.jsonl"),
+            ),
+          });
+          yield* authority.processSession(testSessionId);
+
+          expect(registeredHostTools.map((tool) => tool.name)).toEqual(
+            expect.arrayContaining([
+              "native_build_start",
+              "native_build_status",
+              "native_build_artifact",
+              "native_build_cancel",
+            ]),
+          );
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
+
+          yield* runInputRepo.applyStop(testSessionId);
+          for (const toolName of [
+            "native_build_start",
+            "native_build_artifact",
+            "native_build_cancel",
+          ] as const) {
+            const result = yield* listener({
+              id: `call-${toolName}`,
+              toolCallId: `tool-${toolName}`,
+              toolName,
+              arguments:
+                toolName === "native_build_start"
+                  ? {
+                      commit: "a".repeat(40),
+                      pullRequest: 7,
+                      action: "archive",
+                    }
+                  : { job: "b".repeat(32) },
+            });
+            expect(result.isError).toBe(true);
+            expect(result.content).toMatchObject([
+              { type: "text", text: "Run has stopped" },
+            ]);
+          }
+        }),
+      {
+        config: [
+          ["NATIVE_BUILD_SSH_CONFIG_FILE", testPath("native/ssh_config")],
+          ["NATIVE_BUILD_SCRATCH_ROOT", testPath("native/scratch")],
+        ],
+      },
+    ),
+  );
+
   it.live("refuses mutating host tools once the run is canceled", () =>
     withAuthority(
       () =>
@@ -1961,15 +2868,42 @@ describe("SessionAuthority host-tool mutation gate", () => {
 
           yield* authority.processSession(testSessionId);
           expect(registeredHostTools.map((tool) => tool.name)).toEqual([
+            "linear_workspace_read",
+            "linear_workspace_write",
             "linear_get_issue",
             "linear_create_comment",
             "linear_update_issue",
             "linear_add_external_url",
+            "github_create_pull_request",
           ]);
           expect(workerSpawnInputs).toHaveLength(1);
           const listener = hostToolListener;
           expect(listener).toBeDefined();
           if (listener === undefined) return;
+
+          const readTool = registeredHostTools.find(
+            (tool) => tool.name === "linear_workspace_read",
+          );
+          expect(readTool?.parameters).toMatchObject({
+            required: ["operation", "input"],
+            properties: { input: { type: "object" } },
+          });
+          const workspaceRead = yield* listener({
+            id: "call-workspace-read",
+            toolCallId: "tool-workspace-read",
+            toolName: "linear_workspace_read",
+            arguments: { operation: "get_issue", input: { id: "issue-1" } },
+          });
+          expect(workspaceRead.isError).not.toBe(true);
+          expect(workspaceRead.content).toEqual([
+            {
+              type: "text",
+              text: JSON.stringify({
+                operation: "get_issue",
+                input: { id: "issue-1" },
+              }),
+            },
+          ]);
 
           const allowed = yield* listener({
             id: "call-allowed",
@@ -1979,6 +2913,18 @@ describe("SessionAuthority host-tool mutation gate", () => {
           });
           expect(allowed.isError).not.toBe(true);
           expect(toolCommentCalls).toHaveLength(1);
+
+          const allowedWorkspaceWrite = yield* listener({
+            id: "call-allowed-write",
+            toolCallId: "tool-workspace-denied",
+            toolName: "linear_workspace_write",
+            arguments: {
+              operation: "create_issue",
+              input: { teamId: "team-1", title: "should not be created" },
+            },
+          });
+          expect(allowedWorkspaceWrite.isError).not.toBe(true);
+          expect(workspaceWriteCalls).toHaveLength(1);
 
           // Stop dominance: desired_state flips to canceled, then the
           // in-gate re-read must refuse further mutations.
@@ -1991,6 +2937,17 @@ describe("SessionAuthority host-tool mutation gate", () => {
           });
           expect(refused.isError).toBe(true);
           expect(toolCommentCalls).toHaveLength(1);
+          const deniedWorkspaceWrite = yield* listener({
+            id: "call-denied-write",
+            toolCallId: "tool-workspace-denied",
+            toolName: "linear_workspace_write",
+            arguments: {
+              operation: "create_issue",
+              input: { teamId: "team-1", title: "should not be created" },
+            },
+          });
+          expect(deniedWorkspaceWrite.isError).toBe(true);
+          expect(workspaceWriteCalls).toHaveLength(1);
 
           // Read tools still work after cancellation.
           const read = yield* listener({
@@ -3318,6 +4275,17 @@ const seedDriverRun = (
         '[core]\nrepositoryformatversion = 0\n[http "https://github.com/"]\nextraheader = AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0\n',
       ),
     );
+    const initialized = yield* Effect.sync(() =>
+      Bun.spawnSync({
+        cmd: ["/usr/bin/git", "init", "--quiet", cwd],
+        env: {
+          PATH: "/usr/bin:/bin",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+      }),
+    );
+    expect(initialized.exitCode).toBe(0);
     yield* runs.create({
       sessionId: testSessionId,
       organizationId: testOrganizationId,
@@ -3354,10 +4322,20 @@ const withT3Authority = <A, E>(
   task: Parameters<typeof withAuthority<A, E>>[0],
   server: FakeT3Server,
   workerUid?: string,
+  sandboxMode: false | "firecracker" | "sysbox" = false,
 ) =>
   withAuthority(task, {
     withLinearGateway: true,
     ...(workerUid === undefined ? {} : { workerUid }),
+    ...(sandboxMode
+      ? {
+          configOverride: (config: GatewayConfig["Service"]) => ({
+            ...config,
+            workerSandboxMode: sandboxMode,
+            sessionSandboxBrokerSocketPath: "/nonexistent-sandbox-broker.sock",
+          }),
+        }
+      : {}),
     config: [
       ["T3_BASE_URL", server.baseUrl.toString()],
       ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
@@ -3763,33 +4741,35 @@ describe("AgentDriver authority integration", () => {
       }),
   );
   it.live(
-    "fails closed before contacting T3 when per-session uid isolation is active",
+    "fails closed before contacting remote T3 when uid or container isolation is active",
     () =>
       Effect.gen(function* () {
         const server = yield* t3Server;
-        yield* withT3Authority(
-          () =>
-            Effect.gen(function* () {
-              yield* seedDriverRun("t3");
-              const result = yield* (yield* SessionAuthority)
-                .processSession(testSessionId)
-                .pipe(Effect.result);
-              expect(Result.isFailure(result)).toBe(true);
-              if (Result.isFailure(result))
-                expect(result.failure.message).toContain(
-                  "shared T3 daemon cannot serve isolated worker workspaces",
-                );
-              expect(server.threads.size).toBe(0);
-              expect(server.projectMutations).toHaveLength(0);
-              expect(workerSpawnInputs).toHaveLength(0);
-              expect(
-                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
-                  .state,
-              ).toBe("orphaned");
-            }),
-          server,
-          "10001",
-        );
+        for (const sandboxMode of [false, "firecracker", "sysbox"] as const)
+          yield* withT3Authority(
+            () =>
+              Effect.gen(function* () {
+                yield* seedDriverRun("t3");
+                const result = yield* (yield* SessionAuthority)
+                  .processSession(testSessionId)
+                  .pipe(Effect.result);
+                expect(Result.isFailure(result)).toBe(true);
+                if (Result.isFailure(result))
+                  expect(result.failure.message).toContain(
+                    "shared T3 daemon cannot serve isolated worker workspaces",
+                  );
+                expect(server.threads.size).toBe(0);
+                expect(server.projectMutations).toHaveLength(0);
+                expect(workerSpawnInputs).toHaveLength(0);
+                expect(
+                  Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                    .state,
+                ).toBe("orphaned");
+              }),
+            server,
+            sandboxMode ? undefined : "10001",
+            sandboxMode,
+          );
       }),
   );
   it.live(
@@ -3846,14 +4826,22 @@ describe("AgentDriver authority integration", () => {
               expect(ref.locator.origin).toBe(`http://127.0.0.1:${portBase}`);
               expect(workerSpawnInputs).toHaveLength(0);
               expect([...server.projects.values()][0]?.workspaceRoot).toBe(cwd);
-              // Same repo-scoped, re-minted credential OMP workers get. It
-              // stays in the session's Git config and never crosses the API.
+              // GitHub credentials stay in the gateway during checkout and
+              // never persist in the worker's repository config or cross T3.
               const minted = Buffer.from("x-access-token:ghs_launch").toString(
                 "base64",
               );
-              expect(
-                yield* Effect.promise(() => readFile(configPath, "utf8")),
-              ).toContain(`AUTHORIZATION: basic ${minted}`);
+              const workspaceGitConfig = yield* Effect.promise(() =>
+                readFile(configPath, "utf8"),
+              );
+              expect(workspaceGitConfig).not.toContain("AUTHORIZATION");
+              expect(workspaceGitConfig).not.toContain("ghs_launch");
+              expect(workspaceGitConfig).toMatch(
+                /\[url "http:\/\/127\.0\.0\.1:\d+\/git\/[A-Za-z0-9_-]+\/org\/repo"\]/u,
+              );
+              expect(workspaceGitConfig).toContain(
+                "insteadOf = https://github.com/org/repo",
+              );
               expect(JSON.stringify(server.requests)).not.toContain(minted);
               expect(JSON.stringify(server.requests)).not.toContain(
                 "ghs_launch",
@@ -3861,7 +4849,8 @@ describe("AgentDriver authority integration", () => {
               const prompt = JSON.stringify(
                 server.commandsOf("message.dispatch")[0],
               );
-              expect(prompt).toContain("GitHub REST API");
+              expect(prompt).toContain("github_create_pull_request");
+              expect(prompt).not.toContain("git config --get");
               expect(prompt).not.toContain("Org OMP contract");
               expect(prompt).not.toContain("linear_get_issue");
               expect(prompt).not.toContain("rromp_report_deviation");

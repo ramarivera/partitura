@@ -18,6 +18,7 @@ import { RpcWorker } from "./services/rpc-worker.js";
 import { SessionAuthority } from "./services/session-authority.js";
 import {
   AdminSessionRepo,
+  AgentSettingsRepo,
   DeliveryRepo,
   ExecutorInstanceRepo,
   InstallationRepo,
@@ -44,6 +45,7 @@ const sqliteClientLayer = Layer.unwrap(
 export const GatewayServicesLive = Layer.mergeAll(
   TokenCrypto.layer,
   AdminSessionRepo.layer,
+  AgentSettingsRepo.layer,
   InstallationRepo.layer,
   DeliveryRepo.layer,
   RunRepo.layer,

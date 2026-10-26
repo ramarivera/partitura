@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   rename,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -18,11 +19,15 @@ import {
   materializeMcpAgentDb,
   removeMcpAgentDbFile,
 } from "./services/mcp-oauth.js";
+import { seedWorkerBuildTools } from "./services/worker-build-tools.js";
 import {
   seedWorkerProfileFiles,
   type WorkerProfileManifest,
 } from "./services/worker-profile.js";
-import { workerMcpCredential } from "./services/worker-security.js";
+import {
+  workerMcpCredential,
+  writeAgeIdentityFile,
+} from "./services/worker-security.js";
 import { cleanupWorkerSharedDirectoriesSync } from "./services/worker-shared-cleanup.js";
 import {
   assertT3GitCredentials,
@@ -97,6 +102,7 @@ switch (action) {
   case "tool-directories": {
     for (const name of [".omp-home", ".omp-tmp"])
       await mkdir(join(cwd, name), { recursive: true, mode: 0o700 });
+    await seedWorkerBuildTools(cwd);
     await mkdir(join(cwd, ".git", "info"), { recursive: true });
     const excludePath = join(cwd, ".git", "info", "exclude");
     const existing = await readFile(excludePath, "utf8").catch(
@@ -118,9 +124,34 @@ switch (action) {
       await appendFile(excludePath, `\n${missing.join("\n")}\n`);
     break;
   }
+  case "age-identity": {
+    if (
+      typeof input === "object" &&
+      input !== null &&
+      "identity" in input &&
+      input.identity === null
+    ) {
+      await rm(join(cwd, ".omp-home", ".config", "sops", "age", "keys.txt"), {
+        force: true,
+      });
+      break;
+    }
+    if (
+      typeof input !== "object" ||
+      input === null ||
+      !("identity" in input) ||
+      typeof input.identity !== "string" ||
+      input.identity.length === 0 ||
+      input.identity.length > 256 * 1024
+    )
+      throw new Error("Expected a bounded age identity string");
+    const path = await writeAgeIdentityFile(cwd, input.identity);
+    process.stdout.write(path);
+    break;
+  }
   case "t3-config": {
     // Paths come from the workspace, never the payload. Rewritten every launch.
-    const { settings, codexConfig } = input as T3LaunchSettings;
+    const { settings, codexConfig, claudeConfig } = input as T3LaunchSettings;
     if (typeof codexConfig !== "string" || typeof settings !== "object")
       throw new Error("Expected T3 settings");
     const paths = t3SessionPaths(cwd);
@@ -136,6 +167,10 @@ switch (action) {
       `${JSON.stringify(settings, null, 2)}\n`,
     );
     await replace(join(paths.codexHome, "config.toml"), codexConfig);
+    await replace(
+      join(paths.claudeHome, ".claude.json"),
+      `${JSON.stringify(claudeConfig, null, 2)}\n`,
+    );
     break;
   }
   default:

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   Cause,
@@ -42,7 +43,6 @@ import {
 import type { AgentDriver } from "../drivers/driver.js";
 import { rpcAssistantText } from "../drivers/events.js";
 import { makeOmpDriver } from "../drivers/omp/driver.js";
-import { selectDriver } from "../drivers/selection.js";
 import {
   makeT3Driver,
   remoteT3Endpoint,
@@ -55,9 +55,28 @@ import {
   T3PortPool,
 } from "../drivers/t3/launcher.js";
 import { openDriverWorker } from "../drivers/worker-adapter.js";
-import { GatewayConfig, type T3LaunchConfig } from "./config.js";
+import {
+  applyEffortToT3Selection,
+  type EffectiveRunSettings,
+  resolveRunSettings,
+} from "./agent-settings.js";
+import {
+  GatewayConfig,
+  type T3LaunchConfig,
+  type WorkerSandboxMode,
+} from "./config.js";
 import { GitHubApp } from "./github-app.js";
+import {
+  createGitHubPullRequest,
+  githubCreatePullRequestToolDefinition,
+} from "./github-workspace-tools.js";
 import { LinearGateway, type LinearIssue } from "./linear-gateway.js";
+import { startLinearMcpServer } from "./linear-mcp-server.js";
+import {
+  LINEAR_WORKSPACE_MUTATIONS,
+  LINEAR_WORKSPACE_TOOLS,
+  type LinearWorkspaceMutation,
+} from "./linear-workspace-tools.js";
 import {
   removeMcpConfig,
   resolveEffectiveMcpServers,
@@ -68,6 +87,10 @@ import {
   materializeMcpAgentDb,
   removeMcpAgentDb,
 } from "./mcp-oauth.js";
+import {
+  deliverNativeArtifact,
+  type NativeBuildConfig,
+} from "./native-build-client.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import {
@@ -85,6 +108,12 @@ import type {
 } from "./rpc-worker.js";
 import { RpcWorker } from "./rpc-worker.js";
 import {
+  makeSessionSandboxRuntime,
+  type SessionSandboxHandle,
+  type SessionSandboxRelay,
+} from "./session-sandbox.js";
+import {
+  AgentSettingsRepo,
   InstallationRepo,
   McpServerRepo,
   PromptTemplateRepo,
@@ -94,6 +123,11 @@ import {
   WorkspaceRepo,
 } from "./store/repositories.js";
 import { WorkerIdentityRepo } from "./store/worker-identity-repo.js";
+import {
+  makeT3DeviceBackup,
+  t3DeviceBackupResult,
+  t3DeviceBackupTool,
+} from "./t3-device-backup.js";
 import { startWorkerMcpProxy } from "./worker-mcp-proxy.js";
 import {
   seedWorkerProfileFiles,
@@ -136,6 +170,20 @@ interface WorkerState {
 }
 
 const CANCEL_GATE_TIMEOUT_MS = 30_000;
+
+const ompApprovalMode = (
+  mode: EffectiveRunSettings["runtimeMode"],
+): "always-ask" | "write" | "yolo" => {
+  switch (mode) {
+    case "approval-required":
+      return "always-ask";
+    case "full-access":
+      return "yolo";
+    case "auto-accept-edits":
+    case "auto":
+      return "write";
+  }
+};
 
 const failureMessage = <E>(cause: Cause.Cause<E>): string => {
   const failure = Cause.findErrorOption(cause);
@@ -202,7 +250,11 @@ const linearWorkerPromptWithTemplate = (
         );
 };
 
-export const resolveDeviationExtensionPath = (): string | null => {
+export const resolveDeviationExtensionPath = (
+  sandboxMode: WorkerSandboxMode = "native",
+): string | null => {
+  if (sandboxMode !== "native")
+    return "/app/dist/extensions/report-deviation.js";
   const candidates = [
     fileURLToPath(
       new URL("../extensions/report-deviation.ts", import.meta.url),
@@ -370,6 +422,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const runtime = yield* Effect.context<never>();
       const runPromise = Effect.runPromiseWith(runtime);
       const mcpProxies = new Map<SessionId, () => void>();
+      const sandboxHandles = new Map<SessionId, SessionSandboxHandle>();
+      const sandboxRelays = new Map<SessionId, SessionSandboxRelay[]>();
+      const gitBrokers = new Map<SessionId, { readonly stop: () => void }>();
       // One pool per gateway: launched T3 daemons never share a port.
       let t3PortPool: T3PortPool | undefined;
       const t3Ports = (launch: T3LaunchConfig): T3PortPool => {
@@ -380,8 +435,19 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         mcpProxies.get(sessionId)?.();
         mcpProxies.delete(sessionId);
       };
+      const stopSandboxRelays = (sessionId: SessionId) => {
+        for (const relay of sandboxRelays.get(sessionId) ?? []) relay.stop();
+        sandboxRelays.delete(sessionId);
+      };
+      const stopGitBroker = (sessionId: SessionId) => {
+        gitBrokers.get(sessionId)?.stop();
+        gitBrokers.delete(sessionId);
+      };
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
+          for (const sessionId of sandboxHandles.keys())
+            stopSandboxRelays(sessionId);
+          for (const sessionId of gitBrokers.keys()) stopGitBroker(sessionId);
           for (const stop of mcpProxies.values()) stop();
           mcpProxies.clear();
         }),
@@ -391,15 +457,178 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const promptTemplateRepo = yield* PromptTemplateRepo;
       const installationRepo = yield* InstallationRepo;
       const runEventRepo = yield* RunEventRepo;
+      const agentSettingsRepo = yield* AgentSettingsRepo;
       const workspaceRepo = yield* WorkspaceRepo;
       const projector = yield* ActivityProjector;
       const rpc = yield* RpcWorker;
       const workerIdentities = yield* WorkerIdentityRepo;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      const deviceBackup =
+        config.t3DeviceBackup === undefined
+          ? undefined
+          : makeT3DeviceBackup(config.t3DeviceBackup);
+      const sandboxMode = config.workerSandboxMode ?? "firecracker";
+      if (
+        sandboxMode !== "native" &&
+        config.sessionSandboxBrokerSocketPath === undefined
+      )
+        return yield* new RpcSpawnError({
+          message: `${sandboxMode} workers require SESSION_SANDBOX_BROKER_SOCKET; native execution is forbidden`,
+        });
+      type NativeBuildClient = Awaited<
+        ReturnType<
+          typeof import("./native-build-client.js").createNativeBuildClient
+        >
+      >;
+      type NativeBuilder = "primary" | "backup";
+      const nativeBuildClients = new Map<
+        NativeBuilder,
+        Promise<NativeBuildClient>
+      >();
+      const nativeBuildJobs = new Map<
+        SessionId,
+        Map<string, { builder: NativeBuilder; job: string }>
+      >();
+      const repositoryAgeIdentity = (run: AgentRun) =>
+        Option.isSome(run.repositoryId) &&
+        config.workerRepositoryAgeKeys !== undefined
+          ? Redacted.value(config.workerRepositoryAgeKeys)[
+              run.organizationId
+            ]?.[run.repositoryId.value]
+          : undefined;
+      const getNativeBuildClient = (builder: NativeBuilder) => {
+        const nativeBuild: NativeBuildConfig | undefined =
+          builder === "backup" ? config.nativeBuildBackup : config.nativeBuild;
+        if (nativeBuild === undefined)
+          return Promise.reject(new Error("Native builder is disabled"));
+        const existing = nativeBuildClients.get(builder);
+        if (existing) return existing;
+        const initialized = import("./native-build-client.js")
+          .then(({ createNativeBuildClient }) =>
+            createNativeBuildClient(nativeBuild),
+          )
+          .catch((error: unknown) => {
+            nativeBuildClients.delete(builder);
+            throw error;
+          });
+        nativeBuildClients.set(builder, initialized);
+        return initialized;
+      };
+      const sandboxRuntime =
+        sandboxMode !== "native" &&
+        config.sessionSandboxBrokerSocketPath !== undefined
+          ? makeSessionSandboxRuntime(
+              config.sessionSandboxBrokerSocketPath,
+              sandboxMode,
+            )
+          : undefined;
       const mcpOAuth = yield* McpOAuth;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
       const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
+
+      const rememberSandboxRelay = (
+        sessionId: SessionId,
+        relay: SessionSandboxRelay,
+      ) => {
+        const current = sandboxRelays.get(sessionId) ?? [];
+        current.push(relay);
+        sandboxRelays.set(sessionId, current);
+        return relay;
+      };
+      const openSandboxRelay = Effect.fn("SessionAuthority.openSandboxRelay")(
+        function* (
+          sessionId: SessionId,
+          target: "gateway" | "worker",
+          targetPort: number,
+        ) {
+          if (sandboxRuntime === undefined)
+            return yield* Effect.fail(
+              new RpcSpawnError({ message: "Sandbox relay is unavailable" }),
+            );
+          const relay = yield* sandboxRuntime
+            .openRelay(sessionId, target, targetPort)
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new RpcSpawnError({
+                    message: "Could not start the per-session sandbox relay",
+                  }),
+              ),
+            );
+          return rememberSandboxRelay(sessionId, relay);
+        },
+      );
+      const provisionSandbox = Effect.fn("SessionAuthority.provisionSandbox")(
+        function* (
+          sessionId: SessionId,
+          cwd: string,
+          workerUid: string | undefined,
+        ) {
+          if (sandboxRuntime === undefined) return undefined;
+          if (workerUid === undefined)
+            return yield* new RpcSpawnError({
+              message: "Sysbox mode requires a per-session worker uid range",
+            });
+          const recovered = yield* sandboxRuntime
+            .recover(sessionId, cwd, workerUid)
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new RpcSpawnError({
+                    message: "Could not recover the per-session sandbox",
+                  }),
+              ),
+            );
+          const handle =
+            recovered.handle ??
+            (yield* sandboxRuntime.provision(sessionId, cwd, workerUid).pipe(
+              Effect.mapError(
+                () =>
+                  new RpcSpawnError({
+                    message: "Could not provision the per-session sandbox",
+                  }),
+              ),
+            ));
+          sandboxHandles.set(sessionId, handle);
+          const proxy = yield* sandboxRuntime.openEgressProxy(sessionId).pipe(
+            Effect.mapError(
+              () =>
+                new RpcSpawnError({
+                  message: "Could not start the sandbox egress proxy",
+                }),
+            ),
+            Effect.tapError(() =>
+              sandboxRuntime
+                .destroy(sessionId)
+                .pipe(
+                  Effect.tap(
+                    Effect.sync(() => sandboxHandles.delete(sessionId)),
+                  ),
+                  Effect.ignore,
+                ),
+            ),
+          );
+          rememberSandboxRelay(sessionId, proxy);
+          return { handle, egressProxyUrl: proxy.baseUrl };
+        },
+      );
+      const destroySandbox = (sessionId: SessionId) =>
+        Effect.gen(function* () {
+          stopSandboxRelays(sessionId);
+          if (sandboxRuntime === undefined) return;
+          yield* sandboxRuntime.destroy(sessionId).pipe(
+            Effect.mapError(
+              () =>
+                new RpcSpawnError({
+                  message: "Could not destroy the per-session sandbox",
+                }),
+            ),
+            Effect.tap(() =>
+              Effect.sync(() => sandboxHandles.delete(sessionId)),
+            ),
+          );
+        });
 
       const stopShouldApply = Effect.fn("SessionAuthority.stopShouldApply")(
         function* (
@@ -466,6 +695,49 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           ),
           Effect.asVoid,
         );
+      const cancelSessionNativeBuilds = (sessionId: SessionId) =>
+        Effect.promise(async () => {
+          const jobs = nativeBuildJobs.get(sessionId);
+          if (jobs === undefined) return;
+          try {
+            for (const { builder, job } of jobs.values()) {
+              try {
+                const client = await getNativeBuildClient(builder);
+                const status = await client.status(sessionId, job);
+                if (status.state === "starting" || status.state === "running")
+                  await client.cancel(sessionId, job);
+              } catch {
+                // Session cleanup must continue if the build host is down.
+              }
+            }
+          } finally {
+            nativeBuildJobs.delete(sessionId);
+          }
+        });
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* Effect.forEach(
+            [...sandboxHandles.keys()],
+            (sessionId) =>
+              bestEffort(
+                `destroy sandbox for ${sessionId} during shutdown`,
+                destroySandbox(sessionId),
+              ),
+            { discard: true, concurrency: "unbounded" },
+          );
+          yield* Effect.promise(async () => {
+            await Promise.all(
+              [...nativeBuildClients.values()].map(async (client) => {
+                try {
+                  await (await client).close();
+                } catch {
+                  // Shutdown cleanup must not prevent other finalizers.
+                }
+              }),
+            );
+          });
+        }),
+      );
 
       const updateRun = (
         sessionId: SessionId,
@@ -547,7 +819,24 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           onSome: (path) =>
             Effect.andThen(
               workspace.clearGitHubExtraHeader(run.sessionId, path),
-              removeMcpAgentDb(path),
+              Effect.andThen(
+                removeMcpAgentDb(path),
+                Effect.tryPromise({
+                  try: () =>
+                    workspaceProcess(path, "age-identity", { identity: null }),
+                  catch: () =>
+                    new RpcSpawnError({
+                      message: "Could not remove scoped age identity",
+                    }),
+                }).pipe(
+                  Effect.asVoid,
+                  Effect.catch(() =>
+                    Effect.logWarning(
+                      "worker.age_identity_cleanup_failed",
+                    ).pipe(Effect.annotateLogs({ sessionId: run.sessionId })),
+                  ),
+                ),
+              ),
             ),
         });
       const ensureIssueLifecycle = (
@@ -922,11 +1211,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   ["succeeded", "failed", "canceled"].includes(
                     current.value.state,
                   )
-                )
+                ) {
+                  // The broker checks durable Docker labels even after a gateway
+                  // restart. A failed destroy must leave this identity reserved.
+                  yield* destroySandbox(sessionId);
                   yield* workerIdentities.release(
                     sessionId,
                     config.workspaceRoot,
                   );
+                }
               }),
             );
             yield* Ref.update(workerSlots, (slots) => {
@@ -1120,7 +1413,22 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
 
       const dropWorker = (sessionId: SessionId) =>
         Effect.gen(function* () {
+          if (deviceBackup !== undefined) {
+            yield* bestEffort(
+              "close T3 backup devices",
+              Effect.gen(function* () {
+                const run = yield* runRepo.get(sessionId);
+                if (Option.isSome(run))
+                  yield* deviceBackup.release(
+                    run.value.organizationId,
+                    sessionId,
+                  );
+              }),
+            );
+          }
           stopMcpProxy(sessionId);
+          stopGitBroker(sessionId);
+          yield* cancelSessionNativeBuilds(sessionId);
           const state = (yield* Ref.get(workersRef)).get(sessionId);
           if (state !== undefined) {
             yield* state.unsubscribe();
@@ -1132,6 +1440,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               return next;
             });
           }
+          yield* bestEffort(
+            `destroy sandbox for ${sessionId}`,
+            destroySandbox(sessionId),
+          );
         });
 
       const cancel = Effect.fn("SessionAuthority.cancel")(function* (
@@ -1576,23 +1888,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         yield* projector.projectRpcEvent(sessionId, sequence, event);
       });
 
-      const registerLinearHostTools = Effect.fn(
-        "SessionAuthority.registerLinearHostTools",
-      )(function* (
+      const linearHostToolsForRun = (
         run: AgentRun,
-        worker: RpcWorkerHandle,
-      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
-        if (
-          worker.driverSession?.capabilities.hostTools !== undefined &&
-          worker.driverSession.capabilities.hostTools !== "inline"
-        )
-          return;
-        if (
-          typeof worker.onHostToolCall !== "function" ||
-          typeof worker.setHostTools !== "function"
-        ) {
-          return;
-        }
+        workspacePath: string,
+        workerUid: string | undefined,
+      ) => {
         const textResult = (
           text: string,
           details?: unknown,
@@ -1602,7 +1902,8 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           ...(details === undefined ? {} : { details }),
           ...(isError ? { isError: true } : {}),
         });
-        const definitions: ReadonlyArray<RpcHostToolDefinition> = [
+        const linearDefinitions: ReadonlyArray<RpcHostToolDefinition> = [
+          ...LINEAR_WORKSPACE_TOOLS,
           {
             name: "linear_get_issue",
             label: "Linear: get issue",
@@ -1657,15 +1958,352 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             },
           },
         ];
+        const definitions: ReadonlyArray<RpcHostToolDefinition> = [
+          ...linearDefinitions,
+          githubCreatePullRequestToolDefinition,
+          ...(deviceBackup === undefined ||
+          config.t3DeviceBackup?.organizationHosts[run.organizationId] ===
+            undefined
+            ? []
+            : [t3DeviceBackupTool]),
+          ...(config.nativeBuild === undefined
+            ? []
+            : ([
+                {
+                  name: "native_build_start",
+                  label: "Native build: start",
+                  description:
+                    "Run the repository's .partitura/native-build.sh action in an isolated macOS VM for this commit and pull request. Select primary or the separately configured backup builder explicitly. No automatic failover. Use the same builder for later status, artifact and cancel calls.",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["commit", "pullRequest", "action"],
+                    properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
+                      commit: {
+                        type: "string",
+                        pattern: "^[a-f0-9]{40}$",
+                      },
+                      pullRequest: {
+                        type: "integer",
+                        minimum: 1,
+                        maximum: 99999999,
+                      },
+                      action: {
+                        type: "string",
+                        pattern: "^[a-z][a-z0-9-]{0,63}$",
+                      },
+                    },
+                  },
+                },
+                {
+                  name: "native_build_status",
+                  label: "Native build: status",
+                  description: "Read a native build job owned by this session.",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["job"],
+                    properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
+                      job: { type: "string", pattern: "^[a-f0-9]{32}$" },
+                    },
+                  },
+                },
+                {
+                  name: "native_build_artifact",
+                  label: "Native build: deliver artifact",
+                  description:
+                    "Copy a verified native build archive into this session workspace. After a workflow-failed job, the archive holds the repository build log (build.log, last 1 MiB) and guest runner stderr (runner.log).",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["job"],
+                    properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
+                      job: { type: "string", pattern: "^[a-f0-9]{32}$" },
+                    },
+                  },
+                },
+                {
+                  name: "native_build_cancel",
+                  label: "Native build: cancel",
+                  description:
+                    "Cancel a native build job owned by this session.",
+                  parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["job"],
+                    properties: {
+                      builder: { type: "string", enum: ["primary", "backup"] },
+                      job: { type: "string", pattern: "^[a-f0-9]{32}$" },
+                    },
+                  },
+                },
+              ] satisfies ReadonlyArray<RpcHostToolDefinition>)),
+        ];
 
-        yield* worker.onHostToolCall((request: RpcHostToolCall) =>
+        const handler = (request: RpcHostToolCall) =>
           Effect.gen(function* () {
             const fail = (message: string) =>
               textResult(message, undefined, true);
-            if (Option.isNone(linearOption)) {
-              return fail("Linear gateway is unavailable");
-            }
             const raw = request.arguments;
+            if (request.toolName === "t3_device_backup") {
+              if (deviceBackup === undefined)
+                return fail("T3 device backup is disabled");
+              return yield* withSessionMutationGate(
+                run.sessionId,
+                Effect.gen(function* () {
+                  const current = yield* runRepo.get(run.sessionId);
+                  if (
+                    Option.isNone(current) ||
+                    current.value.desiredState === "canceled" ||
+                    ["succeeded", "failed", "canceled"].includes(
+                      current.value.state,
+                    )
+                  )
+                    return fail(
+                      "Run is finished; device operations are refused",
+                    );
+                  const result = yield* deviceBackup.call(
+                    run.organizationId,
+                    run.sessionId,
+                    raw,
+                  );
+                  return t3DeviceBackupResult(result);
+                }).pipe(
+                  Effect.catch(() =>
+                    Effect.succeed(
+                      fail(
+                        "T3 device backup failed. Check its configured host, device ownership, and server access. Inspect the device before retrying input because dispatch may have occurred.",
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
+            if (request.toolName === "github_create_pull_request") {
+              return yield* withSessionMutationGate(
+                run.sessionId,
+                Effect.gen(function* () {
+                  const current = yield* runRepo.get(run.sessionId);
+                  if (Option.isNone(current))
+                    return fail("Run no longer exists");
+                  const latest = current.value;
+                  if (
+                    latest.desiredState === "canceled" ||
+                    ["succeeded", "failed", "canceled"].includes(latest.state)
+                  )
+                    return fail(
+                      "Run is finished; pull request creation is refused",
+                    );
+                  if (Option.isNone(latest.repositoryId))
+                    return fail("Run has no configured repository");
+                  const repository = yield* workspaceRepo.getRepository(
+                    latest.organizationId,
+                    latest.repositoryId.value,
+                  );
+                  if (
+                    Option.isNone(repository) ||
+                    Option.isNone(githubAppOption)
+                  )
+                    return fail(
+                      "GitHub repository credentials are unavailable",
+                    );
+                  const github = githubAppOption.value;
+                  const result = yield* Effect.tryPromise({
+                    try: (signal) =>
+                      createGitHubPullRequest(
+                        {
+                          repository: repository.value,
+                          getToken: (boundRepository) => {
+                            const candidate =
+                              parseRepositorySuggestionCandidate(
+                                boundRepository.url,
+                              );
+                            const [owner, name] =
+                              candidate?.repositoryFullName.split("/") ?? [];
+                            if (owner === undefined || name === undefined)
+                              return Promise.reject(
+                                new RpcProtocolError({
+                                  method: "github_create_pull_request",
+                                  message: "Invalid repository",
+                                }),
+                              );
+                            return runPromise(
+                              github.getInstallationToken(
+                                owner,
+                                name,
+                                latest.organizationId,
+                              ),
+                              { signal },
+                            );
+                          },
+                          signal,
+                        },
+                        raw,
+                      ),
+                    catch: () =>
+                      new RpcProtocolError({
+                        method: "github_create_pull_request",
+                        message: "Unable to create GitHub pull request",
+                      }),
+                  });
+                  return textResult(JSON.stringify(result), result);
+                }).pipe(
+                  Effect.catch(() =>
+                    Effect.succeed(
+                      fail("Unable to create GitHub pull request"),
+                    ),
+                  ),
+                ),
+              );
+            }
+            if (request.toolName.startsWith("native_build_")) {
+              if (config.nativeBuild === undefined)
+                return fail("Native build tools are disabled");
+              if (
+                raw.builder !== undefined &&
+                raw.builder !== "primary" &&
+                raw.builder !== "backup"
+              )
+                return fail("Invalid native builder");
+              const builder = raw.builder === "backup" ? "backup" : "primary";
+              if (
+                builder === "backup" &&
+                config.nativeBuildBackup === undefined
+              )
+                return fail("The backup native builder is disabled");
+              const job = raw.job;
+              const nativeOperation = Effect.promise(async () => {
+                try {
+                  if (workspacePath === undefined)
+                    return fail("Native build workspace is unavailable");
+                  const client = await getNativeBuildClient(builder);
+                  switch (request.toolName) {
+                    case "native_build_start": {
+                      if (
+                        typeof raw.commit !== "string" ||
+                        typeof raw.pullRequest !== "number" ||
+                        typeof raw.action !== "string" ||
+                        !/^[a-z][a-z0-9-]{0,63}$/u.test(raw.action)
+                      )
+                        return fail("Invalid native build request");
+                      const identity = repositoryAgeIdentity(run);
+                      const started = await client.start({
+                        sessionId: run.sessionId,
+                        workspacePath,
+                        ...(workerUid === undefined ? {} : { workerUid }),
+                        ...(identity === undefined
+                          ? {}
+                          : {
+                              secretFiles: {
+                                "repository-age-identity": identity,
+                              },
+                            }),
+                        commit: raw.commit,
+                        pullRequest: raw.pullRequest,
+                        action: raw.action,
+                      });
+                      const jobs =
+                        nativeBuildJobs.get(run.sessionId) ??
+                        new Map<
+                          string,
+                          { builder: NativeBuilder; job: string }
+                        >();
+                      jobs.set(`${builder}:${started.job}`, {
+                        builder,
+                        job: started.job,
+                      });
+                      nativeBuildJobs.set(run.sessionId, jobs);
+                      const result = { ...started, builder };
+                      return textResult(JSON.stringify(result), result);
+                    }
+                    case "native_build_status": {
+                      if (typeof job !== "string")
+                        return fail("job is required");
+                      const status = await client.status(run.sessionId, job);
+                      const result = { ...status, builder };
+                      return textResult(JSON.stringify(result), result);
+                    }
+                    case "native_build_artifact": {
+                      if (typeof job !== "string")
+                        return fail("job is required");
+                      const artifact = await deliverNativeArtifact(client, {
+                        sessionId: run.sessionId,
+                        job,
+                        workspacePath,
+                        ...(workerUid === undefined ? {} : { workerUid }),
+                      });
+                      nativeBuildJobs
+                        .get(run.sessionId)
+                        ?.delete(`${builder}:${job}`);
+                      const workerArtifact = {
+                        builder,
+                        path: sandboxHandles.has(run.sessionId)
+                          ? `/workspace/.omp-home/native-build/${job}.tar`
+                          : artifact.path,
+                        sha256: artifact.sha256,
+                        bytes: artifact.bytes,
+                      };
+                      return textResult(
+                        JSON.stringify(workerArtifact),
+                        workerArtifact,
+                      );
+                    }
+                    case "native_build_cancel": {
+                      if (typeof job !== "string")
+                        return fail("job is required");
+                      await client.cancel(run.sessionId, job);
+                      nativeBuildJobs
+                        .get(run.sessionId)
+                        ?.delete(`${builder}:${job}`);
+                      return textResult("Native build canceled");
+                    }
+                    default:
+                      return fail(
+                        `Unknown native build tool: ${request.toolName}`,
+                      );
+                  }
+                } catch {
+                  return fail("Native build operation failed");
+                }
+              });
+              if (
+                request.toolName === "native_build_start" ||
+                request.toolName === "native_build_artifact" ||
+                request.toolName === "native_build_cancel"
+              )
+                return yield* withSessionMutationGate(
+                  run.sessionId,
+                  Effect.gen(function* () {
+                    const latest = yield* runRepo.get(run.sessionId).pipe(
+                      Effect.map((value) => ({ ok: true as const, value })),
+                      Effect.catch(() =>
+                        Effect.succeed({
+                          ok: false as const,
+                          result: fail("Unable to read run state"),
+                        }),
+                      ),
+                    );
+                    if (!latest.ok) return latest.result;
+                    if (Option.isNone(latest.value))
+                      return fail("Run no longer exists");
+                    const current = latest.value.value;
+                    if (
+                      current.desiredState === "canceled" ||
+                      ["canceled", "failed", "succeeded"].includes(
+                        current.state,
+                      )
+                    )
+                      return fail("Run has stopped");
+                    return yield* nativeOperation;
+                  }),
+                );
+              return yield* nativeOperation;
+            }
+            if (Option.isNone(linearOption))
+              return fail("Linear gateway is unavailable");
             // Host-tool callbacks intentionally turn infrastructure failures
             // into an isError result for the model; they must not masquerade
             // as an absent run.
@@ -1688,11 +2326,64 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             const mutating =
               request.toolName === "linear_create_comment" ||
               request.toolName === "linear_update_issue" ||
-              request.toolName === "linear_add_external_url";
+              request.toolName === "linear_add_external_url" ||
+              request.toolName === "linear_workspace_write";
             const linear = linearOption.value;
             const dispatch: Effect.Effect<RpcHostToolResult, never, never> =
               Effect.gen(function* () {
                 switch (request.toolName) {
+                  case "linear_workspace_read": {
+                    const operation = raw.operation;
+                    if (typeof operation !== "string")
+                      return fail("operation must be a string");
+                    if (!record(raw.input))
+                      return fail("input must be an object");
+                    return yield* linear
+                      .workspaceRead({
+                        sessionId: run.sessionId,
+                        operation,
+                        input: raw.input,
+                      })
+                      .pipe(
+                        Effect.map((data) =>
+                          textResult(JSON.stringify(data), data),
+                        ),
+                        Effect.catch(() =>
+                          Effect.succeed(
+                            fail("Unable to read Linear workspace"),
+                          ),
+                        ),
+                      );
+                  }
+                  case "linear_workspace_write": {
+                    const operation = raw.operation;
+                    if (
+                      typeof operation !== "string" ||
+                      !Object.hasOwn(LINEAR_WORKSPACE_MUTATIONS, operation)
+                    )
+                      return fail(
+                        "operation is not an allowed Linear workspace write",
+                      );
+                    if (!record(raw.input))
+                      return fail("input must be an object");
+                    return yield* linear
+                      .workspaceWrite({
+                        sessionId: run.sessionId,
+                        operation: operation as LinearWorkspaceMutation,
+                        ...(raw.id === undefined ? {} : { id: raw.id }),
+                        input: raw.input,
+                      })
+                      .pipe(
+                        Effect.map((data) =>
+                          textResult(JSON.stringify(data), data),
+                        ),
+                        Effect.catch(() =>
+                          Effect.succeed(
+                            fail("Unable to write Linear workspace"),
+                          ),
+                        ),
+                      );
+                  }
                   case "linear_get_issue": {
                     const requested = raw.issueId;
                     if (
@@ -1872,15 +2563,47 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 isError: true,
               }),
             ),
-          ),
+          );
+        return { definitions, handler };
+      };
+
+      const registerLinearHostTools = Effect.fn(
+        "SessionAuthority.registerLinearHostTools",
+      )(function* (
+        run: AgentRun,
+        worker: RpcWorkerHandle,
+        workspacePath: string,
+        workerUid: string | undefined,
+      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
+        if (
+          worker.driverSession?.capabilities.hostTools !== undefined &&
+          worker.driverSession.capabilities.hostTools !== "inline"
+        )
+          return;
+        if (
+          typeof worker.onHostToolCall !== "function" ||
+          typeof worker.setHostTools !== "function"
+        ) {
+          return;
+        }
+        const { definitions, handler } = linearHostToolsForRun(
+          run,
+          workspacePath,
+          workerUid,
         );
+        yield* worker.onHostToolCall(handler);
         // Host-tool registration is part of the worker contract. A failure
         // must fail startup rather than silently running without Linear tools.
         yield* worker.setHostTools(definitions);
       });
 
       const attachWorker = Effect.fn("SessionAuthority.attachWorker")(
-        function* (run: AgentRun, worker: RpcWorkerHandle) {
+        function* (
+          run: AgentRun,
+          worker: RpcWorkerHandle,
+          workspacePath: string,
+          workerUid: string | undefined,
+        ) {
           const queue = yield* Queue.unbounded<RpcEvent>();
 
           const unsubscribe = yield* worker.onEvent((event) => {
@@ -1923,7 +2646,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           });
 
           yield* worker.start();
-          yield* registerLinearHostTools(run, worker).pipe(
+          yield* registerLinearHostTools(
+            run,
+            worker,
+            workspacePath,
+            workerUid,
+          ).pipe(
             Effect.catch((error) =>
               Effect.gen(function* () {
                 // Registration happens after the worker is started and indexed;
@@ -1959,6 +2687,31 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         },
       );
 
+      const applyRepositoryAgeIdentity = Effect.fn(
+        "SessionAuthority.applyRepositoryAgeIdentity",
+      )(function* (
+        run: AgentRun,
+        cwd: string,
+        environment: Record<string, string>,
+      ) {
+        delete environment.FNOX_AGE_KEY_FILE;
+        const identity = repositoryAgeIdentity(run);
+        const path = yield* Effect.tryPromise({
+          try: () =>
+            workspaceProcess(cwd, "age-identity", {
+              identity: identity ?? null,
+            }),
+          catch: () =>
+            new RpcSpawnError({
+              message: "Could not prepare scoped repository age identity",
+            }),
+        });
+        if (identity !== undefined) {
+          environment.FNOX_AGE_KEY_FILE = path;
+          environment.HOME = join(cwd, ".omp-home");
+        }
+      });
+
       /** Repository Nix PATH and, on resume, a fresh repo-scoped Git credential. */
       const applyRepositoryEnvironment = Effect.fn(
         "SessionAuthority.applyRepositoryEnvironment",
@@ -1967,9 +2720,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         cwd: string,
         environment: Record<string, string>,
         refreshWorkspaceCredentials: boolean,
+        sandbox: { readonly handle: SessionSandboxHandle } | undefined,
       ): Effect.fn.Return<
         void,
-        DatabaseError | RowDecodeError | NixEnvironmentError | WorkspaceError
+        | DatabaseError
+        | RowDecodeError
+        | NixEnvironmentError
+        | RpcSpawnError
+        | WorkspaceError
       > {
         if (Option.isSome(run.repositoryId)) {
           const repository = yield* workspaceRepo.getRepository(
@@ -2019,7 +2777,38 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 cwd,
               );
             }
+            stopGitBroker(run.sessionId);
+            const broker = yield* workspace.openGitBroker(
+              run.sessionId,
+              repository.value,
+              sandbox?.handle.gatewayAddress,
+            );
+            if (broker === undefined) {
+              yield* workspace.clearGitBrokerConfig(run.sessionId, cwd);
+            } else {
+              gitBrokers.set(run.sessionId, broker);
+              const relay =
+                sandbox === undefined
+                  ? undefined
+                  : yield* openSandboxRelay(
+                      run.sessionId,
+                      "gateway",
+                      broker.port,
+                    );
+              yield* workspace.configureGitBroker(
+                run.sessionId,
+                cwd,
+                broker,
+                relay?.baseUrl,
+              );
+            }
+          } else {
+            stopGitBroker(run.sessionId);
+            yield* workspace.clearGitBrokerConfig(run.sessionId, cwd);
           }
+        } else {
+          stopGitBroker(run.sessionId);
+          yield* workspace.clearGitBrokerConfig(run.sessionId, cwd);
         }
       });
 
@@ -2047,14 +2836,22 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           return yield* Effect.fail(error);
         }
         const saved = yield* workspaceRepo.getDriverSession(run.sessionId);
+        let snapshot = yield* agentSettingsRepo.getSnapshot(
+          run.sessionId,
+          run.organizationId,
+        );
         const latestInput = yield* runInputRepo.latestActionableInput(
           run.sessionId,
         );
         let labels = Option.isSome(latestInput)
           ? inputContext(latestInput.value.payload).issueLabels
           : [];
+        let projectLabels = Option.isSome(latestInput)
+          ? inputContext(latestInput.value.payload).projectLabels
+          : [];
         if (issueSnapshot !== undefined && Option.isSome(issueSnapshot)) {
           labels = issueSnapshot.value.labels;
+          projectLabels = issueSnapshot.value.projectLabels;
         }
         if (
           issueSnapshot === undefined &&
@@ -2062,12 +2859,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           Option.isSome(run.issueId) &&
           Option.isSome(linearOption)
         ) {
-          labels = yield* linearOption.value
+          const currentIssue = yield* linearOption.value
             .getIssue({ sessionId: run.sessionId, issueId: run.issueId.value })
-            .pipe(
-              Effect.map((issue) => issue.labels),
-              Effect.catch(() => Effect.succeed(labels)),
-            );
+            .pipe(Effect.option);
+          if (Option.isSome(currentIssue)) {
+            labels = currentIssue.value.labels;
+            projectLabels = currentIssue.value.projectLabels;
+          }
         }
         const repository = Option.isSome(run.repositoryId)
           ? yield* workspaceRepo.getRepository(
@@ -2075,18 +2873,107 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               run.repositoryId.value,
             )
           : Option.none();
-        const kind = Option.isSome(saved)
-          ? saved.value.driver
-          : yield* selectDriver(
-              Option.isSome(repository)
-                ? (repository.value.defaultDriver ?? "omp")
-                : "omp",
-              labels,
-            ).pipe(
-              Effect.mapError(
-                (error) => new RpcSpawnError({ message: error.message }),
-              ),
-            );
+        if (Option.isNone(snapshot)) {
+          const organizationSettings = yield* agentSettingsRepo.get(
+            run.organizationId,
+          );
+          const t3Config = config.t3Driver;
+          const legacySessionLabels = Option.isSome(saved);
+          const effectiveSettings = legacySessionLabels
+            ? {
+                ...organizationSettings,
+                defaults: {
+                  ...organizationSettings.defaults,
+                  driver: saved.value.driver,
+                },
+              }
+            : organizationSettings;
+          const settingsIssueLabels = legacySessionLabels
+            ? labels.filter(
+                (label) =>
+                  !label
+                    .trim()
+                    .toLowerCase()
+                    .startsWith(organizationSettings.labelPrefixes.driver),
+              )
+            : labels;
+          const settingsProjectLabels = legacySessionLabels
+            ? projectLabels.filter(
+                (label) =>
+                  !label
+                    .trim()
+                    .toLowerCase()
+                    .startsWith(organizationSettings.labelPrefixes.driver),
+              )
+            : projectLabels;
+          const resolved = resolveRunSettings({
+            settings: effectiveSettings,
+            issueLabels: settingsIssueLabels,
+            projectLabels: settingsProjectLabels,
+            environment: {
+              driver: Option.isSome(saved)
+                ? saved.value.driver
+                : Option.isSome(repository)
+                  ? (repository.value.defaultDriver ?? "omp")
+                  : "omp",
+              ompModel: config.workerDefaultModel ?? null,
+              t3Model:
+                t3Config === undefined
+                  ? null
+                  : {
+                      instanceId: t3Config.providerInstanceId,
+                      model: t3Config.model,
+                      ...(t3Config.modelOptions.length === 0
+                        ? {}
+                        : { options: t3Config.modelOptions }),
+                    },
+              effort: null,
+              mode: t3Config?.runtimeMode ?? "auto",
+            },
+          });
+          const frozen = legacySessionLabels
+            ? {
+                ...resolved,
+                driver: saved.value.driver,
+                sources: {
+                  ...resolved.sources,
+                  driver: "environment" as const,
+                },
+              }
+            : resolved;
+          snapshot = Option.some(
+            yield* agentSettingsRepo.saveSnapshot(
+              run.sessionId,
+              run.organizationId,
+              frozen,
+            ),
+          );
+          if (
+            resolved.warnings.length > 0 &&
+            Option.isSome(run.issueId) &&
+            Option.isSome(linearOption)
+          ) {
+            const body = `Partitura ignored run setting label(s): ${resolved.warnings.join(" ")} The run will use the next valid settings tier.`;
+            yield* linearOption.value
+              .createIssueComment({ sessionId: run.sessionId, body })
+              .pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning(
+                    "run_settings.label_warning_comment_failed",
+                  ).pipe(
+                    Effect.annotateLogs({
+                      sessionId: run.sessionId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
+          }
+        }
+        const effective = Option.getOrThrow(snapshot).settings;
+        const kind = effective.driver;
         if (kind === "t3") {
           const t3Config = config.t3Driver;
           if (t3Config === undefined)
@@ -2097,12 +2984,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           const uid = yield* workerIdentities.acquire(
             run.sessionId,
             config.workspaceRoot,
+            { retireTerminal: sandboxMode === "native" },
           );
           let driver: AgentDriver;
           if (t3Config.connection._tag === "Remote") {
             // One shared daemon can't reach mode-0700 per-uid workspaces
             // without collapsing session isolation.
-            if (uid !== undefined)
+            if (uid !== undefined || sandboxMode !== "native")
               return yield* new RpcSpawnError({
                 message:
                   "A shared T3 daemon cannot serve isolated worker workspaces; set T3_MODE=launch",
@@ -2127,12 +3015,28 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               config.gitTimeoutMs ?? 120_000,
             );
             // A shared daemon gets no GitHub, Linear or upstream MCP tokens.
-            driver = makeT3Driver(
-              t3DriverOptionsFromConfig(
+            driver = makeT3Driver({
+              ...t3DriverOptionsFromConfig(
                 t3Config,
                 remoteT3Endpoint(t3Config.connection),
               ),
-            );
+              modelSelection: applyEffortToT3Selection(
+                effective.t3Model === null
+                  ? t3DriverOptionsFromConfig(
+                      t3Config,
+                      remoteT3Endpoint(t3Config.connection),
+                    ).modelSelection
+                  : {
+                      instanceId: effective.t3Model.instanceId,
+                      model: effective.t3Model.model,
+                      ...(effective.t3Model.options === undefined
+                        ? {}
+                        : { options: effective.t3Model.options }),
+                    },
+                effective.effort,
+              ),
+              runtimeMode: effective.runtimeMode,
+            });
           } else {
             const launch = t3Config.connection;
             if (config.cliproxyApiBaseUrl === undefined)
@@ -2148,12 +3052,28 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             });
             // Always a private HOME: the daemon's state must never be shared.
             const environment = sessionWorkerEnvironment(cwd, process.env);
+            yield* applyRepositoryAgeIdentity(run, cwd, environment);
+            const sandbox = yield* provisionSandbox(run.sessionId, cwd, uid);
+            if (sandbox !== undefined) {
+              environment.HTTP_PROXY = sandbox.egressProxyUrl;
+              environment.HTTPS_PROXY = sandbox.egressProxyUrl;
+              environment.NODE_USE_ENV_PROXY = "1";
+              environment.NO_PROXY = [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                sandbox.handle.workerAddress,
+                sandbox.handle.gatewayAddress,
+                sandbox.handle.relayAddress,
+              ].join(",");
+            }
             // Same repo-scoped, short-lived Git credential path as OMP workers.
             yield* applyRepositoryEnvironment(
               run,
               cwd,
               environment,
               refreshWorkspaceCredentials,
+              sandbox,
             );
             yield* Effect.tryPromise({
               try: () => workspaceProcess(cwd, "tool-directories", null),
@@ -2171,9 +3091,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     "T3 refused non-gateway workspace Git credentials or config includes",
                 }),
             });
-            // A daemon or provider left by an earlier attempt would own the
-            // T3 state directory; this uid belongs to this session only.
-            if (uid !== undefined)
+            // The broker retires isolated workers on recovery. A host UID sweep
+            // here could kill the VMM and SFTP helper it has just provisioned.
+            // Only native daemons need the gateway's process sweep.
+            if (uid !== undefined && sandbox === undefined)
               yield* Effect.try({
                 try: () => stopWorkerUidProcessesSync(Number(uid)),
                 catch: () =>
@@ -2181,10 +3102,24 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     message: "Stale T3 processes for this session did not exit",
                   }),
               });
-            const modelSelection = {
-              instanceId: t3Config.providerInstanceId,
-              model: t3Config.model,
-            };
+            const modelSelection = applyEffortToT3Selection(
+              effective.t3Model === null
+                ? {
+                    instanceId: t3Config.providerInstanceId,
+                    model: t3Config.model,
+                    ...(t3Config.modelOptions.length === 0
+                      ? {}
+                      : { options: t3Config.modelOptions }),
+                  }
+                : {
+                    instanceId: effective.t3Model.instanceId,
+                    model: effective.t3Model.model,
+                    ...(effective.t3Model.options === undefined
+                      ? {}
+                      : { options: effective.t3Model.options }),
+                  },
+              effective.effort,
+            );
             const modelEnvironment = workerModelEnvironment({
               cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
               cliproxyApiKey:
@@ -2194,6 +3129,38 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               claudeExecutable: launch.claudeExecutable,
             });
             const cliproxyApiBaseUrl = config.cliproxyApiBaseUrl;
+            const linearTools = linearHostToolsForRun(run, cwd, uid);
+            const linearMcp = startLinearMcpServer({
+              tools: linearTools.definitions,
+              ...(sandbox === undefined
+                ? {}
+                : { hostname: sandbox.handle.gatewayAddress }),
+              call: ({ toolName, arguments: toolArguments }) => {
+                const toolCallId = randomUUID();
+                return runPromise(
+                  linearTools.handler({
+                    id: toolCallId,
+                    toolCallId,
+                    toolName,
+                    arguments: toolArguments,
+                  }),
+                );
+              },
+            });
+            mcpProxies.set(run.sessionId, linearMcp.stop);
+            let linearMcpSettings = linearMcp;
+            if (sandbox !== undefined) {
+              const endpoint = new URL(linearMcp.url);
+              const relay = yield* openSandboxRelay(
+                run.sessionId,
+                "gateway",
+                Number(endpoint.port),
+              );
+              linearMcpSettings = {
+                ...linearMcp,
+                url: new URL(endpoint.pathname, relay.baseUrl).toString(),
+              };
+            }
             // Preparation may outlive a lease. Fence again before creating a process.
             yield* updateRun(run.sessionId, {});
             driver = launchedT3Driver(
@@ -2210,24 +3177,56 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   ),
                 ),
                 settings: renderT3LaunchSettings({
-                  cwd,
+                  cwd: sandbox?.handle.workspace ?? cwd,
                   cliproxyApiBaseUrl,
                   launch,
-                  runtimeMode: t3Config.runtimeMode,
+                  runtimeMode: effective.runtimeMode,
                   defaultModel: modelSelection,
+                  linearMcp: linearMcpSettings,
                 }),
                 writeSettings: (settings) =>
                   workspaceProcess(cwd, "t3-config", settings).then(
                     () => undefined,
                   ),
+                ...(sandbox === undefined ||
+                config.sessionSandboxBrokerSocketPath === undefined
+                  ? {}
+                  : {
+                      sandbox: {
+                        brokerSocketPath: config.sessionSandboxBrokerSocketPath,
+                        workerAddress: sandbox.handle.workerAddress,
+                        createRelay: (port: number) =>
+                          openSandboxRelay(run.sessionId, "worker", port),
+                      },
+                    }),
               }),
-              (endpoint) => t3DriverOptionsFromConfig(t3Config, endpoint),
+              (endpoint) => ({
+                ...t3DriverOptionsFromConfig(t3Config, endpoint),
+                modelSelection: applyEffortToT3Selection(
+                  effective.t3Model === null
+                    ? t3DriverOptionsFromConfig(t3Config, endpoint)
+                        .modelSelection
+                    : {
+                        instanceId: effective.t3Model.instanceId,
+                        model: effective.t3Model.model,
+                        ...(effective.t3Model.options === undefined
+                          ? {}
+                          : { options: effective.t3Model.options }),
+                      },
+                  effective.effort,
+                ),
+                runtimeMode: effective.runtimeMode,
+              }),
             );
           }
           const worker = yield* openDriverWorker(driver, {
             sessionKey: run.sessionId,
             title: `Linear ${Option.getOrElse(run.issueId, () => run.sessionId)}`,
-            workspace: { _tag: "Directory", path: cwd },
+            workspace: {
+              _tag: "Directory",
+              path: sandboxHandles.get(run.sessionId)?.workspace ?? cwd,
+            },
+            runtimeMode: effective.runtimeMode,
             ...(Option.isSome(saved) ? { resume: { ref: saved.value } } : {}),
           }).pipe(Effect.provideService(Scope.Scope, scope));
           yield* Effect.gen(function* () {
@@ -2237,7 +3236,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             );
             // A gateway restart must not leave two turns operating in a workspace.
             if (Option.isSome(saved)) yield* worker.abort();
-            yield* attachWorker(run, worker);
+            yield* attachWorker(run, worker, cwd, uid);
           }).pipe(Effect.onError(() => worker.stop()));
           return worker;
         }
@@ -2246,7 +3245,8 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           command.push("--session", run.ompSessionFile.value);
         }
 
-        const deviationExtensionPath = resolveDeviationExtensionPath();
+        const deviationExtensionPath =
+          resolveDeviationExtensionPath(sandboxMode);
         if (deviationExtensionPath === null) {
           return yield* Effect.fail(
             new RpcSpawnError({
@@ -2266,14 +3266,18 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         }
         command.push(
           ...workerModelArguments(
-            config.workerDefaultModel,
+            effective.ompModel ?? undefined,
             Option.isSome(run.ompSessionFile),
           ),
         );
+        if (effective.effort !== null)
+          command.push("--thinking", effective.effort);
+        command.push("--approval-mode", ompApprovalMode(effective.runtimeMode));
 
         const workerUid = yield* workerIdentities.acquire(
           run.sessionId,
           config.workspaceRoot,
+          { retireTerminal: sandboxMode === "native" },
         );
         yield* Effect.tryPromise({
           try: () => prepareWorkerWorkspace(cwd, workerUid),
@@ -2286,11 +3290,27 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           workerUid === undefined
             ? workerEnvironment(process.env)
             : sessionWorkerEnvironment(cwd, process.env);
+        yield* applyRepositoryAgeIdentity(run, cwd, environment);
+        const sandbox = yield* provisionSandbox(run.sessionId, cwd, workerUid);
+        if (sandbox !== undefined) {
+          environment.HTTP_PROXY = sandbox.egressProxyUrl;
+          environment.HTTPS_PROXY = sandbox.egressProxyUrl;
+          environment.NODE_USE_ENV_PROXY = "1";
+          environment.NO_PROXY = [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            sandbox.handle.workerAddress,
+            sandbox.handle.gatewayAddress,
+            sandbox.handle.relayAddress,
+          ].join(",");
+        }
         yield* applyRepositoryEnvironment(
           run,
           cwd,
           environment,
           refreshWorkspaceCredentials,
+          sandbox,
         );
         const listMcp: Effect.Effect<
           ReadonlyArray<McpServerRecord>,
@@ -2329,6 +3349,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             try: () =>
               startWorkerMcpProxy({
                 servers: oauthServers,
+                ...(sandbox === undefined
+                  ? {}
+                  : { bindHost: sandbox.handle.gatewayAddress }),
                 allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp ?? false,
                 accessToken: (server, rejectedAccessToken) =>
                   runPromise(
@@ -2376,8 +3399,23 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               }),
           });
           mcpProxies.set(run.sessionId, proxy.stop);
+          const relay =
+            sandbox === undefined
+              ? undefined
+              : yield* openSandboxRelay(run.sessionId, "gateway", proxy.port);
           const byId = new Map(
-            proxy.servers.map((server) => [server.id, server]),
+            proxy.servers.map((server) => {
+              if (relay === undefined || Option.isNone(server.url))
+                return [server.id, server] as const;
+              const endpoint = new URL(server.url.value);
+              const base = new URL(relay.baseUrl);
+              endpoint.hostname = base.hostname;
+              endpoint.port = base.port;
+              return [
+                server.id,
+                { ...server, url: Option.some(endpoint.toString()) },
+              ] as const;
+            }),
           );
           configServers = effectiveMcpServers.map(
             (server) => byId.get(server.id) ?? server,
@@ -2472,17 +3510,40 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         const worker = yield* rpc.spawn({
           command,
           ...(workerUid === undefined ? {} : { workerUid }),
+          ...(sandbox === undefined ||
+          config.sessionSandboxBrokerSocketPath === undefined ||
+          workerUid === undefined
+            ? {}
+            : {
+                sandbox: {
+                  brokerSocketPath: config.sessionSandboxBrokerSocketPath,
+                  sessionId: run.sessionId,
+                  workerUid,
+                },
+              }),
           cwd,
           env: { ...environment, PI_CODING_AGENT_DIR: agentDir },
-          injectedEnv: workerModelEnvironment({
-            cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
-            cliproxyApiKey:
-              config.cliproxyApiKey === undefined
-                ? undefined
-                : Redacted.value(config.cliproxyApiKey),
-            claudeExecutable:
-              config.workerClaudeExecutable ?? "claude-cliproxy",
-          }),
+          injectedEnv: {
+            // These proxy values were created by this run's sandbox broker.
+            // Inherited gateway proxy settings stay outside workerEnvironment.
+            ...(sandbox === undefined
+              ? {}
+              : {
+                  HTTP_PROXY: sandbox.egressProxyUrl,
+                  HTTPS_PROXY: sandbox.egressProxyUrl,
+                  NODE_USE_ENV_PROXY: "1",
+                  NO_PROXY: environment.NO_PROXY ?? "",
+                }),
+            ...workerModelEnvironment({
+              cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
+              cliproxyApiKey:
+                config.cliproxyApiKey === undefined
+                  ? undefined
+                  : Redacted.value(config.cliproxyApiKey),
+              claudeExecutable:
+                config.workerClaudeExecutable ?? "claude-cliproxy",
+            }),
+          },
           sessionId: run.sessionId,
           requestTimeoutMs: config.rpcRequestTimeoutMs ?? 30_000,
         });
@@ -2492,6 +3553,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             sessionKey: run.sessionId,
             title: `Linear ${run.sessionId}`,
             workspace: { _tag: "Directory", path: cwd },
+            runtimeMode: effective.runtimeMode,
           },
           worker,
         ).pipe(
@@ -2503,7 +3565,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             run.sessionId,
             adapted.driverSession.ref,
           );
-          yield* attachWorker(run, adapted);
+          yield* attachWorker(run, adapted, cwd, workerUid);
         }).pipe(Effect.onError(() => adapted.stop()));
         return adapted;
       });
@@ -2511,7 +3573,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const startWorker = (...args: Parameters<typeof openWorker>) =>
         openWorker(...args).pipe(
           Effect.onError(() =>
-            Effect.sync(() => stopMcpProxy(args[0].sessionId)),
+            Effect.gen(function* () {
+              stopMcpProxy(args[0].sessionId);
+              stopGitBroker(args[0].sessionId);
+              stopSandboxRelays(args[0].sessionId);
+              yield* bestEffort(
+                `destroy failed sandbox for ${args[0].sessionId}`,
+                destroySandbox(args[0].sessionId),
+              );
+            }),
           ),
         );
 
@@ -2545,10 +3615,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 hasActionableInput && (yield* runRepo.reopen(sessionId));
               if (!resumed) {
                 yield* cancel(initial.value);
-                // The cancellation honors any pending stop inputs; mark them
-                // so a later prompt isn't preceded by a stale stop re-cancel.
+                // The cancellation honors pending stops and supersedes older
+                // prompts, while later prompts remain eligible to resume.
                 yield* Effect.forEach(
-                  inputs.filter((input) => input.kind === "stop"),
+                  inputs.slice(
+                    0,
+                    inputs.findLastIndex((input) => input.kind === "stop") + 1,
+                  ),
                   (input) => runInputRepo.markProcessed(input.id),
                   { discard: true },
                 );
@@ -2607,13 +3680,21 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   yield* runInputRepo.markProcessed(input.id);
                   continue;
                 }
-                if (isDeferredNotificationStopPayload(input.payload)) {
-                  yield* runInputRepo.applyStop(sessionId);
-                  const refreshed = yield* runRepo.get(sessionId);
-                  if (Option.isSome(refreshed)) latest = refreshed.value;
-                }
+                // A newer prompt may have reopened a terminal run since this
+                // stop was enqueued. Persist cancellation again so that prompt
+                // remains eligible for the normal canceled-run resume path.
+                yield* runInputRepo.applyStop(sessionId);
+                const refreshed = yield* runRepo.get(sessionId);
+                if (Option.isSome(refreshed)) latest = refreshed.value;
                 yield* cancel(latest);
-                yield* runInputRepo.markProcessed(input.id);
+                // The accepted stop also cancels prompts queued before it.
+                // Leave later prompts pending so they can resume the run.
+                for (const superseded of inputs.slice(
+                  0,
+                  inputs.findIndex((candidate) => candidate.id === input.id) +
+                    1,
+                ))
+                  yield* runInputRepo.markProcessed(superseded.id);
                 return;
               }
             }
@@ -2799,13 +3880,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 const resumedOption = yield* runRepo.get(sessionId);
                 if (Option.isNone(resumedOption)) return;
                 const resumed = resumedOption.value;
-                const retryPayload = yield* runInputRepo
-                  .latestActionableInput(sessionId)
-                  .pipe(
-                    Effect.map((input) =>
-                      Option.isSome(input) ? input.value.payload : null,
-                    ),
-                  );
+                const latestActionable =
+                  yield* runInputRepo.latestActionableInput(sessionId);
+                const retryPayload = Option.isSome(latestActionable)
+                  ? latestActionable.value.payload
+                  : null;
+                // Projections use a global key, and attempt numbers reset on
+                // reopening. Scope notices and driver commands to this input.
+                const retryKey = `retry:${sessionId}:${Option.isSome(latestActionable) ? latestActionable.value.id : "saved"}:${resumed.attempt}`;
                 let retryInput:
                   | {
                       readonly kind: "created" | "prompted" | "stop";
@@ -2813,8 +3895,6 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     }
                   | undefined;
                 if (Option.isNone(resumed.ompSessionFile)) {
-                  const latestActionable =
-                    yield* runInputRepo.latestActionableInput(sessionId);
                   if (Option.isNone(latestActionable)) {
                     return yield* Effect.fail(
                       new InterruptedRunNoActionableInputError({
@@ -2846,13 +3926,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 );
                 yield* projector.thought(
                   sessionId,
-                  `retry:${resumed.attempt}`,
+                  retryKey,
                   `Retrying the interrupted Partitura run (attempt ${resumed.attempt}).`,
                 );
                 if (Option.isSome(resumed.ompSessionFile)) {
                   yield* worker.followUp(
                     "Continue the interrupted Linear task from the saved session state.",
-                    `retry:${resumed.attempt}`,
+                    retryKey,
                   );
                 } else {
                   if (retryInput === undefined) {
@@ -2874,14 +3954,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   );
                   const agentInvoked = yield* worker.prompt(
                     retryPrompt,
-                    `retry:${resumed.attempt}`,
+                    retryKey,
                   );
                   if (!agentInvoked) {
-                    yield* finishLocalCommand(
-                      sessionId,
-                      worker,
-                      `retry:${resumed.attempt}`,
-                    );
+                    yield* finishLocalCommand(sessionId, worker, retryKey);
                   }
                 }
               }
@@ -2924,12 +4000,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 if (runUrlForSession !== null) {
                   yield* projector.externalUrls(
                     sessionId,
-                    `run-url:${sessionId}`,
+                    `partitura-run-url:${sessionId}`,
                     [
                       {
-                        // This label is part of the persisted payload for the
-                        // stable run-url key. Keep it compatible on resume.
-                        label: "OhMyPi run",
+                        // Use a new key to preserve immutable legacy payloads.
+                        label: "Partitura run",
                         url: runUrlForSession(sessionId),
                       },
                     ],
@@ -3086,6 +4161,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     yield* workerIdentities.acquire(
                       sessionId,
                       config.workspaceRoot,
+                      { retireTerminal: sandboxMode === "native" },
                     ),
                   );
                   yield* updateRun(sessionId, {
@@ -3315,6 +4391,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       RunRepo.layer,
       LinearGateway.layer,
       WorkspaceRepo.layer,
+      AgentSettingsRepo.layer,
       GatewayConfig.layer,
       GitHubApp.layer,
       RpcWorker.layer,

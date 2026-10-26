@@ -26,14 +26,18 @@ An absent list grants nobody gateway-wide cache administration.
 
 Repository URLs must be canonical `https://github.com/owner/repo` URLs, optionally
 ending in `.git`. Convert existing SSH/local/non-GitHub repository records before
-running them. GitHub tokens use Git environment configuration during clone, and
-mode-0600 local Git configuration for worker access, never command arguments.
-The worker can read that repository-scoped installation token, which GitHub
-expires after one hour. This is intentional for authenticated worker Git
-operations. It is not the GitHub App private key or an organization-wide token.
-Hiding a token from code that can invoke authenticated Git requires a separate
-Git broker, which this design doesn't provide. Gateway header refresh and
-terminal cleanup remove only generated values and retain user-installed headers.
+running them. Gateway-side clone and fetch commands receive the repository token
+through process environment and never persist it in the checkout. Worker Git
+requests go through a per-session broker bound to that one repository. The broker
+keeps the GitHub installation token in gateway memory, accepts only Git smart-HTTP
+upload and receive-pack paths, rejects redirects, and caps request and response
+bodies. Workers receive a random session URL for the broker, not the GitHub token.
+Broker-configured checkouts enable `push.negotiate` so an older shallow snapshot
+can discover common upstream objects before packing a push. The broker retains
+its 64 MiB request limit and returns HTTP 413 for oversized request bodies.
+The session broker stops with its worker; the host relay must route its fixed Git
+service to that listener. Public GitHub reads follow the sandbox's configured
+web egress policy; repository write credentials remain in the broker.
 
 ## Docker worker identity
 
@@ -49,8 +53,8 @@ and Git credential updates execute as the worker uid, including on resume, so
 worker-planted paths never cause privileged gateway writes. Git subprocesses receive a transport
 environment allowlist, without gateway or model-provider credentials.
 The workspace helper starts from its gateway-owned installation directory and
-receives the workspace as an absolute argument. Both asynchronous operations and
-synchronous retention pin Bun's configuration to `/dev/null`, disable `.env`
+receives the workspace as an absolute argument. Workspace operations and
+retention pin Bun's configuration to `/dev/null`, disable `.env`
 autoloading and automatic package installation, and use an environment allowlist
 that excludes `BUN_*`, `NODE_OPTIONS` and loader injection variables. Keep the
 helper, its installation directory, dependencies and parent directories unwritable
@@ -62,17 +66,28 @@ MCP configuration is projected to its generated `mcpServers` fields before helpe
 stdin is serialized. OAuth client records and renewal fields never cross that uid
 boundary. Agent database inputs are empty for gateway-managed OAuth servers.
 Generated MCP configuration contains only a loopback URL and the worker session's
-proxy bearer; upstream access tokens stay in the gateway. Git persistence sends
-only the repository-scoped header string on stdin, never argv; cleanup operations
-carry no credential payload.
+proxy bearer; upstream access tokens stay in the gateway. The Git relay carries
+only the session-bound broker URL. It never receives an installation token from
+the worker.
 
-Retention removes workspace contents as the worker uid while holding its synchronous
-SQLite reopen fence. Before delegation, the gateway migrates legacy ownership with
+Retention commits `workspace.state='deleting'` in a short immediate transaction
+before removing contents asynchronously as the worker uid. Reopen, prompt input,
+new overlapping path references, lease acquisition and uid recycling respect this
+durable claim. The claim and uid reservation survive crashes and failed cleanup;
+the next sweep retries them, even if a later stop changed the run's update time.
+Kernel flock serializes sweepers across processes and PID namespaces. Filesystem
+removal finishes before interruption releases that lock. Metadata and saved driver
+session references are cleared only after successful removal and uid retirement.
+Before delegation, the gateway migrates legacy ownership with
 the same descriptor-based, no-follow walk used for workspace preparation. Only
 canonical paths strictly inside the workspace root qualify. The gateway only
 removes the empty top-level directory; it never recursively deletes a
 worker-controlled tree with gateway privileges. A
 failed cleanup leaves the workspace records intact for a later sweep.
+New clone staging names carry a random owner ID backed by the same kernel-lock
+mechanism. An active gateway holds the lock through clone publication and cleanup.
+Recovery acquires it before removing abandoned staging, so PID reuse and container
+restart don't stand in for liveness. Legacy names retain conservative PID checks.
 `/app/workspaces` must be a separate writable volume,
 outside `/app/data`; the image sets `WORKSPACE_ROOT=/app/workspaces`.
 
@@ -183,18 +198,64 @@ gateway's process environment and files. Use Docker for this boundary. Per-sessi
 uids isolate discretionary filesystem access; workers still share the container's
 network, kernel and global process visibility. This isn't a network sandbox.
 
+## Optional session containers
+
+`WORKER_SANDBOX_MODE=sysbox` runs each OMP worker or launched T3 daemon in a
+separate container through a host broker. Its workspace and Mise volume belong
+to that session. The worker gets image-local tool paths and run-created proxy
+settings; inherited gateway proxy and Mise settings are discarded. Host runtime
+installation and live isolation qualification remain separate requirements.
+See [the broker deployment contract](../deploy/session-sandbox/README.md).
+
+UID release requires successful broker teardown, including after a gateway
+restart. Retention destroys the sandbox before deleting its workspace under the
+durable deletion claim. Failure preserves the workspace and identity for retry.
+Native process-only orphan retirement is disabled in Sysbox mode. An orphan
+without a published workspace stays reserved until explicit broker-backed
+cleanup establishes that no sandbox remains.
+
+## Repository age identities
+
+`WORKER_REPOSITORY_AGE_KEYS_JSON_FILE` points to a gateway-only secret whose JSON
+maps organization IDs to repository IDs to scoped age identity text. Keep that
+map encrypted in fnox source. It must contain project agent identities, never
+toolbox, operator, release or production identities. The gateway selects only
+the durable run's organization/repository binding, then sends that identity on
+stdin to its workspace helper under the worker UID. Both OMP and launched T3
+receive only `FNOX_AGE_KEY_FILE`, pointing to a mode-0400 file beneath their
+private home. Neither the identity nor the map goes into argv or worker env.
+
+New sessions discard inherited gateway `FNOX_AGE_KEY_FILE` pointers. A launch
+without a configured binding removes a previous materialized identity, and
+terminal cleanup removes the file too. A cleanup failure emits a sanitized
+warning; workspace retention remains responsible for final deletion. File
+removal doesn't revoke copies an authorized worker already read. Keep the
+identity's decryptable secrets limited to that project's agent scope and verify
+positive and negative decryption cases before enabling a live grant.
+
 ## Launched T3 daemons
+
+The optional existing-server device backup is configured separately through
+`T3_DEVICE_BACKUP_CONFIG_JSON` or `_FILE`. Its dedicated bearer stays gateway
+side; organization-to-host bindings restrict the worker tool, and the authority
+serializes its operations with session cancellation. Run-owned idle threads
+carry device ownership across gateway restarts. Enabling this tool doesn't
+grant shell execution or a remote build route. See
+`docs/agent-drivers.md` for its credential scopes and verification limits.
 
 With `T3_MODE=launch` each T3 session gets its own `t3 serve` started by the
 gateway under the session's worker uid, with the same `setpriv` flags, env
 allowlist and model-credential injection as an OMP worker. Its `HOME` and T3
 state directory are inside the session's mode-0700 workspace. Settings are
 written as the worker uid by `src/workspace-worker.ts` and hold no credential.
-The daemon binds `127.0.0.1` only. Its bearer is issued per launch, as the
-worker uid, against that daemon's own state, so another daemon rejects it.
-Before sending the bearer, at launch and on every reconnect, the gateway checks
+For native launches the daemon binds `127.0.0.1`. Its bearer is issued per launch,
+as the worker uid, against that daemon's own state, so another daemon rejects it.
+Before sending the bearer for a native launch, at launch and on every reconnect, the gateway checks
 `/proc/net/tcp{,6}` and requires every listener on the daemon's port to belong
-to the session uid. A port held by any other uid fails the launch. The daemon's
+to the session uid. A port held by any other uid fails the launch. In Sysbox mode,
+the daemon binds `0.0.0.0` inside its session container. The per-session internal
+network and relay peer check replace the host listener-ownership check; the
+gateway connects through that session's relay. The daemon's
 startup pairing code is discarded from logs. Remote mode, one daemon shared by
 every session, is refused while uid isolation is active. See
 `docs/agent-drivers.md`.
@@ -290,8 +351,10 @@ need safe in-place updates and auth-failure/reconnect coordination.
 process lifetime. The proxy keeps OMP's bearer stable while rotating upstream
 credentials. OMP's MCP refresh callback requires local refresh material and
 explicitly rejects its remote-broker refresh sentinel, so its model auth broker
-isn't a drop-in MCP renewal path here. This per-session bearer pattern overlaps with `sym-gmy.6`; hosting Linear
-tools for T3 remains separate work.
+isn't a drop-in MCP renewal path here. Launched T3 sessions receive the same
+gateway-owned Linear workspace tools as OMP through a session MCP server.
+GitHub PR creation also uses that server and stays bound to the run's
+repository. Cancellation fences mutating tools before dispatch.
 
 ## Encryption rotation
 

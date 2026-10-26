@@ -15,6 +15,7 @@ import { testPaths } from "./fixtures/paths.js";
 const temporaryDirectories: string[] = [];
 
 const baseValues = new Map<string, string>([
+  ["WORKER_SANDBOX_MODE", "native"],
   ["LINEAR_CLIENT_ID", "client"],
   ["LINEAR_CLIENT_SECRET", "secret"],
   ["LINEAR_WEBHOOK_SECRET", "webhook"],
@@ -62,6 +63,190 @@ afterEach(async () => {
 const testPath = testPaths();
 
 describe("GatewayConfig", () => {
+  test("loads optional T3 device backup from a file and sanitizes invalid config", async () => {
+    const config = {
+      baseUrl: "https://t3.example.test",
+      tokenFile: "/run/secrets/dedicated-t3-backup",
+      workspaceRoot: "/srv/partitura-device",
+      organizationHosts: { "org-one": ["configured-host"] },
+      instanceId: "configured-provider",
+      model: "configured-model",
+    };
+    const directory = await mkdtemp(testPath("device-backup-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "config.json");
+    await writeFile(path, JSON.stringify(config));
+    const configured = await Effect.runPromise(
+      configResult(valuesWith([["T3_DEVICE_BACKUP_CONFIG_JSON_FILE", path]])),
+    );
+    expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured))
+      expect(configured.success.t3DeviceBackup).toEqual(config);
+    const absent = await Effect.runPromise(configResult(valuesWith([])));
+    if (Result.isSuccess(absent))
+      expect(absent.success.t3DeviceBackup).toBeUndefined();
+    const invalid = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          [
+            "T3_DEVICE_BACKUP_CONFIG_JSON",
+            JSON.stringify({
+              ...config,
+              baseUrl:
+                "https://secret-invalid-user:secret-invalid-value@t3.example.test",
+            }),
+          ],
+        ]),
+      ),
+    );
+    expect(Result.isFailure(invalid)).toBe(true);
+    expect(JSON.stringify(invalid)).not.toContain("secret-invalid-value");
+  });
+
+  test("loads scoped age bindings as redacted configuration and hides invalid contents", async () => {
+    const keys = { "org-one": { "repo-one": "scoped-test-identity" } };
+    const configured = await Effect.runPromise(
+      configResult(
+        valuesWith([["WORKER_REPOSITORY_AGE_KEYS_JSON", JSON.stringify(keys)]]),
+      ),
+    );
+    expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured)) {
+      expect(configured.success.workerRepositoryAgeKeys).toBeDefined();
+      const bound = configured.success.workerRepositoryAgeKeys;
+      if (bound !== undefined) {
+        expect(Redacted.value(bound)).toEqual(keys);
+        expect(JSON.stringify(bound)).not.toContain("scoped-test-identity");
+      }
+    }
+    const invalid = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["WORKER_REPOSITORY_AGE_KEYS_JSON", '{"secret-invalid-content":[]}'],
+        ]),
+      ),
+    );
+    expect(Result.isFailure(invalid)).toBe(true);
+    expect(JSON.stringify(invalid)).not.toContain("secret-invalid-content");
+  });
+
+  test.each(["firecracker", "sysbox"] as const)(
+    "requires the allowlisted broker for %s",
+    async (runtime) => {
+      const missingBroker = await Effect.runPromise(
+        configResult(valuesWith([["WORKER_SANDBOX_MODE", runtime]])),
+      );
+      expect(Result.isFailure(missingBroker)).toBe(true);
+
+      const configured = await Effect.runPromise(
+        configResult(
+          valuesWith([
+            ["WORKER_SANDBOX_MODE", runtime],
+            [
+              "SESSION_SANDBOX_BROKER_SOCKET",
+              "/run/partitura-sandbox/broker.sock",
+            ],
+          ]),
+        ),
+      );
+      expect(Result.isSuccess(configured)).toBe(true);
+    },
+  );
+
+  test("defaults to Firecracker and refuses to fall back without its broker", async () => {
+    const values = valuesWith([]);
+    values.delete("WORKER_SANDBOX_MODE");
+    expect(
+      Result.isFailure(await Effect.runPromise(configResult(values))),
+    ).toBe(true);
+    values.set(
+      "SESSION_SANDBOX_BROKER_SOCKET",
+      "/run/partitura-sandbox/broker.sock",
+    );
+    const configured = await Effect.runPromise(configResult(values));
+    expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured))
+      expect(configured.success.workerSandboxMode).toBe("firecracker");
+  });
+
+  test("rejects unknown sandbox runtimes", async () => {
+    expect(
+      Result.isFailure(
+        await Effect.runPromise(
+          configResult(valuesWith([["WORKER_SANDBOX_MODE", "docker"]])),
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  test("enables native build transport only with both private paths", async () => {
+    const incomplete = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["NATIVE_BUILD_SSH_CONFIG_FILE", "/run/secrets/native-ssh-config"],
+        ]),
+      ),
+    );
+    expect(Result.isFailure(incomplete)).toBe(true);
+
+    const configured = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["NATIVE_BUILD_SSH_CONFIG_FILE", "/run/secrets/native-ssh-config"],
+          ["NATIVE_BUILD_SCRATCH_ROOT", "/app/data/native-build"],
+        ]),
+      ),
+    );
+    expect(Result.isSuccess(configured)).toBe(true);
+    if (Result.isSuccess(configured)) {
+      expect(configured.success.nativeBuild).toEqual({
+        sshConfigFile: "/run/secrets/native-ssh-config",
+        scratchRoot: "/app/data/native-build",
+      });
+    }
+  });
+
+  test("requires independent transport and storage for the backup builder", async () => {
+    const primary = [
+      ["NATIVE_BUILD_SSH_CONFIG_FILE", "/run/secrets/primary-ssh"],
+      ["NATIVE_BUILD_SCRATCH_ROOT", "/app/data/native-primary"],
+    ] as const;
+    const backup = [
+      ["NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE", "/run/secrets/backup-ssh"],
+      ["NATIVE_BUILD_BACKUP_SCRATCH_ROOT", "/app/data/native-backup"],
+    ] as const;
+    for (const overrides of [
+      backup,
+      [...primary, backup[0]],
+      [...primary, backup[1]],
+      [
+        ...primary,
+        ...backup,
+        ["NATIVE_BUILD_BACKUP_SSH_CONFIG_FILE", primary[0][1]] as const,
+      ],
+      [
+        ...primary,
+        ...backup,
+        ["NATIVE_BUILD_BACKUP_SCRATCH_ROOT", primary[1][1]] as const,
+      ],
+    ]) {
+      expect(
+        Result.isFailure(
+          await Effect.runPromise(configResult(valuesWith(overrides))),
+        ),
+      ).toBe(true);
+    }
+    const result = await Effect.runPromise(
+      configResult(valuesWith([...primary, ...backup])),
+    );
+    expect(Result.isSuccess(result)).toBe(true);
+    if (Result.isSuccess(result))
+      expect(result.success.nativeBuildBackup).toEqual({
+        sshConfigFile: "/run/secrets/backup-ssh",
+        scratchRoot: "/app/data/native-backup",
+      });
+  });
+
   test("loads required values from Docker secret files", async () => {
     const directory = await mkdtemp(
       join(testPath("temporary"), "gateway-secrets-"),
@@ -76,6 +261,7 @@ describe("GatewayConfig", () => {
       ),
     };
     const environment: Record<string, string> = {
+      WORKER_SANDBOX_MODE: "native",
       PUBLIC_URL: "https://ohmypi-symphony.ai.roxasroot.net",
     };
 
@@ -113,6 +299,7 @@ describe("GatewayConfig", () => {
 
     const values = configValuesFromEnvironment({
       PUBLIC_URL: "http://localhost:3000",
+      WORKER_SANDBOX_MODE: "native",
       LINEAR_CLIENT_ID: "direct-client",
       LINEAR_CLIENT_ID_FILE: clientIdFile,
       LINEAR_CLIENT_SECRET: "secret",
