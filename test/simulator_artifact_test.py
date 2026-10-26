@@ -33,6 +33,7 @@ def fixture():
         ('artifacts/ONYXIO.app/Info.plist', plistlib.dumps(dict(CFBundleIdentifier=BINDING['bundleId'], CFBundleExecutable='ONYXIO', CFBundlePackageType='APPL', CFBundleSupportedPlatforms=['iPhoneSimulator'], MinimumOSVersion='26.0')), None),
         ('artifacts/ONYXIO.app/ONYXIO', macho(), None),
         ('artifacts/ONYXIO.app/main.jsbundle', b'embedded release code', None),
+        ('artifacts/result.json', ('{"job":"' + 'b' * 32 + '","commit":"' + BINDING['commit'] + '","action":"simulator","taskExit":0}\n').encode(), None),
     ]
 
 
@@ -75,8 +76,22 @@ class SimulatorArtifactTest(unittest.TestCase):
             self.assertEqual(len(self.verified), 1)
             self.assertEqual(self.verified[0][1], [app / 'ONYXIO'])
             self.assertEqual((app / 'ONYXIO').stat().st_mode & 0o777, 0o700)
+            self.assertEqual(json.loads((app.parent / 'result.json').read_bytes())['commit'], BINDING['commit'])
         self.assertFalse(app.exists())
         self.assertTrue(self.archive.exists())
+
+    def test_native_guest_receipt_must_be_bounded_regular_file(self):
+        files = [entry for entry in fixture() if entry[0] != 'artifacts/result.json']
+        for data, link in [(b'x' * (MODULE.MAX_METADATA + 1), None), (b'', 'ONYXIO.app/Info.plist')]:
+            with self.subTest(link=link, size=len(data)):
+                self.assert_rejected(self.write(files + [('artifacts/result.json', data, link)]))
+        for kind in (tarfile.DIRTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE):
+            def extra(info):
+                if info.name == 'artifacts/result.json':
+                    info.type, info.size = kind, 0
+                    info.linkname = 'artifacts/ONYXIO.app/Info.plist'
+            with self.subTest(kind=kind):
+                self.assert_rejected(self.write(extra=extra))
 
     def test_caller_failure_cleans_staging(self):
         with self.assertRaisesRegex(RuntimeError, 'install failed'):
@@ -211,8 +226,9 @@ class SimulatorArtifactTest(unittest.TestCase):
     def test_real_ad_hoc_simulator_app_is_admitted_without_launch(self):
         app = self.scratch / 'ONYXIO.app'
         app.mkdir()
-        for name, data, _ in fixture()[1:]:
-            (app / Path(name).name).write_bytes(data)
+        for name, data, _ in fixture():
+            if name.startswith('artifacts/ONYXIO.app/'):
+                (app / Path(name).name).write_bytes(data)
         source = self.scratch / 'main.c'
         source.write_text('int main(void) { return 0; }\n')
         # Python may use CLT for interpreter isolation; the simulator SDK belongs
@@ -221,10 +237,11 @@ class SimulatorArtifactTest(unittest.TestCase):
         subprocess.run(['/usr/bin/xcrun', '--sdk', 'iphonesimulator', 'clang', '-target', 'arm64-apple-ios26.0-simulator', str(source), '-o', str(app / 'ONYXIO')], check=True, capture_output=True, timeout=60, env=compiler_env)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(app)], check=True, capture_output=True, timeout=30)
         with tarfile.open(self.archive, 'w') as archive:
-            name, data, _ = fixture()[0]
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            archive.addfile(info, io.BytesIO(data))
+            for name, data, _ in fixture():
+                if not name.startswith('artifacts/ONYXIO.app/'):
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
             archive.add(app, arcname='artifacts/ONYXIO.app')
         receipt = hashlib.sha256(self.archive.read_bytes()).hexdigest(), self.archive.stat().st_size
         with MODULE.admitted_app(self.archive, self.scratch, *receipt, BINDING, '26.4') as admitted:

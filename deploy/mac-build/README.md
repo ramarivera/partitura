@@ -317,6 +317,10 @@ under `artifacts/` and `artifacts/partitura-simulator.json`:
 }
 ```
 
+The guest runner also adds `artifacts/result.json` after a successful workflow.
+Admission permits that regular file up to 64 KiB. Its contents don't authorize
+installation or replace the authenticated build binding and transfer receipt.
+
 The installer compares every binding with authenticated job and capability data,
 and checks the complete tar's byte count and SHA-256 against the transfer
 receipt. Archive-provided identity alone never authorizes installation. Admission

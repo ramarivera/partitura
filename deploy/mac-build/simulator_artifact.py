@@ -130,7 +130,7 @@ def archive_plan(archive):
     for path, member in entries.items():
         if path == PurePosixPath('artifacts') and member.isdir():
             continue
-        if path == PurePosixPath('artifacts/partitura-simulator.json') and member.isreg() and member.size <= MAX_METADATA:
+        if path in (PurePosixPath('artifacts/partitura-simulator.json'), PurePosixPath('artifacts/result.json')) and member.isreg() and member.size <= MAX_METADATA:
             continue
         if len(path.parts) < 2 or path.parts[1] != app:
             raise ValueError('unexpected artifact member')
