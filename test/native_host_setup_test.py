@@ -224,6 +224,15 @@ class NativeHostSetupTests(unittest.TestCase):
             with patch.dict(os.environ, {'DEVELOPER_DIR': 'relative'}):
                 with self.assertRaisesRegex(host_setup.NativeHostError, 'developer directory'):
                     host_setup.account_python('partitura-build')
+            # /usr/bin/git is also an xcode-select shim; root must keep the selection.
+            with patch.dict(os.environ, {'DEVELOPER_DIR': '/usr', 'GIT_DIR': '/untrusted'}):
+                environment = host_setup.git_environment()
+                self.assertEqual(environment['DEVELOPER_DIR'], '/usr')
+                self.assertEqual(environment['GIT_CONFIG_NOSYSTEM'], '1')
+                self.assertNotIn('GIT_DIR', environment)
+            with patch.dict(os.environ, {'DEVELOPER_DIR': directory}):
+                with self.assertRaisesRegex(host_setup.NativeHostError, 'developer directory'):
+                    host_setup.git_environment()
 
     def test_installer_checks_staged_and_live_sshd_and_restores_dropin_on_failure(self):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()

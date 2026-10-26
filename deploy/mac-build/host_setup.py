@@ -387,6 +387,20 @@ def safe_read(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def git_environment() -> dict[str, str]:
+    """Run /usr/bin/git without user config and with the qualified toolchain.
+
+    /usr/bin/git is an xcode-select shim. Keep a process-scoped DEVELOPER_DIR
+    selection, or root would fall back to the globally selected toolchain.
+    """
+    environment = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    developer = os.environ.get("DEVELOPER_DIR")
+    if developer is not None:
+        trusted_root_path(Path(developer), "selected developer directory")
+        environment["DEVELOPER_DIR"] = developer
+    return environment
+
+
 def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, bytes, bytes]:
     source = config["source"]
     repository = Path(source["partitura_repository"])
@@ -399,7 +413,7 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
         check=True,
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+        env=git_environment(),
     ).stdout.strip()
     if resolved != commit:
         raise NativeHostError("Partitura broker source commit did not resolve exactly")
@@ -407,7 +421,7 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
         ["/usr/bin/git", "-C", str(repository), "show", f"{commit}:{HOST_SETUP_PATH}"],
         check=True,
         capture_output=True,
-        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+        env=git_environment(),
     ).stdout
     if sha256_bytes(setup) != sha256_file(Path(__file__)):
         raise NativeHostError("running host setup module differs from the pinned Partitura commit")
@@ -423,7 +437,7 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
             ["/usr/bin/git", "-C", str(repository), "show", f"{commit}:{relative}"],
             check=True,
             capture_output=True,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+            env=git_environment(),
         )
         blob = result.stdout
         if sha256_bytes(blob) != expected:
