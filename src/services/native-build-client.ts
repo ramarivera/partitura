@@ -36,10 +36,22 @@ export interface NativeBuildRequest {
 }
 const FailureFields = {
   failureCode: Schema.optionalKey(
-    Schema.Literals(["host-key-unavailable", "cleanup-required"]),
+    Schema.Literals([
+      "host-key-unavailable",
+      "cleanup-required",
+      "unlock-failed",
+      "host-capacity-unavailable",
+    ]),
   ),
   stage: Schema.optionalKey(
-    Schema.Literals(["clone", "boot", "workflow", "artifact"]),
+    Schema.Literals([
+      "capacity",
+      "unlock",
+      "clone",
+      "boot",
+      "workflow",
+      "artifact",
+    ]),
   ),
   bootExitCode: Schema.optionalKey(
     Schema.Number.check(
@@ -504,6 +516,10 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             if (
               (failure.failureCode === "host-key-unavailable" &&
                 failure.stage !== "boot") ||
+              (failure.failureCode === "unlock-failed" &&
+                failure.stage !== "unlock") ||
+              (failure.failureCode === "host-capacity-unavailable" &&
+                failure.stage !== "capacity") ||
               (failure.bootExitCode !== undefined && failure.stage !== "boot")
             )
               throw new Error("Inconsistent native build failure diagnostic");

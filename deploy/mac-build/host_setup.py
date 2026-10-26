@@ -12,12 +12,14 @@ import base64
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import stat
 import subprocess
 import sys
 
+WRITER_PATH = "deploy/mac-build/credential-writer.py"
 BROKER_PATH = "deploy/mac-build/broker.py"
 GUEST_RUNNER_PATH = "deploy/mac-build/guest-run.sh"
 NATIVE_HOST_PATH = "deploy/mac-build/native_host.py"
@@ -33,6 +35,8 @@ BROKER_CONFIG_KEYS = {
     "qualifierSha256",
     "guestUser",
     "guestHome",
+    "keychainPath",
+    "keychainCredentialPath",
 }
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
@@ -42,6 +46,7 @@ PUBLIC_KEY = re.compile(
 FORCED_COMMAND = "/usr/bin/python3 /Library/Partitura/NativeBuild/broker.py"
 ROOT_CONFIG = Path("/Library/Partitura/NativeBuild/config.json")
 ROOT_MANIFEST = Path("/Library/Partitura/NativeBuild/managed-files.json")
+ROOT_WRITER = Path("/Library/Partitura/NativeBuild/credential-writer.py")
 ROOT_BROKER = Path("/Library/Partitura/NativeBuild/broker.py")
 ROOT_AUTHORIZED_KEYS = Path("/Library/Partitura/NativeBuild/authorized_keys")
 ROOT_SSHD_CONFIG = Path("/private/etc/ssh/sshd_config")
@@ -112,6 +117,7 @@ def tree_sha256(root: Path) -> str:
 TREE_HASH_AS_ACCOUNT = r'''
 import hashlib
 import os
+import pwd
 from pathlib import Path
 import stat
 import sys
@@ -152,22 +158,50 @@ print(digest.hexdigest())
 '''
 
 
+def trusted_root_path(path: Path, what: str) -> None:
+    """Require a real path whose every component is root-owned and unwritable."""
+    if not path.is_absolute() or Path(os.path.realpath(path)) != path:
+        raise NativeHostError(f"{what} must be an absolute path without symlinks: {path}")
+    for item in (path, *path.parents):
+        metadata = os.lstat(item)
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise NativeHostError(f"{what} is not root-owned and protected: {item}")
+
+
+def verify_root_interpreter() -> None:
+    """Refuse root execution from an interpreter outside root-owned directories.
+
+    The protected runbook qualifies the interpreter before starting Python; this
+    repeats the check so a wrong selection stops before any host reads.
+    """
+    if os.geteuid() != 0:
+        return
+    trusted_root_path(Path(os.path.realpath(sys.executable)), "root Python interpreter")
+    trusted_root_path(Path(os.path.realpath(sys.prefix)), "root Python prefix")
+
+
+def account_python(account: str) -> list[str]:
+    """Run the same qualified interpreter selection as a dedicated account.
+
+    sudo resets the environment, so a process-scoped DEVELOPER_DIR selection
+    is passed explicitly; otherwise /usr/bin/python3 falls back to xcode-select.
+    """
+    command = ["/usr/bin/sudo", "--non-interactive", "-H", "-u", account]
+    developer = os.environ.get("DEVELOPER_DIR")
+    if developer is not None:
+        trusted_root_path(Path(developer), "selected developer directory")
+        command += ["/usr/bin/env", f"DEVELOPER_DIR={developer}"]
+    return [*command, "/usr/bin/python3", "-I"]
+
+
 def tree_sha256_as_account(root: Path, account: str, run=subprocess.run) -> str:
     result = run(
-        [
-            "/usr/bin/sudo",
-            "--non-interactive",
-            "-u",
-            account,
-            "/usr/bin/python3",
-            "-c",
-            TREE_HASH_AS_ACCOUNT,
-            str(root),
-        ],
+        [*account_python(account), "-c", TREE_HASH_AS_ACCOUNT, str(root)],
         capture_output=True,
         text=True,
         check=True,
         timeout=300,
+        cwd="/",
     )
     digest = result.stdout.strip()
     if not HASH.fullmatch(digest):
@@ -189,6 +223,7 @@ def validate_settings(settings: object) -> dict:
         "guest_user",
         "authorized_key",
         "source",
+        "predecessor_manifest_sha256",
         "tart",
         "base",
         "runtime",
@@ -202,12 +237,16 @@ def validate_settings(settings: object) -> dict:
         raise NativeHostError("account must be a valid macOS short name")
     if not isinstance(config["guest_user"], str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", config["guest_user"]) or config["guest_user"] == "root":
         raise NativeHostError("guest_user must be a non-root macOS short name")
+    predecessor = config["predecessor_manifest_sha256"]
+    if not isinstance(predecessor, str) or (predecessor and not HASH.fullmatch(predecessor)):
+        raise NativeHostError("predecessor manifest must be empty or a frozen SHA-256")
     source = required_mapping(
         config["source"],
         {
             "partitura_repository",
             "broker_commit",
             "broker_sha256",
+            "credential_writer_sha256",
             "guest_runner_sha256",
             "native_host_sha256",
             "install_host_sha256",
@@ -230,7 +269,7 @@ def validate_settings(settings: object) -> dict:
         "base",
     )
     runtime = required_mapping(config["runtime"], {"root", "tart_home"}, "runtime")
-    for key in ("broker_sha256", "guest_runner_sha256", "qualifier_sha256"):
+    for key in ("broker_sha256", "credential_writer_sha256", "guest_runner_sha256", "qualifier_sha256"):
         if not isinstance(source[key], str) or not HASH.fullmatch(source[key]):
             raise NativeHostError(f"source.{key} must be a lowercase SHA-256")
     for key in ("native_host_sha256", "install_host_sha256"):
@@ -311,6 +350,8 @@ def make_broker_config(config: dict) -> dict[str, str]:
         "qualifierSha256": source["qualifier_sha256"],
         "guestUser": config["guest_user"],
         "guestHome": f"/Users/{config['guest_user']}",
+        "keychainPath": f"/Users/{config['account']}/Library/Keychains/login.keychain-db",
+        "keychainCredentialPath": f"/Users/{config['account']}/.partitura-native-login.password",
     }
 
 
@@ -346,7 +387,7 @@ def safe_read(path: Path) -> bytes:
     return path.read_bytes()
 
 
-def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, bytes, bytes]:
     source = config["source"]
     repository = Path(source["partitura_repository"])
     reject_symlink_ancestors(repository)
@@ -358,7 +399,7 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
         check=True,
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(Path.home())},
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
     ).stdout.strip()
     if resolved != commit:
         raise NativeHostError("Partitura broker source commit did not resolve exactly")
@@ -366,7 +407,7 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
         ["/usr/bin/git", "-C", str(repository), "show", f"{commit}:{HOST_SETUP_PATH}"],
         check=True,
         capture_output=True,
-        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(Path.home())},
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
     ).stdout
     if sha256_bytes(setup) != sha256_file(Path(__file__)):
         raise NativeHostError("running host setup module differs from the pinned Partitura commit")
@@ -376,12 +417,13 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
         (GUEST_RUNNER_PATH, source["guest_runner_sha256"]),
         (NATIVE_HOST_PATH, source["native_host_sha256"]),
         (INSTALL_HOST_PATH, source["install_host_sha256"]),
+        (WRITER_PATH, source["credential_writer_sha256"]),
     ):
         result = subprocess.run(
             ["/usr/bin/git", "-C", str(repository), "show", f"{commit}:{relative}"],
             check=True,
             capture_output=True,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(Path.home())},
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": pwd.getpwuid(os.getuid()).pw_dir, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
         )
         blob = result.stdout
         if sha256_bytes(blob) != expected:
@@ -390,7 +432,7 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
     qualifier = safe_read(Path(source["qualifier_source"]))
     if sha256_bytes(qualifier) != source["qualifier_sha256"]:
         raise NativeHostError("pinned Partitura qualifier hash differs")
-    return blobs[0], blobs[1], qualifier, blobs[2], blobs[3]
+    return blobs[0], blobs[1], qualifier, blobs[2], blobs[3], blobs[4]
 
 
 def verify_tart_source(config: dict) -> Path:
@@ -507,12 +549,13 @@ def sshd_effective(settings: dict, run=subprocess.run) -> dict[str, str]:
     }
 
 
-def expected_host_files(config: dict, blobs: tuple[bytes, bytes, bytes, bytes, bytes]) -> dict[Path, tuple[bytes, int]]:
+def expected_host_files(config: dict, blobs: tuple[bytes, bytes, bytes, bytes, bytes, bytes]) -> dict[Path, tuple[bytes, int]]:
     broker, runner, qualifier = blobs[:3]
     # The guest files are staged for a later approved base-qualification path.
     # This host installer does not run them or copy a VM image.
     return {
         ROOT_BROKER: (broker, 0o555),
+        ROOT_WRITER: (blobs[5], 0o555),
         # The forced-command broker runs as the dedicated host account.
         ROOT_CONFIG: (json.dumps(make_broker_config(config), sort_keys=True, indent=2).encode() + b"\n", 0o444),
         ROOT_AUTHORIZED_KEYS: (authorized_key_line(config["authorized_key"]).encode(), 0o444),
@@ -570,8 +613,22 @@ def check_existing_files(
     stale = manifest is None
     target_names = {str(path) for path in files}
     target_names.add(str(Path(config["tart"]["installed_app"]) / config["tart"]["executable_relative_path"]))
-    if manifest and set(previous) != target_names:
-        raise NativeHostError("managed-files manifest does not match the reviewed target set")
+    migrating = manifest and set(previous) != target_names
+    if migrating:
+        predecessor = config["predecessor_manifest_sha256"]
+        if set(previous) != target_names - {str(ROOT_WRITER)} or not predecessor or sha256_file(manifest_path) != predecessor:
+            raise NativeHostError("managed-files manifest does not match the frozen predecessor target set")
+        # Every predecessor entry must still match. The pin alone does not
+        # authorize arbitrary intervening changes or a partial prior install.
+        for name, entry in previous.items():
+            path = Path(name)
+            reject_symlink_ancestors(path)
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != entry["mode"] or sha256_file(path) != entry["sha256"]:
+                raise NativeHostError("frozen predecessor payload differs")
+        if os.path.lexists(ROOT_WRITER):
+            raise NativeHostError("unexpected credential writer before migration")
+        stale = True
 
     def known_or_desired(path: Path, expected_hash: str, expected_mode: int, actual_hash: str, actual_mode: int) -> None:
         nonlocal stale
@@ -693,6 +750,7 @@ def verify_private_runtime(config: dict, run=subprocess.run) -> None:
     # home. Inspect it as its owner, as with the qualified base tree hash.
     script = r'''
 import os
+import pwd
 from pathlib import Path
 import stat
 import sys
@@ -709,10 +767,9 @@ for value in sys.argv[1:]:
         raise SystemExit("private runtime directory is not account-owned mode 0700")
 '''
     run(
-        ["/usr/bin/sudo", "--non-interactive", "-u", config["account"],
-         "/usr/bin/python3", "-c", script,
+        [*account_python(config["account"]), "-c", script,
          config["runtime"]["root"], config["runtime"]["tart_home"]],
-        capture_output=True, text=True, check=True, timeout=15,
+        capture_output=True, text=True, check=True, timeout=15, cwd="/",
     )
 
 
@@ -740,7 +797,8 @@ def stage(settings: object, destination: Path) -> None:
     (destination / "qualify.sh").write_bytes(blobs[2])
     (destination / "native_host.py").write_bytes(blobs[3])
     (destination / "install-host.sh").write_bytes(blobs[4])
-    for name in ("broker.py", "guest-run.sh", "qualify.sh", "native_host.py", "install-host.sh"):
+    (destination / "credential-writer.py").write_bytes(blobs[5])
+    for name in ("broker.py", "guest-run.sh", "qualify.sh", "native_host.py", "install-host.sh", "credential-writer.py"):
         os.chmod(destination / name, 0o600)
     (destination / "config.json").write_text(
         json.dumps(make_broker_config(config), sort_keys=True, indent=2) + "\n"
@@ -775,6 +833,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--stage", "--stage-host", type=Path, dest="stage")
     arguments = parser.parse_args(argv)
     try:
+        verify_root_interpreter()
         settings = json.loads(arguments.config.read_text())
         if arguments.check:
             return check(settings)

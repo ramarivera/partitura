@@ -171,9 +171,12 @@ class NativeHostSetupTests(unittest.TestCase):
 
             def run(arguments, **kwargs):
                 calls.append((arguments, kwargs))
-                self.assertEqual(arguments[:4], ['/usr/bin/sudo', '--non-interactive', '-u', 'partitura-build'])
+                self.assertEqual(arguments[:5], ['/usr/bin/sudo', '--non-interactive', '-H', '-u', 'partitura-build'])
                 self.assertEqual(kwargs['timeout'], 15)
-                return subprocess.run(arguments[4:], **kwargs)
+                # A process-scoped DEVELOPER_DIR selection may precede the shim.
+                self.assertEqual(arguments[arguments.index('-c') - 2:arguments.index('-c')], ['/usr/bin/python3', '-I'])
+                self.assertEqual(kwargs['cwd'], '/')
+                return subprocess.run(arguments[5:], **kwargs)
 
             settings = {'account': 'partitura-build', 'runtime': {'root': str(runtime), 'tart_home': str(tart)}}
             with patch.object(Path, 'lstat', side_effect=PermissionError('administrator cannot traverse private home')):
@@ -188,6 +191,39 @@ class NativeHostSetupTests(unittest.TestCase):
             settings['runtime']['tart_home'] = str(link)
             with self.assertRaises(subprocess.CalledProcessError):
                 host_setup.verify_private_runtime(settings, run)
+
+    def test_root_interpreter_and_developer_selection_must_be_root_owned(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            operator_python = Path(directory) / 'python3'
+            operator_python.write_text('')
+            loader = importlib.util.spec_from_file_location('native_interpreter', ROOT / 'deploy/mac-build/native_host.py')
+            native_host = importlib.util.module_from_spec(loader)
+            loader.loader.exec_module(native_host)
+            for module in (host_setup, native_host):
+                with self.subTest(module=module.__name__), patch.object(module.os, 'geteuid', return_value=0):
+                    with patch.object(module.sys, 'executable', '/bin/sh'), patch.object(module.sys, 'prefix', '/usr'):
+                        if module is host_setup:
+                            host_setup.verify_root_interpreter()
+                        else:
+                            self.assertIsNone(native_host.untrusted_root_interpreter())
+                    with patch.object(module.sys, 'executable', str(operator_python)), patch.object(module.sys, 'prefix', '/usr'):
+                        if module is host_setup:
+                            with self.assertRaisesRegex(host_setup.NativeHostError, 'root Python interpreter'):
+                                host_setup.verify_root_interpreter()
+                        else:
+                            self.assertIsNotNone(native_host.untrusted_root_interpreter())
+            with patch.dict(os.environ, {'DEVELOPER_DIR': '/usr'}):
+                self.assertEqual(
+                    host_setup.account_python('partitura-build'),
+                    ['/usr/bin/sudo', '--non-interactive', '-H', '-u', 'partitura-build',
+                     '/usr/bin/env', 'DEVELOPER_DIR=/usr', '/usr/bin/python3', '-I'],
+                )
+            with patch.dict(os.environ, {'DEVELOPER_DIR': directory}):
+                with self.assertRaisesRegex(host_setup.NativeHostError, 'developer directory'):
+                    host_setup.account_python('partitura-build')
+            with patch.dict(os.environ, {'DEVELOPER_DIR': 'relative'}):
+                with self.assertRaisesRegex(host_setup.NativeHostError, 'developer directory'):
+                    host_setup.account_python('partitura-build')
 
     def test_installer_checks_staged_and_live_sshd_and_restores_dropin_on_failure(self):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()

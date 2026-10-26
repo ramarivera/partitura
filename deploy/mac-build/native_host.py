@@ -15,9 +15,10 @@ import sys
 import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
-INSTALL_HOST_SHA256 = "65f93ca9b8fc59f0659ad568195e5519aac38969ca15d2bd4631bf1b2448ba0a"
+INSTALL_HOST_SHA256 = "a9ee4ea0723a5a02820556b41c157299199170d7297b21b2afbdc1b759773055"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 STAGED_FILES = {
+    '/Library/Partitura/NativeBuild/credential-writer.py': 'credential-writer.py',
     '/Library/Partitura/NativeBuild/broker.py': 'broker.py',
     '/Library/Partitura/NativeBuild/config.json': 'config.json',
     '/Library/Partitura/NativeBuild/authorized_keys': 'authorized_keys',
@@ -56,6 +57,19 @@ def fail(message: str) -> int:
     return 1
 
 
+def untrusted_root_interpreter() -> str | None:
+    """Name the first interpreter path component root must not execute from."""
+    if os.geteuid() != 0:
+        return None
+    for location in (sys.executable, sys.prefix):
+        real = Path(os.path.realpath(location))
+        for item in (real, *real.parents):
+            metadata = item.lstat()
+            if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                return str(item)
+    return None
+
+
 def root_scratch_directory() -> Path:
     # sudo may preserve the administrator's HOME. Root staging must use the
     # root account's own directory, never an environment-selected home.
@@ -72,10 +86,12 @@ def root_scratch_directory() -> Path:
     for directory in reversed(missing):
         directory.mkdir(mode=0o700)
     current = scratch
-    while current != root_home:
+    while True:
         metadata = current.lstat()
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
             raise OSError(f"unsafe root scratch directory: {current}")
+        if current == current.parent:
+            break
         current = current.parent
     return scratch
 
@@ -96,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
         return fail("installer pins are incomplete")
     if os.uname().sysname != "Darwin":
         return fail("host installation requires macOS")
+    unsafe = untrusted_root_interpreter()
+    if unsafe is not None:
+        return fail(f"root Python interpreter is not root-owned and protected: {unsafe}")
     stage = args.stage
     try:
         info = stage.lstat()
@@ -103,6 +122,11 @@ def main(argv: list[str] | None = None) -> int:
             return fail("stage path must be absolute and contain no symlink")
         if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
             return fail("stage directory must be mode 0700")
+        if os.geteuid() == 0:
+            for ancestor in (stage, *stage.parents):
+                metadata = ancestor.lstat()
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                    return fail("root stage requires protected root-owned ancestors")
         if os.geteuid() != 0 and info.st_uid != os.getuid():
             return fail("stage directory must belong to the caller")
         installer = stage / "install-host.sh"

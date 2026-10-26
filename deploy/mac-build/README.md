@@ -136,6 +136,18 @@ The standalone sequence is:
 6. Run the original `host_setup.py --config PATH --check` again. Require exit 0,
    then run the acceptance checks below before enabling gateway native tools.
 
+Root runs Python only from a root-owned interpreter. Before the first root
+command, resolve `xcode-select -p` and the interpreter with `/usr/bin/stat`,
+`/usr/bin/find` and `/usr/bin/xcrun --find`, not by running Python. If the
+selected Xcode sits under the admin-writable `/Applications`, select the
+installed Command Line Tools for those processes only, for example
+`sudo -H /usr/bin/env DEVELOPER_DIR=/Library/Developer/CommandLineTools /usr/bin/python3 -I ...`,
+after checking that the whole tools tree is root-owned and not group- or
+other-writable. This doesn't change the global `xcode-select` choice.
+`host_setup.py` passes that selection explicitly to its nested `sudo -u`
+helpers, and both it and `native_host.py` refuse to run as root when the
+interpreter or its prefix has a non-root or writable ancestor.
+
 All script paths above are relative to the pinned Partitura checkout unless
 they name the private stage. `--help` lists each script's full required inputs.
 The base needs a working Tart guest agent and noninteractive guest sudo during
@@ -177,6 +189,8 @@ are canonical mode-0700 directories owned by the dedicated build account.
   "tartHome": "/Volumes/Builds/partitura/tart",
   "guestUser": "partitura",
   "guestHome": "/Users/partitura",
+  "keychainPath": "/Users/partitura-build/Library/Keychains/login.keychain-db",
+  "keychainCredentialPath": "/Users/partitura-build/.partitura-native-login.password",
   "guestRunnerSha256": "REVIEWED_GUEST_RUNNER_SHA256",
   "qualifierSha256": "REVIEWED_GENERIC_QUALIFIER_SHA256"
 }
@@ -244,6 +258,34 @@ Provisioning a keychain or changing account authentication requires separate
 operator approval. Preserve public-key-only SSH, the forced command and disabled
 forwarding. Keep any host keychain credential outside the guest, gateway and
 repository. No project credentials belong in this host keychain.
+
+The installed `credential-writer.py` accepts the dedicated account password
+through `/dev/tty` with echo disabled, twice. The human runs it with
+`sudo -H -u partitura-build /usr/bin/env DEVELOPER_DIR=/Library/Developer/CommandLineTools /usr/bin/python3 -I /Library/Partitura/NativeBuild/credential-writer.py`
+on a host that needs the process-scoped Command Line Tools selection, after the approved password initialization. It refuses an existing destination,
+an inherited operator HOME, or a different account. The new file is mode 0600;
+the earlier `.partitura-native-keychain.password` is left unused and untouched.
+Neither the installer nor bootstrap sets a password or logs a user in.
+
+Only `run` reads that credential, after receiving the bundle and acquiring the
+runner lock. The broker opens the explicit dedicated login keychain and unlocks
+it immediately before cloning. It locks after VM cleanup, including failed jobs,
+and crash reconciliation locks before removing the active-VM fence. An unlock
+failure returns `unlock-failed` before any clone. A lock failure retains the
+recovery fence and returns `cleanup-required`. A killed broker cannot immediately
+lock; its durable fence blocks new jobs until reconciliation. Private
+`keychain.json` records the pre-unlock state without credential data.
+
+The host admission check counts Tart and Virtualization.framework VM processes
+across accounts. More than one existing guest or an unqualified hypervisor stops
+the job with `host-capacity-unavailable` before keychain access. Unrelated VM
+starts can still race this check; the broker never stops another account's VM.
+
+Adding the writer to an existing installation requires the exact approved
+`predecessor_manifest_sha256` in host settings. The stager checks every old
+payload against that frozen manifest. Unknown target sets, changed payloads and
+an unexpected writer stop the migration. New installs use an empty predecessor
+pin. Source settings also pin `credential_writer_sha256`.
 
 After approved installation, verify account and SSH restrictions, exact installed
 hashes/modes, base provenance and qualification, no host shares, a generic

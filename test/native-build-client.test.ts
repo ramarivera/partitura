@@ -566,6 +566,45 @@ it.live("waits for a current prune before leasing a fresh artifact", () =>
   }),
 );
 
+for (const [stage, failureCode] of [
+  ["unlock", "unlock-failed"],
+  ["capacity", "host-capacity-unavailable"],
+] as const) {
+  it.live(`preserves ${failureCode} through the native gateway`, () =>
+    Effect.promise(async () => {
+      const fixture = await setup();
+      await writeFile(
+        fixture.configFile,
+        JSON.stringify({
+          trace: fixture.trace,
+          exitCode: 1,
+          receiptOverrides: { state: "failed", stage, failureCode },
+        }),
+      );
+      const client = await createNativeBuildClient(fixture.config);
+      try {
+        const job = await client.start({
+          sessionId: "session-a",
+          workspacePath: fixture.workspace,
+          commit: fixture.commit,
+          pullRequest: 12,
+          action: "archive",
+        });
+        expect(await settled(client, job.job)).toMatchObject({
+          state: "failed",
+          stage,
+          failureCode,
+        });
+        await expect(client.artifact("session-a", job.job)).rejects.toThrow(
+          "no successful artifact",
+        );
+      } finally {
+        await client.close();
+      }
+    }),
+  );
+}
+
 it.live("preserves only validated failed-job diagnostics across restart", () =>
   Effect.promise(async () => {
     const fixture = await setup();

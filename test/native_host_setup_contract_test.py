@@ -33,6 +33,7 @@ class PartituraNativeHostTest(unittest.TestCase):
     def setUpClass(cls):
         cls.settings = {
             "enabled": False,
+            "predecessor_manifest_sha256": "",
             "host": "generic-mac-host",
             "account": "partitura-build",
             "guest_user": "partitura",
@@ -41,6 +42,7 @@ class PartituraNativeHostTest(unittest.TestCase):
                 "partitura_repository": "/opt/partitura",
                 "broker_commit": "a" * 40,
                 "broker_sha256": "b" * 64,
+                "credential_writer_sha256": "f" * 64,
                 "guest_runner_sha256": "c" * 64,
                 "native_host_sha256": "",
                 "install_host_sha256": "",
@@ -150,7 +152,7 @@ class PartituraNativeHostTest(unittest.TestCase):
         config["base"]["sha256"] = "a" * 64
         config["base"]["source_sha256"] = "b" * 64
         config["base"]["mise_sha256"] = "c" * 64
-        files = MODULE.expected_host_files(config, (b"broker", b"runner", b"qualifier"))
+        files = MODULE.expected_host_files(config, (b"broker", b"runner", b"qualifier", b"launcher", b"installer", b"writer"))
         self.assertEqual(files[MODULE.ROOT_CONFIG][1], 0o444)
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -209,16 +211,18 @@ class PartituraNativeHostTest(unittest.TestCase):
                 calls.append((command, kwargs))
                 return SimpleNamespace(stdout=f"{expected['baseSha256']}\n")
 
-            with patch.object(Path, "lstat", autospec=True, side_effect=fake_lstat), patch.object(MODULE.os, "access", return_value=True):
+            environment = {key: value for key, value in os.environ.items() if key != "DEVELOPER_DIR"}
+            with patch.dict(os.environ, environment, clear=True), patch.object(Path, "lstat", autospec=True, side_effect=fake_lstat), patch.object(MODULE.os, "access", return_value=True):
                 MODULE.verify_qualified_base(config, run=fake_run)
 
             command, kwargs = calls[0]
             self.assertEqual(
-                command[:5],
-                ["/usr/bin/sudo", "--non-interactive", "-u", config["account"], "/usr/bin/python3"],
+                command[:7],
+                ["/usr/bin/sudo", "--non-interactive", "-H", "-u", config["account"], "/usr/bin/python3", "-I"],
             )
-            self.assertEqual(command[5], "-c")
-            self.assertEqual(command[7], str(dedicated))
+            self.assertEqual(command[7], "-c")
+            self.assertEqual(kwargs["cwd"], "/")
+            self.assertEqual(command[9], str(dedicated))
             self.assertEqual(kwargs["timeout"], 300)
 
             unsafe_parent = SimpleNamespace(st_mode=stat.S_IFDIR | 0o777, st_uid=0)
@@ -247,6 +251,7 @@ class PartituraNativeHostTest(unittest.TestCase):
                 MODULE.NATIVE_HOST_PATH,
                 MODULE.INSTALL_HOST_PATH,
                 MODULE.HOST_SETUP_PATH,
+                MODULE.WRITER_PATH,
             )
             for relative in paths:
                 target = repository / relative
@@ -267,6 +272,7 @@ class PartituraNativeHostTest(unittest.TestCase):
                 partitura_repository=str(repository),
                 broker_commit=commit,
                 broker_sha256=MODULE.sha256_file(repository / MODULE.BROKER_PATH),
+                credential_writer_sha256=MODULE.sha256_file(repository / MODULE.WRITER_PATH),
                 guest_runner_sha256=MODULE.sha256_file(repository / MODULE.GUEST_RUNNER_PATH),
                 native_host_sha256=MODULE.sha256_file(repository / MODULE.NATIVE_HOST_PATH),
                 install_host_sha256=MODULE.sha256_file(repository / MODULE.INSTALL_HOST_PATH),
@@ -283,6 +289,7 @@ class PartituraNativeHostTest(unittest.TestCase):
                         qualifier.read_bytes(),
                         (repository / MODULE.NATIVE_HOST_PATH).read_bytes(),
                         (repository / MODULE.INSTALL_HOST_PATH).read_bytes(),
+                        (repository / MODULE.WRITER_PATH).read_bytes(),
                     ),
                 )
                 config["source"]["install_host_sha256"] = "f" * 64
@@ -377,6 +384,43 @@ class PartituraNativeHostTest(unittest.TestCase):
                         tart_inspector=lambda _: (hashlib.sha256(source_exec.read_bytes()).hexdigest(), mode),
                     )
 
+    def test_writer_migration_requires_exact_frozen_manifest_and_unchanged_payloads(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            root = Path(directory)
+            broker, writer = root / 'broker.py', root / 'credential-writer.py'
+            executable = root / 'tart.app/Contents/MacOS/tart'
+            executable.parent.mkdir(parents=True)
+            broker.write_bytes(b'old-broker')
+            broker.chmod(0o555)
+            executable.write_bytes(b'old-tart')
+            executable.chmod(0o755)
+            manifest = {'schema': 1, 'files': {
+                str(broker): {'sha256': MODULE.sha256_file(broker), 'mode': 0o555},
+                str(executable): {'sha256': MODULE.sha256_file(executable), 'mode': 0o755},
+            }}
+            manifest_path = root / 'managed-files.json'
+            manifest_path.write_text(json.dumps(manifest))
+            config = json.loads(json.dumps(self.settings))
+            config['predecessor_manifest_sha256'] = MODULE.sha256_file(manifest_path)
+            config['tart'].update(source_app=str(executable.parents[2]), installed_app=str(executable.parents[2]), sha256=MODULE.sha256_file(executable))
+            files = {broker: (b'new-broker', 0o555), writer: (b'new-writer', 0o555)}
+            original_lstat = Path.lstat
+            def root_owned(path):
+                metadata = original_lstat(path)
+                return SimpleNamespace(st_mode=metadata.st_mode, st_uid=0)
+            with patch.object(MODULE, 'read_managed_manifest', return_value=manifest), patch.object(MODULE, 'ROOT_WRITER', writer), patch.object(Path, 'lstat', autospec=True, side_effect=root_owned):
+                inspector = lambda _: (MODULE.sha256_file(executable), 0o755)
+                self.assertTrue(MODULE.check_existing_files(files, config, manifest_path=manifest_path, tart_inspector=inspector))
+                config['predecessor_manifest_sha256'] = 'f' * 64
+                with self.assertRaisesRegex(MODULE.NativeHostError, 'frozen predecessor'):
+                    MODULE.check_existing_files(files, config, manifest_path=manifest_path, tart_inspector=inspector)
+                config['predecessor_manifest_sha256'] = MODULE.sha256_file(manifest_path)
+                broker.chmod(0o755)
+                broker.write_bytes(b'changed-since-review')
+                broker.chmod(0o555)
+                with self.assertRaisesRegex(MODULE.NativeHostError, 'predecessor payload'):
+                    MODULE.check_existing_files(files, config, manifest_path=manifest_path, tart_inspector=inspector)
+
     def test_failed_update_restores_all_managed_files_and_retry_passes_preflight(self):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
 
@@ -423,10 +467,10 @@ class PartituraNativeHostTest(unittest.TestCase):
             broker_blob, runner_blob, qualifier_blob = b"new broker", b"new runner", b"new qualifier"
             with patch.object(MODULE, "ROOT_TART_APP", installed_app), patch.object(
                 MODULE, "ROOT_BROKER", native_root / "broker.py"
-            ), patch.object(MODULE, "ROOT_CONFIG", native_root / "config.json"), patch.object(
+            ), patch.object(MODULE, "ROOT_WRITER", native_root / "credential-writer.py"), patch.object(MODULE, "ROOT_CONFIG", native_root / "config.json"), patch.object(
                 MODULE, "ROOT_AUTHORIZED_KEYS", native_root / "authorized_keys"
             ), patch.object(MODULE, "ROOT_SSHD_DROPIN", dropin):
-                files = MODULE.expected_host_files(config, (broker_blob, runner_blob, qualifier_blob))
+                files = MODULE.expected_host_files(config, (broker_blob, runner_blob, qualifier_blob, b"launcher", b"installer", b"writer"))
                 expected_manifest = MODULE.expected_managed_manifest(files, config)
 
             for target, (payload, mode) in files.items():

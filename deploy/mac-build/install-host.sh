@@ -9,10 +9,10 @@ tart_previous=/Library/Partitura/NativeBuild/.tart.app.previous
 for path in /Library /Library/Partitura /Library/Partitura/NativeBuild /private/etc /private/etc/ssh /private/etc/ssh/sshd_config.d; do
   [ ! -L "$path" ] || { echo "refusing symlink path: $path" >&2; exit 1; }
 done
-for path in /Library/Partitura/NativeBuild/broker.py /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/config.json /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/tart.app /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
+for path in /Library/Partitura/NativeBuild/broker.py /Library/Partitura/NativeBuild/credential-writer.py /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/credential-writer.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/credential-writer.py.rollback /Library/Partitura/NativeBuild/config.json /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/tart.app /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
   [ ! -L "$path" ] || { echo "refusing symlink target: $path" >&2; exit 1; }
 done
-for path in /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
+for path in /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/credential-writer.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/credential-writer.py.rollback /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
   [ ! -e "$path" ] || { echo "refusing stale Tart transaction path: $path" >&2; exit 1; }
 done
 preflight="$(/usr/bin/mktemp -d /private/etc/ssh/.partitura-native-build.XXXXXX)"
@@ -30,6 +30,7 @@ cleanup() {
     if [ "$tart_old_moved" -eq 1 ]; then /bin/mv -f "$tart_previous" "$tart_target" || rollback_failed=1; fi
     if [ "$snapshot_ready" -eq 1 ]; then
       restore_managed_file broker /Library/Partitura/NativeBuild/broker.py || rollback_failed=1
+      restore_managed_file writer /Library/Partitura/NativeBuild/credential-writer.py || rollback_failed=1
       restore_managed_file config /Library/Partitura/NativeBuild/config.json || rollback_failed=1
       restore_managed_file authorized-keys /Library/Partitura/NativeBuild/authorized_keys || rollback_failed=1
       restore_managed_file dropin "$dropin" || rollback_failed=1
@@ -78,6 +79,7 @@ atomic_install() {
 }
 /bin/mkdir -m 0700 "$preflight/backups"
 backup_managed_file broker /Library/Partitura/NativeBuild/broker.py
+backup_managed_file writer /Library/Partitura/NativeBuild/credential-writer.py
 backup_managed_file config /Library/Partitura/NativeBuild/config.json
 backup_managed_file authorized-keys /Library/Partitura/NativeBuild/authorized_keys
 backup_managed_file dropin "$dropin"
@@ -128,6 +130,7 @@ fi
 /bin/mv "$tart_new" "$tart_target"
 tart_new_installed=1
 atomic_install "$stage/broker.py" 0555 /Library/Partitura/NativeBuild/broker.py
+atomic_install "$stage/credential-writer.py" 0555 /Library/Partitura/NativeBuild/credential-writer.py
 atomic_install "$stage/config.json" 0444 /Library/Partitura/NativeBuild/config.json
 atomic_install "$stage/authorized_keys" 0444 /Library/Partitura/NativeBuild/authorized_keys
 atomic_install "$stage/managed-files.json" 0444 /Library/Partitura/NativeBuild/managed-files.json

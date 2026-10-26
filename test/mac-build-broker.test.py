@@ -16,6 +16,9 @@ spec = importlib.util.spec_from_file_location('native_broker', SOURCE)
 broker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(broker)
 
+real_verify_vm_capacity = broker.verify_vm_capacity
+RealLoginKeychain = broker.LoginKeychain
+
 FAKE_TART = '''#!/usr/bin/python3
 import json, pathlib, shutil, sys, time
 root = pathlib.Path(__file__).parent
@@ -58,6 +61,13 @@ class BrokerTests(unittest.TestCase):
         for name in ('config.json', 'disk.img', 'nvram.bin'):
             (base / name).write_bytes(b'sealed input')
             (base / name).chmod(0o444)
+        self.keychain_patch = patch.object(broker, 'LoginKeychain')
+        self.keychain = self.keychain_patch.start().return_value
+        self.keychain.state.return_value = 'locked'
+        self.addCleanup(self.keychain_patch.stop)
+        self.capacity_patch = patch.object(broker, 'verify_vm_capacity')
+        self.capacity_patch.start()
+        self.addCleanup(self.capacity_patch.stop)
         self.job = 'a'*32
         self.request = ('run', self.job, 'd'*40, '12', 'archive', 6)
 
@@ -76,6 +86,90 @@ class BrokerTests(unittest.TestCase):
     def trace(self):
         return [json.loads(line) for line in (self.root / 'trace').read_text().splitlines()]
 
+    def test_capacity_inventory_counts_operator_and_other_frontends(self):
+        from types import SimpleNamespace
+        for inventory, accepted in ((b'/tools/tart\n/System/com.apple.Virtualization.VirtualMachine\n', True),
+                                    (b'/tools/tart\n/tools/tart\n', False),
+                                    (b'/System/com.apple.Virtualization.VirtualMachine\n' * 2, False),
+                                    (b'/tools/qemu-system-aarch64\n', False)):
+            with self.subTest(inventory=inventory), patch.object(broker.subprocess, 'run', return_value=SimpleNamespace(stdout=inventory)):
+                if accepted:
+                    real_verify_vm_capacity()
+                else:
+                    with self.assertRaises(ValueError):
+                        real_verify_vm_capacity()
+        with patch.object(broker.subprocess, 'run', side_effect=OSError('inventory unavailable')):
+            with self.assertRaises(OSError):
+                real_verify_vm_capacity()
+
+    def test_unlock_failure_never_clones_and_locks_before_releasing_fence(self):
+        def reject():
+            self.assertTrue((self.root / 'active-vm').exists())
+            self.assertEqual((self.root / self.job / 'source.bundle').read_bytes(), b'bundle')
+            raise broker.KeychainError('unlock:-25293')
+        self.keychain.unlock.side_effect = reject
+        code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['failureCode'], 'unlock-failed')
+        self.assertEqual(receipt['stage'], 'unlock')
+        self.keychain.lock.assert_called_once()
+        self.keychain.close.assert_called_once()
+        self.assertFalse((self.root / 'trace').exists())
+        self.assertFalse((self.root / 'active-vm').exists())
+        self.assertEqual(json.loads((self.root / self.job / 'keychain.json').read_text()), {'preUnlockState': 'locked'})
+
+    def test_capacity_failure_precedes_keychain_access_and_clone(self):
+        with patch.object(broker, 'verify_vm_capacity', side_effect=ValueError('capacity')):
+            code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['failureCode'], 'host-capacity-unavailable')
+        self.keychain.unlock.assert_not_called()
+        self.assertFalse((self.root / 'trace').exists())
+        self.assertFalse((self.root / 'active-vm').exists())
+
+    def test_keychain_lock_failure_fences_future_jobs(self):
+        self.keychain.unlock.side_effect = broker.KeychainError('unlock:-25293')
+        self.keychain.lock.side_effect = broker.KeychainError('lock:-1')
+        code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['failureCode'], 'cleanup-required')
+        self.assertTrue((self.root / 'active-vm').exists())
+        self.assertTrue((self.root / 'cleanup-required').exists())
+        with self.assertRaisesRegex(ValueError, 'cleanup'):
+            self.invoke()
+
+    def test_crash_recovery_locks_without_reading_credential_and_keeps_fence_on_error(self):
+        (self.root / 'active-vm').write_text(self.job + '\n')
+        self.keychain.lock.side_effect = broker.KeychainError('lock:-1')
+        with self.assertRaises(broker.KeychainError):
+            broker.cancel_job(self.config, self.job)
+        self.assertTrue((self.root / 'active-vm').exists())
+        self.keychain.unlock.assert_not_called()
+        self.keychain.close.assert_called_once()
+
+    def test_explicit_credential_read_refuses_missing_links_modes_and_wrong_password(self):
+        credential = self.root / 'credential'
+        # Instantiate without loading Apple's framework on the Linux test host.
+        chain = RealLoginKeychain.__new__(RealLoginKeychain)
+        chain.config = {'keychainCredentialPath': str(credential)}
+        chain.ref = None
+        from unittest.mock import Mock
+        chain.security = Mock()
+        chain.security.SecKeychainUnlock.return_value = -25293
+        with self.assertRaises(FileNotFoundError):
+            chain.unlock()
+        credential.write_bytes(b'private-fixture-password')
+        credential.chmod(0o644)
+        with self.assertRaisesRegex(broker.KeychainError, 'metadata'):
+            chain.unlock()
+        credential.chmod(0o600)
+        with self.assertRaisesRegex(broker.KeychainError, 'unlock:-25293'):
+            chain.unlock()
+        credential.rename(self.root / 'original')
+        credential.symlink_to(self.root / 'original')
+        with self.assertRaises(OSError):
+            chain.unlock()
+
     def test_secret_prefix_is_bounded_and_kept_out_of_named_host_state(self):
         secret = b'{"repository-age-identity":"fixture-job-identity"}'
         request = (*self.request, len(secret))
@@ -89,7 +183,7 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual((self.root / 'received').read_bytes(), secret + b'bundle')
         self.assertNotIn('fixture-job-identity', json.dumps(receipt))
         self.assertNotIn('fixture-job-identity', (self.root / 'trace').read_text())
-        self.assertEqual(sorted(p.name for p in (self.root / self.job).iterdir()), ['artifacts.tar', 'receipt.json'])
+        self.assertEqual(sorted(p.name for p in (self.root / self.job).iterdir()), ['artifacts.tar', 'keychain.json', 'receipt.json'])
 
     def test_secret_path_injection_is_rejected_before_creating_a_vm(self):
         secret = b'{"../escape":"fixture-job-identity"}'

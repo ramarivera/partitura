@@ -12,7 +12,8 @@
     "native_host_sha256": "REVIEWED_NATIVE_HOST_LAUNCHER_SHA256",
     "install_host_sha256": "REVIEWED_INSTALLER_SHA256",
     "qualifier_source": "/Users/operator/dev/partitura/deploy/mac-build/qualify-base.sh",
-    "qualifier_sha256": "REVIEWED_QUALIFIER_SHA256"
+    "qualifier_sha256": "REVIEWED_QUALIFIER_SHA256",
+    "credential_writer_sha256": "REVIEWED_CREDENTIAL_WRITER_SHA256"
   },
   "tart": {
     "source_app": "/Users/operator/dev/agentic-scratchpads/partitura/host-inputs/tart.app",
@@ -37,5 +38,6 @@
   "runtime": {
     "root": "/Users/partitura-build/dev/agentic-scratchpads/partitura/native-build",
     "tart_home": "/Volumes/Builds/partitura/tart"
-  }
+  },
+  "predecessor_manifest_sha256": ""
 }

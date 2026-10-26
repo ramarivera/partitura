@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import fcntl
+import ctypes as C
 import hashlib
 import io
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import select
@@ -60,8 +62,9 @@ def sealed(path):
 
 def load_config():
     config = json.loads(sealed(CONFIG).read_text())
-    if set(config) != {'tart', 'tartSha256', 'base', 'root', 'tartHome', 'guestRunnerSha256', 'qualifierSha256', 'guestUser', 'guestHome'}:
+    if set(config) != {'tart', 'tartSha256', 'base', 'root', 'tartHome', 'guestRunnerSha256', 'qualifierSha256', 'guestUser', 'guestHome', 'keychainPath', 'keychainCredentialPath'}:
         raise ValueError('invalid installed configuration')
+    validate_keychain_paths(config)
     tart = sealed(config['tart'])
     if hashlib.sha256(tart.read_bytes()).hexdigest() != config['tartSha256']:
         raise ValueError('installed Tart digest differs')
@@ -80,6 +83,103 @@ def load_config():
         if not path.is_absolute() or path.resolve() != path or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError('unsafe private runtime directory')
     return config
+
+
+def validate_keychain_paths(config):
+    account = pwd.getpwuid(os.getuid())
+    home = Path(account.pw_dir)
+    if account.pw_name == 'root' or home != Path('/Users') / account.pw_name:
+        raise ValueError('keychain requires the dedicated host account')
+    info = home.lstat()
+    if home.resolve() != home or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError('unsafe dedicated account home')
+    if config['keychainPath'] != str(home / 'Library/Keychains/login.keychain-db') or config['keychainCredentialPath'] != str(home / '.partitura-native-login.password'):
+        raise ValueError('keychain paths differ from the dedicated account')
+
+
+class KeychainError(Exception):
+    """Contains fixed API stages and numeric status only, never credentials."""
+
+
+class LoginKeychain:
+    def __init__(self, config):
+        validate_keychain_paths(config)
+        self.config = config
+        self.ref = C.c_void_p()
+        self.security = C.CDLL('/System/Library/Frameworks/Security.framework/Security')
+        self.core = C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+        self.core.CFRelease.argtypes = [C.c_void_p]
+        self.core.CFRelease.restype = None
+        for name, arguments in {
+            'SecKeychainSetUserInteractionAllowed': [C.c_ubyte],
+            'SecKeychainOpen': [C.c_char_p, C.POINTER(C.c_void_p)],
+            'SecKeychainGetStatus': [C.c_void_p, C.POINTER(C.c_uint32)],
+            'SecKeychainUnlock': [C.c_void_p, C.c_uint32, C.c_void_p, C.c_ubyte],
+            'SecKeychainLock': [C.c_void_p],
+        }.items():
+            function = getattr(self.security, name)
+            function.argtypes = arguments
+            function.restype = C.c_int32
+        try:
+            self.check(self.security.SecKeychainSetUserInteractionAllowed(0), 'interaction')
+            self.check(self.security.SecKeychainOpen(os.fsencode(config['keychainPath']), C.byref(self.ref)), 'open')
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def check(status, stage):
+        if status:
+            raise KeychainError(stage + ':' + str(status))
+
+    def state(self):
+        status = C.c_uint32()
+        self.check(self.security.SecKeychainGetStatus(self.ref, C.byref(status)), 'status')
+        return 'unlocked' if status.value & 1 else 'locked'
+
+    def unlock(self):
+        descriptor = os.open(self.config['keychainCredentialPath'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or not 1 <= info.st_size <= 1024:
+                raise KeychainError('credential-metadata')
+            password = source.read(1025)
+        if not 1 <= len(password) <= 1024 or b'\0' in password or b'\n' in password or b'\r' in password:
+            raise KeychainError('credential-length')
+        buffer = C.create_string_buffer(password)
+        del password
+        try:
+            self.check(self.security.SecKeychainUnlock(self.ref, len(buffer) - 1, buffer, 1), 'unlock')
+        finally:
+            C.memset(buffer, 0, len(buffer))
+        if self.state() != 'unlocked':
+            raise KeychainError('unlock-state')
+
+    def lock(self):
+        self.check(self.security.SecKeychainLock(self.ref), 'lock')
+        if self.state() != 'locked':
+            raise KeychainError('lock-state')
+
+    def close(self):
+        if self.ref:
+            self.core.CFRelease(self.ref)
+            self.ref = C.c_void_p()
+
+
+def verify_vm_capacity():
+    # Count Tart processes across UIDs, including the operator's VM. Counting
+    # non-run Tart commands too is conservative. Never stop an unrelated VM.
+    result = subprocess.run(['/bin/ps', '-axo', 'comm='], check=True, capture_output=True, timeout=10)
+    if len(result.stdout) > 2 * 1024 * 1024:
+        raise ValueError('VM inventory is too large')
+    names = [Path(os.fsdecode(line.strip())).name.lower() for line in result.stdout.splitlines()]
+    # Virtualization.framework also catches guests owned by another frontend.
+    # An unfamiliar hypervisor cannot establish available macOS capacity.
+    if any(name.startswith(('qemu-system', 'prl_vm_app', 'vmware-vmx')) for name in names):
+        raise ValueError('unqualified host VM inventory')
+    running = max(names.count('tart'), names.count('com.apple.virtualization.virtualmachine'))
+    if running > 1:
+        raise ValueError('host VM capacity is unavailable')
 
 
 def receive(source, destination, length, seconds=600):
@@ -252,7 +352,7 @@ def prune_artifacts(root, now=None):
 
 
 def environment_for(config):
-    return {'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'TART_HOME': config['tartHome'], 'TART_NO_AUTO_PRUNE': '1'}
+    return {'HOME': pwd.getpwuid(os.getuid()).pw_dir, 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'TART_HOME': config['tartHome'], 'TART_NO_AUTO_PRUNE': '1'}
 
 
 def destroy_vm(config, job):
@@ -292,7 +392,14 @@ def cancel_job(config, job):
             return
         active = root / 'active-vm'
         if active.exists() and active.read_text().strip() == job:
-            destroy_vm(config, job)
+            try:
+                destroy_vm(config, job)
+            finally:
+                keychain = LoginKeychain(config)
+                try:
+                    keychain.lock()
+                finally:
+                    keychain.close()
             active.unlink()
             (root / 'cleanup-required').unlink(missing_ok=True)
             directory = root / job
@@ -353,6 +460,9 @@ def run_job(config, request):
         clone_attempted = False
         failure = None
         cleanup_failed = False
+        keychain = None
+        keychain_attempted = False
+        keychain_state = None
         finished = threading.Event()
         def watch_cancellation():
             while not finished.wait(1):
@@ -365,6 +475,16 @@ def run_job(config, request):
             # Persist before a clone can exist. SIGKILL or power loss leaves this
             # fence, so another SSH request cannot start a second VM.
             durable_write(active, job + '\n')
+            stage = 'capacity'
+            verify_vm_capacity()
+            stage = 'unlock'
+            keychain_attempted = True
+            keychain = LoginKeychain(config)
+            keychain_state = keychain.state()
+            # Private host evidence only, never projected through the gateway.
+            durable_write(directory / 'keychain.json', json.dumps({'preUnlockState': keychain_state}) + '\n')
+            keychain.unlock()
+            stage = 'clone'
             clone_attempted = True
             owned([tart, 'clone', config['base'], vm], environment, 180, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             prepare_clone(config, vm)
@@ -411,21 +531,37 @@ def run_job(config, request):
         except BaseException as error:
             failure = error
             receipt = dict(job=job, commit=commit, action=action, state='failed', cause=type(error).__name__, stage=stage)
+            if stage in ('unlock', 'capacity'):
+                receipt['failureCode'] = 'unlock-failed' if stage == 'unlock' else 'host-capacity-unavailable'
             if stage == 'boot' and boot is not None and boot.poll() is not None:
                 receipt['bootExitCode'] = boot.returncode
         finally:
             ignore_shutdown_signals()
             finished.set()
             watcher.join(timeout=2)
-            stop(boot)
+            try:
+                stop(boot)
+            except Exception:
+                cleanup_failed = True
             if boot_logger is not None:
                 boot_logger.join(timeout=2)
             if clone_attempted:
                 try:
                     destroy_vm(config, job)
-                    active.unlink(missing_ok=True)
                 except Exception:
                     cleanup_failed = True
+            if keychain_attempted:
+                try:
+                    if keychain is None:
+                        keychain = LoginKeychain(config)
+                    keychain.lock()
+                except Exception:
+                    cleanup_failed = True
+                finally:
+                    if keychain is not None:
+                        keychain.close()
+            if not cleanup_failed:
+                active.unlink(missing_ok=True)
             if cleanup_failed:
                 (root / 'cleanup-required').write_text(vm + '\n')
                 receipt.update(state='failed', cause='cleanup-required')
