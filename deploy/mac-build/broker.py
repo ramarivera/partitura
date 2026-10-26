@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import threading
 import tempfile
 import time
@@ -24,6 +25,7 @@ CONFIG = Path('/Library/Partitura/NativeBuild/config.json')
 MAX_BUNDLE = 1024 * 1024 * 1024
 MAX_ARTIFACT = 2 * MAX_BUNDLE
 MAX_BOOT_LOG = 65536
+MAX_WORKFLOW_LOG = 1024 * 1024
 ARTIFACT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 ARTIFACT_STORAGE_LIMIT = 8 * MAX_BUNDLE
 JOB = r'[a-f0-9]{32}'
@@ -251,14 +253,22 @@ def diagnostic_receipt(directory, receipt):
     return result
 
 
-def owned(arguments, environment, timeout, **kwargs):
+def owned(arguments, environment, timeout, stderr_log=None, **kwargs):
+    if stderr_log is not None:
+        kwargs['stderr'] = subprocess.PIPE
     child = subprocess.Popen(arguments, env=environment, start_new_session=True, **kwargs)
+    drain = None
+    if stderr_log is not None:
+        drain = threading.Thread(target=capture_boot_log, args=(child.stderr, stderr_log), daemon=True)
+        drain.start()
     try:
         code = child.wait(timeout=timeout)
         if code:
             raise subprocess.CalledProcessError(code, arguments)
     finally:
         stop(child)
+        if drain is not None:
+            drain.join(timeout=2)
 
 
 def prepare_clone(config, vm):
@@ -280,7 +290,7 @@ def prepare_clone(config, vm):
             os.close(descriptor)
 
 
-def bounded_output(arguments, environment, destination, timeout):
+def bounded_output(arguments, environment, destination, timeout, limit=MAX_ARTIFACT):
     child = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
     size = 0
     deadline = time.monotonic() + timeout
@@ -294,7 +304,7 @@ def bounded_output(arguments, environment, destination, timeout):
                 if not chunk:
                     break
                 size += len(chunk)
-                if size > MAX_ARTIFACT:
+                if size > limit:
                     raise ValueError('artifact exceeds limit')
                 output.write(chunk)
         if child.wait(timeout=max(1, deadline - time.monotonic())):
@@ -303,6 +313,54 @@ def bounded_output(arguments, environment, destination, timeout):
         stop(child)
         child.stdout.close()
     return size
+
+
+def delivers_artifact(receipt):
+    """Successful archives, or the repository's own logs from a failed workflow."""
+    return receipt.get('state') == 'succeeded' or (
+        receipt.get('state') == 'failed'
+        and receipt.get('failureCode') == 'workflow-failed'
+        and 'artifactSha256' in receipt
+    )
+
+
+def package_workflow_logs(config, environment, vm, job, directory):
+    """Archive repository-controlled output from a failed workflow.
+
+    The caller writes .partitura/native-build.sh, so its build log and the guest
+    runner's stderr (relayed by tart exec) expose nothing the caller could not
+    print itself. Keychain and boot diagnostics stay private.
+    """
+    members = []
+    runner = directory / 'runner.log'
+    if runner.exists() and runner.stat().st_size:
+        members.append(('runner.log', runner))
+    build = directory / 'build.log'
+    try:
+        guest_log = config['guestHome'] + '/dev/agentic-scratchpads/partitura/' + job + '/build.log'
+        bounded_output([config['tart'], 'exec', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/tail', '-c', str(MAX_WORKFLOW_LOG), guest_log], environment, build, 60, MAX_WORKFLOW_LOG)
+        members.append(('build.log', build))
+    except Exception:
+        build.unlink(missing_ok=True)  # The runner can fail before the repository step.
+    if not members:
+        return None
+    archive = directory / 'artifacts.tar'
+    try:
+        with tarfile.open(archive, 'x', format=tarfile.PAX_FORMAT) as output:
+            for name, path in members:
+                info = tarfile.TarInfo(name)
+                info.size = path.stat().st_size
+                info.mode = 0o600
+                with path.open('rb') as source:
+                    output.addfile(info, source)
+    finally:
+        runner.unlink(missing_ok=True)
+        build.unlink(missing_ok=True)
+    digest = hashlib.sha256()
+    with archive.open('rb') as source:
+        for block in iter(lambda: source.read(65536), b''):
+            digest.update(block)
+    return dict(artifactBytes=archive.stat().st_size, artifactSha256=digest.hexdigest())
 
 
 def durable_write(path, text):
@@ -343,7 +401,7 @@ def prune_artifacts(root, now=None):
         candidates.append((info.st_mtime, artifact, info.st_size, receipt))
     retained = 0
     for modified, artifact, size, receipt in sorted(candidates, key=lambda item: item[0], reverse=True):
-        if modified < cutoff or receipt['state'] != 'succeeded' or retained + size > ARTIFACT_STORAGE_LIMIT - MAX_ARTIFACT:
+        if modified < cutoff or not delivers_artifact(receipt) or retained + size > ARTIFACT_STORAGE_LIMIT - MAX_ARTIFACT:
             artifact.unlink()
             receipt['artifactExpired'] = True
             record(artifact.parent, **receipt)
@@ -458,6 +516,7 @@ def run_job(config, request):
         boot_logger = None
         stage = 'clone'
         clone_attempted = False
+        workflow_logs = None
         failure = None
         cleanup_failed = False
         keychain = None
@@ -520,7 +579,15 @@ def run_job(config, request):
                 arguments = [tart, 'exec', '-i', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/env', '-i', 'HOME=' + config['guestHome'], 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', '/bin/bash', '/Library/Partitura/NativeBuild/run.sh', job, commit, pr, action, config['guestRunnerSha256'], config['qualifierSha256']]
                 if secret_length:
                     arguments.append(str(secret_length))
-                owned(arguments, environment, 2700, stdin=transport, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    owned(arguments, environment, 2700, stderr_log=directory / 'runner.log', stdin=transport, stdout=subprocess.DEVNULL)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    # Collect while the guest still exists; never mask the failure.
+                    try:
+                        workflow_logs = package_workflow_logs(config, environment, vm, job, directory)
+                    except Exception:
+                        (directory / 'artifacts.tar').unlink(missing_ok=True)
+                    raise
             stage = 'artifact'
             size = bounded_output([tart, 'exec', vm, '/usr/bin/sudo', '-n', '-u', config['guestUser'], '/usr/bin/tar', '-C', config['guestHome'] + '/dev/agentic-scratchpads/partitura/' + job, '-cf', '-', 'artifacts'], environment, directory / 'artifacts.tar', 180)
             digest = hashlib.sha256()
@@ -535,6 +602,12 @@ def run_job(config, request):
                 receipt['failureCode'] = 'unlock-failed' if stage == 'unlock' else 'host-capacity-unavailable'
             if stage == 'boot' and boot is not None and boot.poll() is not None:
                 receipt['bootExitCode'] = boot.returncode
+            if stage == 'workflow' and isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+                receipt['failureCode'] = 'workflow-failed'
+                if isinstance(error, subprocess.CalledProcessError):
+                    receipt['workflowExitCode'] = max(-255, min(255, error.returncode))
+                if workflow_logs is not None:
+                    receipt.update(workflow_logs)
         finally:
             ignore_shutdown_signals()
             finished.set()
@@ -565,10 +638,13 @@ def run_job(config, request):
             if cleanup_failed:
                 (root / 'cleanup-required').write_text(vm + '\n')
                 receipt.update(state='failed', cause='cleanup-required')
-            if receipt['state'] != 'succeeded':
+                for field in ('failureCode', 'artifactBytes', 'artifactSha256'):
+                    receipt.pop(field, None)
+            if not delivers_artifact(receipt):
                 (directory / 'artifacts.tar').unlink(missing_ok=True)
             if receipt['state'] == 'succeeded':
                 (directory / 'boot.log').unlink(missing_ok=True)
+            (directory / 'runner.log').unlink(missing_ok=True)
             receipt = diagnostic_receipt(directory, receipt)
             record(directory, **receipt)
             bundle.unlink(missing_ok=True)
@@ -592,8 +668,8 @@ def main():
     if request[0] == 'status':
         print(json.dumps(diagnostic_receipt(directory, receipt)))
     else:
-        if receipt['state'] != 'succeeded':
-            raise ValueError('no successful artifact')
+        if not delivers_artifact(receipt):
+            raise ValueError('no deliverable artifact')
         # Opaque archive bytes only. No caller path and no host extraction.
         with (directory / 'artifacts.tar').open('rb') as artifact:
             for block in iter(lambda: artifact.read(65536), b''):

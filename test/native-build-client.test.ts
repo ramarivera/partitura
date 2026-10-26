@@ -44,7 +44,9 @@ if(command[0]==="run") {
   if(git("-C",checkout,"rev-parse","HEAD")!==command[2])process.exit(4);
  }
  const payload="${payload}";
- const receipt={job:command[1],commit:command[2],action:command[4],state:"succeeded",artifactSha256:createHash("sha256").update(payload).digest("hex"),artifactBytes:payload.length,...(config.receiptOverrides??{})};
+ const artifact={artifactSha256:createHash("sha256").update(payload).digest("hex"),artifactBytes:payload.length};
+ const failed=config.receiptOverrides?.state==="failed";
+ const receipt={job:command[1],commit:command[2],action:command[4],state:"succeeded",...(failed&&!config.failedArtifact?{}:artifact),...(config.receiptOverrides??{})};
  let serialized=JSON.stringify(receipt);
  if(config.rawArtifactBytes!==undefined)serialized=serialized.replace(/"artifactBytes":[^,}]+/, '"artifactBytes":'+config.rawArtifactBytes);
  console.log(serialized);
@@ -596,7 +598,7 @@ for (const [stage, failureCode] of [
           failureCode,
         });
         await expect(client.artifact("session-a", job.job)).rejects.toThrow(
-          "no successful artifact",
+          "no deliverable artifact",
         );
       } finally {
         await client.close();
@@ -604,6 +606,52 @@ for (const [stage, failureCode] of [
     }),
   );
 }
+
+it.live("delivers repository logs from a failed workflow", () =>
+  Effect.promise(async () => {
+    const fixture = await setup();
+    await writeFile(
+      fixture.configFile,
+      JSON.stringify({
+        trace: fixture.trace,
+        exitCode: 1,
+        failedArtifact: true,
+        receiptOverrides: {
+          state: "failed",
+          stage: "workflow",
+          cause: "CalledProcessError",
+          failureCode: "workflow-failed",
+          workflowExitCode: 3,
+        },
+      }),
+    );
+    const client = await createNativeBuildClient(fixture.config);
+    try {
+      const job = await client.start({
+        sessionId: "session-a",
+        workspacePath: fixture.workspace,
+        commit: fixture.commit,
+        pullRequest: 12,
+        action: "archive",
+      });
+      expect(await settled(client, job.job)).toMatchObject({
+        state: "failed",
+        stage: "workflow",
+        failureCode: "workflow-failed",
+        workflowExitCode: 3,
+        artifactBytes: payload.length,
+      });
+      const artifact = await client.artifact("session-a", job.job);
+      try {
+        expect(await readFile(artifact.path, "utf8")).toBe(payload);
+      } finally {
+        artifact.release();
+      }
+    } finally {
+      await client.close();
+    }
+  }),
+);
 
 it.live("preserves only validated failed-job diagnostics across restart", () =>
   Effect.promise(async () => {
@@ -641,7 +689,7 @@ it.live("preserves only validated failed-job diagnostics across restart", () =>
     try {
       expect(await settled(client, job.job)).toEqual(expected);
       await expect(client.artifact("session-a", job.job)).rejects.toThrow(
-        "no successful artifact",
+        "no deliverable artifact",
       );
     } finally {
       await client.close();
@@ -674,6 +722,21 @@ it.live("rejects foreign, untrusted and transport failure diagnostics", () =>
       { receiptOverrides: { bootExitCode: 1.5 } },
       { receiptOverrides: { stage: "workflow" } },
       { receiptOverrides: { state: "succeeded" } },
+      { receiptOverrides: { failureCode: "workflow-failed" } },
+      { receiptOverrides: { workflowExitCode: 1 } },
+      {
+        receiptOverrides: {
+          stage: "workflow",
+          failureCode: "workflow-failed",
+          workflowExitCode: 256,
+        },
+      },
+      {
+        receiptOverrides: {
+          artifactSha256: "a".repeat(64),
+          artifactBytes: 1,
+        },
+      },
     ].entries()) {
       const fixture = await setup(`invalid-failure-${index}`);
       await writeFile(

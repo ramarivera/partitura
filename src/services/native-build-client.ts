@@ -41,6 +41,7 @@ const FailureFields = {
       "cleanup-required",
       "unlock-failed",
       "host-capacity-unavailable",
+      "workflow-failed",
     ]),
   ),
   stage: Schema.optionalKey(
@@ -60,9 +61,30 @@ const FailureFields = {
       Schema.isLessThanOrEqualTo(255),
     ),
   ),
+  workflowExitCode: Schema.optionalKey(
+    Schema.Number.check(
+      Schema.isInt(),
+      Schema.isGreaterThanOrEqualTo(-255),
+      Schema.isLessThanOrEqualTo(255),
+    ),
+  ),
 };
+const ArtifactFields = {
+  artifactSha256: Schema.optionalKey(
+    Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+  ),
+  artifactBytes: Schema.optionalKey(
+    Schema.Number.check(
+      Schema.isInt(),
+      Schema.isGreaterThanOrEqualTo(0),
+      Schema.isLessThanOrEqualTo(2147483648),
+    ),
+  ),
+};
+// A failed workflow may carry the repository's own logs as its artifact.
 const FailedReceiptSchema = Schema.Struct({
   ...FailureFields,
+  ...ArtifactFields,
   state: Schema.Literal("failed"),
 });
 const JobSchema = Schema.Struct({
@@ -78,16 +100,7 @@ const JobSchema = Schema.Struct({
     "failed",
     "interrupted",
   ]),
-  artifactSha256: Schema.optionalKey(
-    Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
-  ),
-  artifactBytes: Schema.optionalKey(
-    Schema.Number.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(0),
-      Schema.isLessThanOrEqualTo(2147483648),
-    ),
-  ),
+  ...ArtifactFields,
 });
 type Job = {
   -readonly [K in keyof typeof JobSchema.Type]: (typeof JobSchema.Type)[K];
@@ -520,7 +533,17 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
                 failure.stage !== "unlock") ||
               (failure.failureCode === "host-capacity-unavailable" &&
                 failure.stage !== "capacity") ||
-              (failure.bootExitCode !== undefined && failure.stage !== "boot")
+              (failure.bootExitCode !== undefined &&
+                failure.stage !== "boot") ||
+              (failure.failureCode === "workflow-failed" &&
+                failure.stage !== "workflow") ||
+              (failure.workflowExitCode !== undefined &&
+                failure.failureCode !== "workflow-failed") ||
+              ((failure.artifactSha256 !== undefined ||
+                failure.artifactBytes !== undefined) &&
+                (failure.failureCode !== "workflow-failed" ||
+                  failure.artifactSha256 === undefined ||
+                  failure.artifactBytes === undefined))
             )
               throw new Error("Inconsistent native build failure diagnostic");
             Object.assign(job, failure);
@@ -567,8 +590,12 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     artifact: async (sessionId: string, jobId: string) => {
       if (retiringJobs.has(jobId)) await pruneTerminalJobs();
       const job = ownedJob(sessionId, jobId);
-      if (job.state !== "succeeded")
-        throw new Error("Native build has no successful artifact");
+      const workflowLogs =
+        job.state === "failed" &&
+        job.failureCode === "workflow-failed" &&
+        job.artifactSha256 !== undefined;
+      if (job.state !== "succeeded" && !workflowLogs)
+        throw new Error("Native build has no deliverable artifact");
       const path = join(config.scratchRoot, `${job.job}.tar`);
       const otherConsumers = artifactLeases.get(job.job) ?? 0;
       const release = retainArtifact(job.job);

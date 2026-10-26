@@ -2014,7 +2014,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   name: "native_build_artifact",
                   label: "Native build: deliver artifact",
                   description:
-                    "Copy a verified native build archive into this session workspace.",
+                    "Copy a verified native build archive into this session workspace. After a workflow-failed job, the archive holds the repository build log (build.log, last 1 MiB) and guest runner stderr (runner.log).",
                   parameters: {
                     type: "object",
                     additionalProperties: false,

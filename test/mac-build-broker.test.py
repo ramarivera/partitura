@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import tarfile
 import time
 import tempfile
 import unittest
@@ -33,7 +34,7 @@ if args[0]=='run' and scenario in ('boot-failure', 'host-key-failure'):
 if args[0]=='run':
     if any(not (root/'vms'/args[1]/name).stat().st_mode & 0o200 for name in ['config.json','disk.img','nvram.bin']): sys.exit(1)
     time.sleep(120)
-if args[0]=='delete' and scenario=='cleanup-failure': sys.exit(1)
+if args[0]=='delete' and scenario in ('cleanup-failure', 'build-cleanup-failure'): sys.exit(1)
 if args[0]=='delete':
     target=root/'vms'/args[1]
     if not target.exists(): sys.exit(1)
@@ -42,7 +43,12 @@ if args[0]=='exec' and scenario in ('boot-failure', 'host-key-failure'):  sys.ex
 if args[0]=='exec' and '-i' in args:
     data=sys.stdin.buffer.read()
     (root/'received').write_bytes(data)
-    if scenario=='build-failure': sys.exit(1)
+    if scenario.startswith('build-'):
+        print('fixture guest runner refusal', file=sys.stderr)
+        sys.exit(3)
+if args[0]=='exec' and '/usr/bin/tail' in args:
+    if scenario=='build-no-log': sys.exit(1)
+    sys.stdout.buffer.write(b'fixture repository build log')
 if args[0]=='exec' and '/usr/bin/tar' in args: sys.stdout.buffer.write(b'opaque-guest-artifact')
 '''
 
@@ -300,6 +306,60 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(receipt['state'], 'failed')
         self.assertIn(['delete', 'partitura-job-'+self.job], self.trace())
         self.assertFalse(any('/usr/bin/tar' in args for args in self.trace()))
+
+    def archive_members(self):
+        with tarfile.open(self.root / self.job / 'artifacts.tar') as archive:
+            return {member.name: archive.extractfile(member).read() for member in archive.getmembers()}
+
+    def test_failed_workflow_returns_repository_logs_and_exit_code(self):
+        (self.root / 'scenario').write_text('build-failure')
+        code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual((receipt['state'], receipt['stage'], receipt['failureCode']), ('failed', 'workflow', 'workflow-failed'))
+        self.assertEqual(receipt['workflowExitCode'], 3)
+        tail = next(args for args in self.trace() if '/usr/bin/tail' in args)
+        self.assertEqual(tail[-1], '/Users/partitura/dev/agentic-scratchpads/partitura/' + self.job + '/build.log')
+        self.assertEqual(tail[tail.index('-c') + 1], str(broker.MAX_WORKFLOW_LOG))
+        self.assertLess(self.trace().index(tail), self.trace().index(['delete', 'partitura-job-'+self.job]))
+        self.assertEqual(self.archive_members(), {
+            'runner.log': b'fixture guest runner refusal\n',
+            'build.log': b'fixture repository build log',
+        })
+        self.assertEqual(receipt['artifactBytes'], (self.root / self.job / 'artifacts.tar').stat().st_size)
+        self.assertFalse((self.root / self.job / 'runner.log').exists())
+        self.assertFalse((self.root / self.job / 'build.log').exists())
+        output = io.BytesIO()
+        stdout = type('Output', (), {'buffer': output})()
+        with patch.object(broker, 'load_config', return_value=self.config), patch.dict(os.environ, SSH_ORIGINAL_COMMAND='artifact ' + self.job), patch.object(broker.sys, 'stdout', stdout):
+            self.assertEqual(broker.main(), 0)
+        self.assertEqual(output.getvalue(), (self.root / self.job / 'artifacts.tar').read_bytes())
+
+    def test_failure_before_repository_step_returns_runner_log_only(self):
+        (self.root / 'scenario').write_text('build-no-log')
+        code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['failureCode'], 'workflow-failed')
+        self.assertEqual(self.archive_members(), {'runner.log': b'fixture guest runner refusal\n'})
+
+    def test_workflow_logs_survive_the_next_job_but_other_failures_do_not(self):
+        (self.root / 'scenario').write_text('build-failure')
+        self.invoke()
+        logs = self.root / self.job / 'artifacts.tar'
+        other = self.retained_artifact('1'*32, 'failed', 3, 1)
+        (self.root / 'scenario').write_text('success')
+        self.job = 'b'*32
+        self.request = ('run', self.job, 'd'*40, '12', 'archive', 6)
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertTrue(logs.exists())
+        self.assertFalse(other.exists())
+
+    def test_cleanup_failure_withdraws_workflow_logs(self):
+        (self.root / 'scenario').write_text('build-cleanup-failure')
+        code, receipt = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['failureCode'], 'cleanup-required')
+        self.assertNotIn('artifactSha256', receipt)
+        self.assertFalse((self.root / self.job / 'artifacts.tar').exists())
 
     def retained_artifact(self, job, state, size, modified):
         directory = self.root / job
