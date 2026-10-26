@@ -358,6 +358,7 @@ class BrokerTests(unittest.TestCase):
         code, receipt = self.invoke()
         self.assertEqual(code, 1)
         self.assertEqual(receipt['failureCode'], 'cleanup-required')
+        self.assertNotIn('workflowExitCode', receipt)
         self.assertNotIn('artifactSha256', receipt)
         self.assertFalse((self.root / self.job / 'artifacts.tar').exists())
 

@@ -638,7 +638,7 @@ def run_job(config, request):
             if cleanup_failed:
                 (root / 'cleanup-required').write_text(vm + '\n')
                 receipt.update(state='failed', cause='cleanup-required')
-                for field in ('failureCode', 'artifactBytes', 'artifactSha256'):
+                for field in ('failureCode', 'workflowExitCode', 'artifactBytes', 'artifactSha256'):
                     receipt.pop(field, None)
             if not delivers_artifact(receipt):
                 (directory / 'artifacts.tar').unlink(missing_ok=True)
