@@ -1,4 +1,4 @@
-import { Effect, Exit, Fiber, Scope, Semaphore } from "effect";
+import { Deferred, Effect, Exit, Fiber, Scope, Semaphore } from "effect";
 import type {
   BuilderIdentityResult,
   BuilderRegistryIdentity,
@@ -41,6 +41,7 @@ interface Preparation {
   readonly current: Current;
 }
 interface Work {
+  readonly trigger: "startup" | "registry";
   readonly ticket: number;
   readonly entry: BuilderEntry;
   readonly credential?: BuilderCredential;
@@ -53,11 +54,15 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     provider: Provider,
     identity: Identity,
     now: () => number = Date.now,
+    supersede: (
+      ids: readonly string[],
+    ) => Effect.Effect<void, BuilderRegistryError> = () => Effect.void,
   ) {
     const scope = yield* Scope.Scope;
     const gate = yield* Semaphore.make(1);
     const entries = new Map<string, Current>();
     const pending = new Map<string, Work>();
+    const cancellations = new Map<string, Deferred.Deferred<void>>();
     const workers = new Map<string, Fiber.Fiber<void>>();
     const preparations = new Map<BuilderAdmission, Preparation>();
     const leases = new Map<string, Scope.Closeable>();
@@ -68,8 +73,13 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     let error: string | undefined,
       stale = false;
     const failures = new Map<string, unknown>();
-    const enqueue = (current: Current, read: boolean) => {
+    const enqueue = (
+      current: Current,
+      read: boolean,
+      trigger: "startup" | "registry" = "registry",
+    ) => {
       pending.set(current.entry.id, {
+        trigger,
         ticket: current.ticket,
         entry: current.entry,
         ...(!read && current.credential
@@ -107,15 +117,19 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         const work = pending.get(id);
         if (!work) return;
         pending.delete(id);
+        const cancel = yield* Deferred.make<void>();
+        cancellations.set(id, cancel);
         const live = () => {
           const current = entries.get(id);
           return current?.entry.enabled && current.ticket === work.ticket
             ? current
             : undefined;
         };
+        let unpublished: Scope.Closeable | undefined;
         yield* Effect.gen(function* () {
           const credential =
-            work.credential ?? (yield* provider.resolve(work.entry));
+            work.credential ??
+            (yield* provider.resolve(work.entry, work.trigger));
           const accepted = yield* gate.withPermit(
             Effect.sync(() => {
               const current = live();
@@ -128,6 +142,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           if (!accepted) return;
           // The lease holds the generation from verification through publication.
           const lease = yield* Scope.fork(scope);
+          unpublished = lease;
           const verified = yield* Effect.gen(function* () {
             const verified = yield* identity.verify(
               work.entry,
@@ -157,6 +172,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
               if (!current) return lease;
               const previous = leases.get(id);
               leases.set(id, lease);
+              unpublished = undefined;
               current.identity = verified;
               current.checkedAt = now();
               current.healthFailures = 0;
@@ -170,6 +186,13 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           );
           if (replaced) yield* Scope.close(replaced, Exit.void);
         }).pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              unpublished ? Scope.close(unpublished, Exit.void) : Effect.void,
+            ),
+          ),
+          Effect.raceFirst(Deferred.await(cancel)),
+          Effect.ensuring(Effect.sync(() => cancellations.delete(id))),
           Effect.catch((cause) =>
             gate.withPermit(
               Effect.gen(function* () {
@@ -238,6 +261,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     };
     const publish = Effect.fn("BuilderRegistry.publish")(function* (
       snapshot: BuilderRegistrySnapshot,
+      trigger: "startup" | "registry" = "registry",
+      blocked: ReadonlySet<string> = new Set(),
     ) {
       const retired: Scope.Closeable[] = [];
       const retire = (id: string) => {
@@ -248,11 +273,27 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         }
       };
       const changed = yield* gate.withPermit(
-        Effect.sync(() => {
+        Effect.gen(function* () {
           if (stale) return false; // A stale mount requires recreation, never local repair.
           error = undefined;
-          const key = registrySemanticKey(snapshot);
+          const key = `${registrySemanticKey(snapshot)}:${[...blocked].sort().join(",")}`;
           if (key === semantic) return false;
+          const obsolete = [...entries.values()]
+            .filter((old) => {
+              const next = snapshot.builders.find(
+                (entry) => entry.id === old.entry.id,
+              );
+              return (
+                !next?.enabled ||
+                credentialRevision(next) !== credentialRevision(old.entry)
+              );
+            })
+            .map((old) => old.entry.id);
+          if (obsolete.length) yield* supersede(obsolete);
+          for (const id of obsolete) {
+            const cancel = cancellations.get(id);
+            if (cancel) yield* Deferred.succeed(cancel, undefined);
+          }
           desired = structuredClone(snapshot);
           semantic = key;
           revision++;
@@ -269,7 +310,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
             const read =
               entry.enabled &&
               (!old?.entry.enabled ||
-                credentialRevision(old.entry) !== credentialRevision(entry));
+                credentialRevision(old.entry) !== credentialRevision(entry) ||
+                old.error === "budget-capacity");
             const current: Current =
               read || !old
                 ? {
@@ -288,7 +330,10 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
             if (!entry.enabled) {
               current.ticket = ++ticket;
               pending.delete(entry.id);
-            } else if (read) enqueue(current, true);
+            } else if (blocked.has(entry.id)) {
+              current.error = "budget-capacity";
+              pending.delete(entry.id);
+            } else if (read) enqueue(current, true, trigger);
           }
           for (const preparation of preparations.values())
             if (!entries.get(preparation.admission.builderId)?.entry.enabled)

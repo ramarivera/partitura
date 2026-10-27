@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+# SDK/helper memory must never be copied into a core dump.
+ulimit -c 0
 # WORKER_UID alone retains its one-slot legacy meaning. Explicit range wins.
 WORKER_UID_COUNT=${WORKER_UID_COUNT:-$(if [ -n "${WORKER_UID_BASE:-}" ] || [ -z "${WORKER_UID:-}" ]; then echo 64; else echo 1; fi)}
 WORKER_UID_BASE=${WORKER_UID_BASE:-${WORKER_UID:-1001}}
@@ -41,7 +43,7 @@ chown -h root:root /app/data /app/logs
 chmod 0700 /app/data /app/logs
 # Docker secrets must be mounted root-owned with mode 0400. Reject insecure
 # mounts instead of assuming a readonly secret's mode can be changed.
-for name in LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET LINEAR_WEBHOOK_SECRET TOKEN_ENCRYPTION_KEY TOKEN_ENCRYPTION_PREVIOUS_KEYS_JSON GITHUB_APP_PRIVATE_KEY CLIPROXYAPI_API_KEY; do
+for name in LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET LINEAR_WEBHOOK_SECRET TOKEN_ENCRYPTION_KEY TOKEN_ENCRYPTION_PREVIOUS_KEYS_JSON GITHUB_APP_PRIVATE_KEY CLIPROXYAPI_API_KEY NATIVE_BUILD_OP_TOKEN; do
   path=$(printenv "${name}_FILE" || true)
   if [ -n "$path" ]; then
     owner=$(stat -c '%u' "$path")

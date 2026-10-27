@@ -34,7 +34,10 @@ import {
   unresolvedRecovery,
 } from "./native-build-models.js";
 /** Internal, exclusively owned state. Not assembled into the production layer. */
-export async function openNativeStorage(options: NativeStateOptions) {
+export async function openNativeStorage(
+  options: NativeStateOptions,
+  ownedRoot?: string,
+) {
   const { stateRoot, scratchRoot, cacheRoot } = options;
   for (const root of [stateRoot, scratchRoot, cacheRoot]) {
     try {
@@ -64,7 +67,10 @@ export async function openNativeStorage(options: NativeStateOptions) {
   ])
     if (!Number.isSafeInteger(amount) || amount < 0)
       throw NativeOperationError.new("invalid-scratch-quota");
-  const unlock = await lockNativeState(stateRoot);
+  if (ownedRoot !== undefined && ownedRoot !== stateRoot)
+    throw NativeOperationError.new("native-state-owner-mismatch");
+  const unlock =
+    ownedRoot === stateRoot ? async () => {} : await lockNativeState(stateRoot);
   try {
     let key: Buffer;
     try {

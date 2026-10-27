@@ -8,6 +8,7 @@ export interface BuilderRegistrySettings {
   readonly stateRoot: string;
   readonly scratchRoot: string;
   readonly cacheRoot: string;
+  readonly liveQualified?: boolean;
   readonly tokenFile?: string | undefined;
   readonly vaultId?: string | undefined;
   readonly suffix: string;
@@ -53,6 +54,9 @@ export const loadBuilderRegistrySettings = Effect.fn(
       "/app/native-build-registry-scratch",
     ),
     cacheRoot: pathSetting("NATIVE_BUILD_CACHE_ROOT", "/run/partitura-native"),
+    liveQualified: Config.Boolean("NATIVE_BUILD_OP_QUALIFIED").pipe(
+      Config.withDefault(false),
+    ),
     tokenFile: pathSetting("NATIVE_BUILD_OP_TOKEN_FILE"),
     vaultId: Config.option(Config.String("NATIVE_BUILD_OP_VAULT_ID")).pipe(
       Config.map(Option.getOrUndefined),

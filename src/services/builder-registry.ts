@@ -1,13 +1,27 @@
 import { createHash } from "node:crypto";
 import { basename, dirname } from "node:path";
-import { Context, Effect, Exit, Layer, Queue, Scope, Semaphore } from "effect";
+import {
+  Context,
+  Effect,
+  Exit,
+  Layer,
+  Option,
+  Queue,
+  Scope,
+  Semaphore,
+} from "effect";
 import { BuilderRegistryFiles } from "./builder-registry-files.js";
 import { BuilderRegistryIdentity } from "./builder-registry-identity.js";
 import { BuilderRegistryError } from "./builder-registry-json.js";
-import { parseBuilderRegistry } from "./builder-registry-schema.js";
+import {
+  credentialRevision,
+  parseBuilderRegistry,
+  sourceReference,
+} from "./builder-registry-schema.js";
 import { makeBuilderRegistryState } from "./builder-registry-state.js";
 import { BuilderSecretProvider } from "./builder-secret-provider.js";
 import { BuilderRegistryConfig } from "./config-native-build.js";
+import { NativeBuildSecretCache } from "./native-build-secret-cache.js";
 
 export * from "./builder-registry-schema.js";
 export type { BuilderAdmission } from "./builder-registry-state.js";
@@ -21,9 +35,25 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
       const settings = yield* BuilderRegistryConfig;
       const files = yield* BuilderRegistryFiles;
       const provider = yield* BuilderSecretProvider;
+      const secretCache = yield* Effect.serviceOption(NativeBuildSecretCache);
+      let capacityError: string | undefined;
       const identity = yield* BuilderRegistryIdentity;
       const scope = yield* Scope.Scope;
-      const state = yield* makeBuilderRegistryState(provider, identity);
+      const state = yield* makeBuilderRegistryState(
+        provider,
+        identity,
+        Date.now,
+        (ids) =>
+          Option.isSome(secretCache)
+            ? secretCache.value
+                .supersede(ids)
+                .pipe(
+                  Effect.mapError((error) =>
+                    BuilderRegistryError.new(error.code),
+                  ),
+                )
+            : Effect.void,
+      );
       const reloadGate = yield* Semaphore.make(1);
       const hints = yield* Queue.dropping<void>(1);
       let directory:
@@ -59,10 +89,55 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
               262_144,
             );
             const nextDigest = createHash("sha256").update(bytes).digest("hex");
-            if (digest === nextDigest && state.snapshot().error === undefined)
+            if (
+              digest === nextDigest &&
+              state.snapshot().error === undefined &&
+              !capacityError
+            )
               return;
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
-            yield* state.publish(snapshot);
+            const blocked = new Set<string>();
+            if (Option.isSome(secretCache)) {
+              const capacity = yield* secretCache.value
+                .capacity(
+                  snapshot.builders
+                    .filter((entry) => entry.enabled)
+                    .map((entry) => ({
+                      source: sourceReference(entry.secretSource),
+                      revision: entry.secretRevision,
+                      builderId: entry.id,
+                      retained: false,
+                    })),
+                )
+                .pipe(
+                  Effect.mapError((error) =>
+                    BuilderRegistryError.new(error.code),
+                  ),
+                );
+              if (!capacity.sufficient) {
+                capacityError = "budget-capacity";
+                const previous = state.snapshot();
+                for (const entry of snapshot.builders) {
+                  const old = previous.desired?.builders.find(
+                    (old) => old.id === entry.id,
+                  );
+                  if (
+                    entry.enabled &&
+                    entry.secretSource.type === "onepassword" &&
+                    (!old?.enabled ||
+                      credentialRevision(old) !== credentialRevision(entry) ||
+                      previous.entries.find((old) => old.id === entry.id)
+                        ?.reason === "budget-capacity")
+                  )
+                    blocked.add(entry.id);
+                }
+              } else capacityError = undefined;
+            }
+            yield* state.publish(
+              snapshot,
+              state.snapshot().desired ? "registry" : "startup",
+              blocked,
+            );
             digest = nextDigest;
           }).pipe(Effect.catch((cause) => state.fault(cause))),
         ),
@@ -117,7 +192,7 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
       return {
         ...state,
         reload,
-        snapshot: () => ({ ...state.snapshot(), watchDegraded }),
+        snapshot: () => ({ ...state.snapshot(), watchDegraded, capacityError }),
         // Retain the cause privately without serializing it into admin/log output.
         watchFailure: () => watchFailure,
       };
