@@ -238,9 +238,49 @@ def runner_state(root):
     value = api.json_state(root / 'runner.json')
     if value is None:
         return None
-    if set(value) != {'job', 'attempt', 'commit', 'action', 'stage', 'heartbeat'} or not re.fullmatch(api.JOB, value.get('job', '')) or not re.fullmatch(api.JOB, value.get('attempt', '')) or not re.fullmatch(api.COMMIT, value.get('commit', '')) or not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value.get('action', '')) or value['stage'] not in ('receiving', 'capacity', 'unlock', 'keychain-policy', 'clone', 'boot', 'workflow', 'artifact', 'cleanup') or type(value['heartbeat']) not in (int, float) or not math.isfinite(value['heartbeat']) or value['heartbeat'] <= 0:
+    keys = {'job', 'attempt', 'commit', 'action', 'stage', 'heartbeat'}
+    if set(value) not in (keys, keys | {'owner'}) or not re.fullmatch(api.JOB, value.get('job', '')) or not re.fullmatch(api.JOB, value.get('attempt', '')) or not re.fullmatch(api.COMMIT, value.get('commit', '')) or not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value.get('action', '')) or value['stage'] not in ('receiving', 'capacity', 'unlock', 'keychain-policy', 'clone', 'boot', 'workflow', 'artifact', 'cleanup') or type(value['heartbeat']) not in (int, float) or not math.isfinite(value['heartbeat']) or value['heartbeat'] <= 0:
         raise ValueError('invalid runner marker')
     return value
+
+
+def process_start(pid):
+    """macOS ps birth time, never kill(pid, 0) or PID-only ownership.
+
+    lstart has second resolution. Reuse within that second looks live and
+    therefore blocks cleanup, which is the safe direction of that ambiguity.
+    """
+    result = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'lstart='], capture_output=True, timeout=5, env={'LC_ALL': 'C', 'TZ': 'UTC', 'PATH': '/usr/bin:/bin'})
+    if result.returncode == 1 and not result.stdout and not result.stderr:
+        return None
+    if result.returncode or result.stderr or len(result.stdout) > 128:
+        raise ValueError('process birth time unavailable')
+    value = ' '.join(result.stdout.decode('ascii').split())
+    if not re.fullmatch(r'[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}', value):
+        raise ValueError('invalid process birth time')
+    return value
+
+
+def owner_block_reason(runner, boot):
+    """Caller holds runner.lock. An ambiguous owner never authorizes cleanup."""
+    if runner is None:
+        return None  # Inventory decides whether markerless jobs need cleanup.
+    owner = runner.get('owner')
+    if owner is None:
+        return 'runner-owner-missing'
+    if not isinstance(owner, dict) or set(owner) != {'pid', 'start', 'boot'} or type(owner['pid']) is not int or not 1 <= owner['pid'] <= 2**31 - 1 or not isinstance(owner['start'], str) or not re.fullmatch(r'[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}', owner['start']) or not isinstance(owner['boot'], str):
+        return 'runner-owner-unavailable'
+    if owner['boot'] != boot:
+        if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', owner['boot']):
+            return 'runner-owner-unavailable'
+        return None  # No process from a previous boot can still own this job.
+    try:
+        current = api.process_start(owner['pid'])
+    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+        return 'runner-owner-unavailable'
+    if current == owner['start']:
+        return 'runner-owner-alive'
+    return None  # Absent PID or different birth time proves the old owner died.
 
 
 def obligations(config):
@@ -384,6 +424,9 @@ def health(config):
             _, inventory = api.maintenance_state(root, api.boot_id())
             if inventory or api.read_state(root / 'inventory-required') is not None:
                 fields['reasons'] = ['inventory-pending']
+                reason = api.read_state(root / 'maintenance-reason')
+                if reason is not None and reason.strip() in api.MAINTENANCE_REASONS:
+                    fields['reasons'] = [reason.strip()]
                 api.emit(config, 'health', **fields)
                 return 0
             api.private_directory(root)
@@ -402,6 +445,10 @@ def health(config):
             fields['reasons'] = ['host-disk-space-unavailable']
         except (ValueError, subprocess.SubprocessError):
             fields['reasons'] = ['host-capacity-unavailable']
+    reason = api.read_state(root / 'maintenance-reason')
+    if reason is not None and reason.strip() in api.MAINTENANCE_REASONS and reason.strip() not in fields['reasons']:
+        fields['reasons'].append(reason.strip())
+        fields.update(status='blocked', accepting=False, capacity=0)
     if config['profile'] != 'registry-only':
         fields.update(status='blocked', accepting=False, capacity=0, reasons=[*fields['reasons'], 'legacy-profile'])
     api.emit(config, 'health', **fields)

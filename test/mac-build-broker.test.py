@@ -14,7 +14,7 @@ class BrokerTests(BrokerFixture, unittest.TestCase):
     def test_inventory_identity_uses_boot_session_uuid_and_source_revision(self):
         identity = '20FAF704-1AF9-4791-B023-A07843B00547'
         with patch.object(broker.subprocess, 'run', return_value=type('Result', (), {'stdout': (identity + '\n').encode()})()) as run:
-            self.assertEqual(broker.boot_id(), identity.lower())
+            self.assertEqual(real_boot_id(), identity.lower())
         self.assertEqual(run.call_args.args[0], ['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'])
         self.assertEqual(broker.BROKER_REVISION, broker.hashlib.sha256(SOURCE.read_bytes()).hexdigest())
 

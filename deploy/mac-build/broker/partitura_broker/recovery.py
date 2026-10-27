@@ -180,6 +180,7 @@ def reconcile_locked(config, requested, daemon=False, deadline=None, allow_block
         api.durable_write(root / 'admission-epoch', uuid.uuid4().hex + '\n')
         for name in (*api.FENCES, 'runner.json', 'recovery.json'):
             api.durable_remove(root / name)
+        api.durable_remove(root / 'maintenance-reason')
         if allow_blocked and clear_blocked:
             api.durable_remove(root / 'maintenance-blocked')
         return 'reconciled', sorted(jobs)
@@ -200,6 +201,7 @@ def reconcile(config, job):
         if (api.read_state(root / 'maintenance-blocked') or '').startswith('installation-incomplete'):
             api.emit(config, 'cleanup-required', job=job)
             return 1
+        api.durable_remove(root / 'maintenance-reason')
         api.initialize_epoch(config)
         jobs = {job}
         try:
@@ -281,12 +283,16 @@ def maintenance_state(root, boot):
         raise ValueError('invalid maintenance state')
     if previous and previous['nextAt'] > time.time() + 900:
         previous['nextAt'] = 0  # A backwards clock step makes maintenance due.
+    if previous and (previous['boot'] != boot or previous['revision'] != api.BROKER_REVISION):
+        previous = dict(previous, nextAt=0, failures=0)
     inventory = previous is None or previous['boot'] != boot or previous['revision'] != api.BROKER_REVISION or not previous.get('inventoryComplete', previous['failures'] == 0)
     return previous, inventory
 
 
 def record_maintenance(root, boot, failures=0, inventory_complete=True):
     api.durable_write(root / 'maintenance.json', json.dumps(dict(boot=boot, revision=api.BROKER_REVISION, failures=failures, nextAt=time.time() + min(900, 60 * 2**max(0, failures - 1)) if failures else 0, inventoryComplete=inventory_complete)) + '\n')
+    if not failures and inventory_complete:
+        api.durable_remove(root / 'maintenance-reason')
 
 
 def history_gc_due(root):
@@ -361,19 +367,28 @@ def local_maintenance(config):
     previous, inventory = api.maintenance_state(root, boot)
     blocked = api.read_state(root / 'maintenance-blocked') is not None
     if blocked:
-        return 1  # Only successful explicit revalidation may remove this flag.
+        return 0  # Reported by health; repeating an operator block isn't a crash.
     jobs, _ = api.obligations(config)
     inventory |= api.read_state(root / 'inventory-required') is not None
     if previous and time.time() < previous['nextAt']:
-        return 1  # Backoff also applies before the first successful inventory.
+        return 0  # A scheduled backoff wait completed normally.
+    if api.fence_job(root / 'keychain-relock-pending') and not api.daemon_relock_qualified(config):
+        api.durable_write(root / 'maintenance-reason', 'keychain-relock-pending\n')
+        return 0  # Only SSH or a newly qualified daemon can finish this step.
     gc_due = api.history_gc_due(root)
     if not inventory and not jobs and not gc_due:
+        api.durable_remove(root / 'maintenance-reason')
         return 0
     with api.run_lock(config, 0) as acquired:
         if not acquired:
             return 0  # A live owner is responsible for its own obligations.
-        jobs, _ = api.obligations(config)
+        jobs, runner = api.obligations(config)
+        reason = api.owner_block_reason(runner, boot)
+        if reason:
+            api.durable_write(root / 'maintenance-reason', reason + '\n')
+            return 0
         complete = not inventory
+        reason = None
         try:
             if inventory and len(jobs) <= 6:
                 api.durable_write(root / 'inventory-required', 'inventory-pending\n')
@@ -382,19 +397,35 @@ def local_maintenance(config):
                     complete = True
                 except api.InventoryPending as pending:
                     jobs |= pending.jobs
+            # The automatic route needs birth evidence for every cleanup job.
+            # Older markerless debris remains recoverable by explicit reconcile.
+            if jobs and (runner is None or jobs != {runner['job']}):
+                api.durable_write(root / 'inventory-required', 'inventory-pending\n')
+                api.durable_write(root / 'maintenance-reason', 'runner-owner-missing\n')
+                api.record_maintenance(root, boot, inventory_complete=False)
+                return 0
             result, _ = api.reconcile_locked(config, jobs, daemon=True, deadline=deadline) if jobs else ('idle', [])
             if complete:
                 api.durable_remove(root / 'inventory-required')
             else:
                 result = 'cleanup-required'
+                reason = 'inventory-incomplete'
         except ValueError:
             api.durable_write(root / 'maintenance-blocked', 'inventory-invalid\n')
             result = 'cleanup-required'
+            reason = 'inventory-invalid'
             complete = False
         except (OSError, subprocess.SubprocessError):
             # IO failures are retryable. No operator-only flag is manufactured.
             result = 'cleanup-required'
+            reason = 'inventory-unavailable'
             complete = False
+        if reason is None and result in ('cleanup-required', 'keychain-relock-pending'):
+            reason = result
+        if reason:
+            api.durable_write(root / 'maintenance-reason', reason + '\n')
+        else:
+            api.durable_remove(root / 'maintenance-reason')
         # Housekeeping cannot create an operator-required inventory flag. A
         # failed pass retries with backoff while the completed inventory stays
         # valid; unsafe individual entries are retained and counted by pruning.
@@ -407,7 +438,7 @@ def local_maintenance(config):
                 result = 'host-maintenance'
         failures = min(16, (previous or {}).get('failures', 0) + 1) if result in ('cleanup-required', 'keychain-relock-pending', 'host-maintenance') else 0
         api.record_maintenance(root, boot, failures, inventory_complete=complete)
-        return 1 if failures else 0
+        return 1 if failures and result != 'keychain-relock-pending' else 0
 
 
 def refuse(config, request, code, persist=True):

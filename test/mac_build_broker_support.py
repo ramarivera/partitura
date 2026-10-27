@@ -26,6 +26,7 @@ import partitura_broker as broker
 
 real_verify_vm_capacity = broker.verify_vm_capacity
 real_relock_keychain = broker.relock_keychain
+real_boot_id = broker.boot_id
 RealLoginKeychain = broker.LoginKeychain
 
 FAKE_TART = '''#!/usr/bin/python3
@@ -104,6 +105,12 @@ class BrokerFixture:
         self.capacity_patch = patch.object(broker, 'verify_vm_capacity')
         self.capacity_patch.start()
         self.addCleanup(self.capacity_patch.stop)
+        self.process_patch = patch.object(broker, 'process_start', return_value='Mon Oct 26 12:00:00 2026')
+        self.process_patch.start()
+        self.addCleanup(self.process_patch.stop)
+        self.boot_patch = patch.object(broker, 'boot_id', return_value='fixture-boot')
+        self.boot_patch.start()
+        self.addCleanup(self.boot_patch.stop)
         self.disk_patch = patch.object(broker.os, 'statvfs', return_value=type('Space', (), {'f_bavail': 100 * 1024**3, 'f_frsize': 1})())
         self.disk_patch.start()
         self.addCleanup(self.disk_patch.stop)
@@ -170,9 +177,6 @@ class RegistryFixture(BrokerFixture):
         self.epoch = broker.initialize_epoch(self.config)
         self.attempt = 'e'*32
         self.request = ('run-v2', self.job, 'd'*40, '12', 'archive', 6, 0, self.epoch, self.attempt, int(time.time()) + 100)
-        self.boot_patch = patch.object(broker, 'boot_id', return_value='fixture-boot')
-        self.boot_patch.start()
-        self.addCleanup(self.boot_patch.stop)
 
 
     def invoke(self, request=None, prefix=b''):
@@ -202,6 +206,7 @@ class RegistryFixture(BrokerFixture):
 
     def marker(self, job=None, age=0, stage='receiving'):
         value = dict(job=job or self.job, attempt=self.attempt, commit='d'*40, action='archive', stage=stage, heartbeat=time.time() - age)
+        value['owner'] = dict(pid=12345, start='Mon Oct 26 11:00:00 2026', boot='fixture-boot')
         broker.durable_write(self.root / 'runner.json', json.dumps(value) + '\n')
         return value
 

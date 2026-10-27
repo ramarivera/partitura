@@ -120,14 +120,15 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
         self.keychain.apply_policy.assert_not_called()
 
 
-    def test_legacy_run_recovers_main_era_running_receipt_and_pending_daemon_relock_before_input(self):
+    def test_legacy_run_recovers_main_era_job_without_owner_evidence_before_input(self):
         self.config['profile'] = 'legacy'
         old = self.root / ('b'*32)
         old.mkdir()
         broker.record(old, job='b'*32, commit='d'*40, action='archive', state='running')
         broker.durable_write(self.root / 'inventory-required', 'installation\n')
-        self.assertEqual(self.maintenance(), 1)
-        self.assertTrue((self.root / 'keychain-relock-pending').exists())
+        self.assertEqual(self.maintenance(), 0)
+        self.assertTrue((self.root / 'inventory-required').exists())
+        self.assertEqual(self.wire('health')[1]['reasons'], ['runner-owner-missing'])
         # The live gateway still sends the legacy command and needs no new verb.
         reader, writer = os.pipe()
         os.write(writer, b'bundle'); os.close(writer)
@@ -363,8 +364,9 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
     def test_legacy_cancel_completes_daemon_fallback_without_leaving_recovery_marker(self):
         self.config['profile'] = 'legacy'
         self.clone()
+        self.marker(stage='workflow')
         broker.durable_write(self.root / 'active-vm', self.job + '\n')
-        self.assertEqual(self.maintenance(), 1)
+        self.assertEqual(self.maintenance(), 0)
         self.assertTrue((self.root / 'recovery.json').exists())
         code, result = self.wire('cancel ' + self.job)
         self.assertEqual((code, result), (0, dict(job=self.job, state='cancellation-requested')))
