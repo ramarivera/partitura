@@ -214,3 +214,21 @@ it.effect(
       expect(loaded.stateRoot).toBe("/app/data/native-build-registry");
     }),
 );
+
+for (const root of ["/workspaces", "/workspaces/secrets", "/"])
+  it.effect(
+    `NATIVE_BUILD_FILE_SECRET_ROOT refuses worker overlap ${root} in registry mode`,
+    () =>
+      Effect.gen(function* () {
+        const exit = yield* Effect.exit(
+          settings(
+            {
+              NATIVE_BUILD_FILE_SECRET_ROOT: root,
+              NATIVE_BUILD_REGISTRY_FILE: "/run/registry/registry.json",
+            },
+            ["/workspaces"],
+          ),
+        );
+        expect(exit._tag).toBe("Failure");
+      }),
+  );

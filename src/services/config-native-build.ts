@@ -103,11 +103,14 @@ export const loadBuilderRegistrySettings = Effect.fn(
         invalid("Native registry scratch root overlaps another root"),
       );
   if (settings.registryFile !== undefined)
-    for (const root of [stateRoot, cacheRoot])
-      if (otherRoots.some((other) => nativePathsOverlap(root, resolve(other))))
+    for (const root of [stateRoot, cacheRoot, settings.fileSecretRoot])
+      if (
+        root !== undefined &&
+        otherRoots.some((other) => nativePathsOverlap(root, resolve(other)))
+      )
         return yield* Effect.fail(
           invalid(
-            "Native registry state/cache root overlaps a legacy or worker root",
+            "Native registry state/cache/secret root overlaps a legacy or worker root",
           ),
         );
   return {

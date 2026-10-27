@@ -126,21 +126,27 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
             }),
           );
           if (!accepted) return;
-          const verified = yield* identity.verify(work.entry, credential);
-          if (
-            verified.generation.builderId !== id ||
-            verified.generation.transport.hostId !==
-              credential.transport.hostId ||
-            verified.health.kind !== "health" ||
-            verified.health.hostId !== credential.transport.hostId ||
-            verified.health.profile !== "registry-only"
-          )
-            return yield* Effect.fail(
-              BuilderRegistryError.new("builder-identity-mismatch"),
-            );
+          // The lease holds the generation from verification through publication.
           const lease = yield* Scope.fork(scope);
-          yield* identity.retain(verified.generation.id).pipe(
-            Effect.provideService(Scope.Scope, lease),
+          const verified = yield* Effect.gen(function* () {
+            const verified = yield* identity.verify(
+              work.entry,
+              credential,
+              lease,
+            );
+            if (
+              verified.generation.builderId !== id ||
+              verified.generation.transport.hostId !==
+                credential.transport.hostId ||
+              verified.health.kind !== "health" ||
+              verified.health.hostId !== credential.transport.hostId ||
+              verified.health.profile !== "registry-only"
+            )
+              return yield* Effect.fail(
+                BuilderRegistryError.new("builder-identity-mismatch"),
+              );
+            return verified;
+          }).pipe(
             Effect.onExit((exit) =>
               Exit.isFailure(exit) ? Scope.close(lease, exit) : Effect.void,
             ),

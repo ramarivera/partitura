@@ -1,4 +1,4 @@
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Scope } from "effect";
 import { BuilderRegistryError } from "./builder-registry-json.js";
 import type { BuilderEntry } from "./builder-registry-schema.js";
 import type { BuilderCredential } from "./builder-secret-provider.js";
@@ -39,7 +39,12 @@ export class BuilderRegistryIdentity extends Context.Service<BuilderRegistryIden
       return {
         retain,
         verify: Effect.fn("BuilderRegistryIdentity.verify")(
-          (entry: BuilderEntry, credential: BuilderCredential) =>
+          (
+            entry: BuilderEntry,
+            credential: BuilderCredential,
+            // A caller-owned hold keeps the generation pinned after verify returns.
+            hold?: Scope.Scope,
+          ) =>
             Effect.scoped(
               Effect.gen(function* () {
                 const generation = yield* state.addGeneration(
@@ -47,7 +52,11 @@ export class BuilderRegistryIdentity extends Context.Service<BuilderRegistryIden
                   credential.transport,
                   credential.privateKey,
                 );
-                yield* retain(generation.id);
+                yield* hold === undefined
+                  ? retain(generation.id)
+                  : retain(generation.id).pipe(
+                      Effect.provideService(Scope.Scope, hold),
+                    );
                 yield* transport.materialize(generation, credential.privateKey);
                 const health = yield* transport.envelope(generation, "health");
                 return { generation, health } satisfies BuilderIdentityResult;

@@ -116,7 +116,8 @@ it.effect(
           ...fake.identity,
           retain: () =>
             Effect.gen(function* () {
-              if (++holds === 2) {
+              // Health holds go through verify's lease, so admit's is the only retain.
+              if (++holds === 1) {
                 yield* Deferred.succeed(entered, undefined);
                 yield* Deferred.await(release);
               }
