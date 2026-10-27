@@ -1,7 +1,5 @@
-import { Effect, Layer } from "effect";
+import { Context, Effect, Layer, Option } from "effect";
 import { BuilderRegistry } from "./builder-registry.js";
-import { sourceReference } from "./builder-registry-schema.js";
-import { normalizeBuilderFileRecord } from "./builder-secret-record.js";
 import { GatewayConfig } from "./config.js";
 import { BuilderRegistryConfig } from "./config-native-build.js";
 import { NativeBuildFiles } from "./native-build-files.js";
@@ -14,9 +12,10 @@ import { NativeSecretJournal } from "./native-build-secret-journal.js";
 import { emptySecretJournal } from "./native-build-secret-models.js";
 import { NativeSecretError } from "./native-build-secret-protocol.js";
 import { NativeSecretSourceReader } from "./native-build-secret-reader.js";
+import { retainedStartup } from "./native-build-source-lifecycle.js";
 import {
   NativeBuildStateService,
-  unresolvedRecovery,
+  type NativeStateOptions,
 } from "./native-build-state.js";
 import {
   NativeStateConfig,
@@ -26,75 +25,6 @@ import {
   NativeBuildTransport,
   NativeTransportConfig,
 } from "./native-build-transport.js";
-
-/** Restore removed sources independently of the current admission pool. No build triggers reads. */
-const retainedStartup = Effect.gen(function* () {
-  const registry = yield* BuilderRegistry;
-  const state = yield* NativeBuildStateService;
-  const cache = yield* NativeBuildSecretCache;
-  const reader = yield* NativeSecretSourceReader;
-  const transport = yield* NativeBuildTransport;
-  const settings = yield* BuilderRegistryConfig;
-  const enabled = new Set(
-    registry
-      .snapshot()
-      .desired?.builders.filter(
-        (entry) =>
-          entry.enabled &&
-          registry.current(entry.id)?.error !== "budget-capacity",
-      )
-      .map((entry) => sourceReference(entry.secretSource)),
-  );
-  const sources = new Map<
-    string,
-    { source: string; builderId: string; revision: number; retained: boolean }
-  >();
-  const snapshot = state.snapshot();
-  for (const job of snapshot.jobs.filter(unresolvedRecovery)) {
-    const generation = snapshot.generations.find(
-      (entry) => entry.id === job.generationId,
-    );
-    if (generation && !enabled.has(generation.transport.source))
-      sources.set(generation.transport.source, {
-        source: generation.transport.source,
-        builderId: job.builderId,
-        revision: 0,
-        retained: true,
-      });
-  }
-  for (const source of sources.values())
-    yield* Effect.gen(function* () {
-      const credential = source.source.startsWith("file:")
-        ? yield* reader
-            .read(source.source, () =>
-              Effect.fail(NativeSecretError.new("provider-budget-invalid")),
-            )
-            .pipe(
-              Effect.flatMap((record) =>
-                normalizeBuilderFileRecord(
-                  Buffer.from(JSON.stringify(record)),
-                  source.source,
-                  settings.suffix,
-                ),
-              ),
-            )
-        : yield* cache.resolve(source, "startup");
-      yield* transport.restore(source.source, [
-        credential.privateKey,
-        ...(credential.retiringPrivateKey
-          ? [credential.retiringPrivateKey]
-          : []),
-      ]);
-    }).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Native retained startup source unavailable", {
-          builderId: source.builderId,
-          code: "code" in error ? error.code : error.reason,
-        }),
-      ),
-      Effect.forkScoped,
-    );
-});
 
 // Read failure never manufactures a writable fresh allowance. File builds and
 // local recovery remain usable while provider reads report repair-required.
@@ -141,11 +71,23 @@ export const RegistryNativeBuildServices = Layer.mergeAll(
   Layer.effectDiscard(retainedStartup),
 ).pipe(Layer.provideMerge(fleetRecovery));
 
+/** Optional infrastructure adapters for hermetic assembly tests. No environment setting enables these. */
+export class NativeBuildRuntimeAdapters extends Context.Service<
+  NativeBuildRuntimeAdapters,
+  {
+    readonly filesystem?: NativeStateOptions["filesystem"];
+    readonly executable?: string;
+  }
+>()("NativeBuildRuntimeAdapters") {}
 /** Static selection. Unset means no registry ownership, mounts, journal or helper. */
 export const NativeBuildServicesLive = Layer.unwrap(
   Effect.gen(function* () {
     const { nativeBuildRegistry: settings } = yield* GatewayConfig;
     if (!settings?.registryFile) return Layer.empty;
+    const adapters = Option.getOrElse(
+      yield* Effect.serviceOption(NativeBuildRuntimeAdapters),
+      (): NativeBuildRuntimeAdapters["Service"] => ({}),
+    );
     return RegistryNativeBuildServices.pipe(
       Layer.provide(Layer.succeed(BuilderRegistryConfig, settings)),
       Layer.provide(
@@ -155,6 +97,7 @@ export const NativeBuildServicesLive = Layer.unwrap(
           cacheRoot: settings.cacheRoot,
           bytesPerBuilder: settings.perBuilderBytes,
           bytesTotal: settings.totalBytes,
+          ...(adapters.filesystem ? { filesystem: adapters.filesystem } : {}),
           otherRoots: [
             ...(settings.otherRoots ?? []),
             ...(settings.fileSecretRoot ? [settings.fileSecretRoot] : []),
@@ -162,7 +105,10 @@ export const NativeBuildServicesLive = Layer.unwrap(
         }),
       ),
       Layer.provide(
-        Layer.succeed(NativeTransportConfig, { suffix: settings.suffix }),
+        Layer.succeed(NativeTransportConfig, {
+          suffix: settings.suffix,
+          ...(adapters.executable ? { executable: adapters.executable } : {}),
+        }),
       ),
     );
   }),

@@ -209,8 +209,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           } else if (!config.nativeBuildRegistry?.registryFile)
             yield* cancelLegacyNativeBuilds(sessionId);
         }).pipe(
-          Effect.catch(() =>
-            Effect.logWarning("Native session cancellation unavailable"),
+          Effect.catch((error) =>
+            Effect.logWarning("Native session cancellation unavailable", {
+              code:
+                "reason" in error
+                  ? error.reason
+                  : "code" in error
+                    ? error.code
+                    : "native-session-cancellation-failed",
+            }),
           ),
         );
       const mcpOAuth = yield* McpOAuth;

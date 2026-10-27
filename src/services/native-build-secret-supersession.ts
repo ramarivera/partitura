@@ -15,6 +15,9 @@ export const makeNativeSecretSupersession = (
   const key = (op: SecretOperation, work: SecretWork) =>
     `${op.id}:${work.builderId}:${work.source}@${work.revision}`;
   const obsolete = new Set<string>();
+  let desired: ((source: SecretSource) => boolean) | undefined;
+  const mismatched = (work: SecretWork) =>
+    !work.retained && desired?.(work) === false;
   const restored = new Set(
     journal
       .snapshot()
@@ -43,6 +46,10 @@ export const makeNativeSecretSupersession = (
       );
   };
   const flush = Effect.fn("NativeBuildSecretCache.flushObsolete")(function* () {
+    for (const op of journal.snapshot().operations)
+      for (const work of op.sources)
+        if (work.status === "pending" && mismatched(work))
+          obsolete.add(key(op, work));
     if (!obsolete.size) return;
     const selected = new Set(obsolete);
     yield* journal.transaction((data, at) => {
@@ -57,8 +64,16 @@ export const makeNativeSecretSupersession = (
   });
   return {
     capture,
+    observeDesired: (predicate: (source: SecretSource) => boolean) => {
+      desired = predicate;
+      return () => {
+        if (desired === predicate) desired = undefined;
+      };
+    },
     blocked: (op: SecretOperation, work: SecretWork) =>
-      obsolete.has(key(op, work)) || restored.has(key(op, work)),
+      obsolete.has(key(op, work)) ||
+      restored.has(key(op, work)) ||
+      mismatched(work),
     held: (op: SecretOperation, work: SecretWork) =>
       restored.has(key(op, work)),
     flush,

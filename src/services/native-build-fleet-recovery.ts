@@ -90,10 +90,7 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
         if (
           action === "decommission" &&
           current?.credential?.transport.hostId !== hostId &&
-          !selected.some(
-            ({ job, maintenance }) =>
-              job?.builderId === builderId || maintenance?.hostId === hostId,
-          )
+          !selected.some(({ job }) => job?.builderId === builderId)
         )
           return yield* Effect.fail(
             NativeFleetError.new("fleet-recovery-conflict", 409),
@@ -300,7 +297,16 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
               // Durable resolution comes first; remove quota-charged inputs just as automatic recovery does.
               for (const { job } of selected)
                 if (job)
-                  yield* state.remove(`${state.jobPath(job)}/source.bundle`);
+                  yield* state
+                    .remove(`${state.jobPath(job)}/source.bundle`)
+                    .pipe(
+                      Effect.catch((error) =>
+                        Effect.logWarning(
+                          "Native resolved input cleanup unavailable",
+                          { code: error.reason, jobId: job.jobId },
+                        ),
+                      ),
+                    );
               return {
                 outcome:
                   action === "reconcile"

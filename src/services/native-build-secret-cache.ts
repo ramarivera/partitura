@@ -81,8 +81,12 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
       const supersession = makeNativeSecretSupersession(journal, now);
       let cycleRecorded = false;
       // A crash after dispatch is ambiguous and already charged. Only startup may retry.
-      yield* journal
-        .transaction((data, at) => {
+      let normalized = false;
+      const normalizeRestored = Effect.fn(
+        "NativeBuildSecretCache.normalizeRestored",
+      )(function* () {
+        if (normalized) return;
+        yield* journal.transaction((data, at) => {
           for (const operation of data.operations)
             for (const work of operation.sources)
               if (work.status === "running") {
@@ -103,15 +107,16 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                     nextFit: work.nextFit,
                   };
               }
-        }, now())
-        .pipe(
-          Effect.catch((error) =>
-            Effect.logWarning(
-              "Native provider journal unavailable at startup",
-              { code: error.code },
-            ),
-          ),
-        );
+        }, now());
+        normalized = true;
+      });
+      yield* normalizeRestored().pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Native provider journal unavailable at startup", {
+            code: error.code,
+          }),
+        ),
+      );
       const progress = (id: string) => {
         const snapshot = journal.snapshot();
         const operation = snapshot.operations.find((item) => item.id === id);
@@ -317,6 +322,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         () =>
           dispatch.withPermit(
             Effect.gen(function* () {
+              yield* normalizeRestored();
               yield* supersession.flush();
               const expired = new Map<
                 string,
@@ -645,9 +651,12 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         );
       return {
         captureSupersede: supersession.capture,
+        observeDesired: supersession.observeDesired,
         revalidatePending: Effect.fn(
           "NativeBuildSecretCache.revalidatePending",
         )(function* (sources: readonly SecretSource[]) {
+          // Revalidation must see the normalized pending state, including a retry after startup EIO.
+          yield* normalizeRestored();
           yield* supersession.revalidate(sources);
           yield* Queue.offer(wake, undefined);
           yield* notify();
@@ -669,6 +678,21 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                 NativeSecretError.new("provider-operation-invalid"),
               ),
             );
+            const before = journal.snapshot();
+            const needed = new Set([
+              ...checked.map(sourceKey),
+              ...before.operations.flatMap((op) =>
+                op.sources.filter((work) => !terminal(work)).map(sourceKey),
+              ),
+            ]);
+            if (
+              [
+                ...Object.keys(before.successes),
+                ...Object.keys(before.startupStops),
+                ...cache.keys(),
+              ].every((key) => needed.has(key))
+            )
+              return;
             const retained = yield* journal.transaction((data) => {
               const keys = new Set([
                 ...checked.map(sourceKey),
@@ -680,12 +704,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                 if (!keys.has(key)) delete data.successes[key];
               for (const key of Object.keys(data.startupStops))
                 if (!keys.has(key)) delete data.startupStops[key];
-              data.operations = data.operations.filter(
-                (op) =>
-                  !op.sources.every(
-                    (work) => terminal(work) && !keys.has(sourceKey(work)),
-                  ),
-              );
+              // Keep bounded progress history until accept evicts it. Pruning secrets must not erase a caller's operation receipt.
               return keys;
             }, now());
             for (const key of cache.keys())

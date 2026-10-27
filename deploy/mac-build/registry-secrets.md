@@ -145,3 +145,12 @@ invokes a bearer refresh endpoint or claims an item edit was automatically notic
 
 Image deployment, runtime token/vault provisioning, item reads/writes, registry
 assembly and cutover all require their separate secret/host/deployment approvals.
+
+On restart, completed refresh receipts contain no credential bytes. Enabled-source
+startup resolution or retained-source startup resolution restores the keys through
+the budgeted startup path, including a refresh that completed before installation.
+Retained startup waits for a valid registry snapshot so it cannot duplicate the
+desired source read while the registry is unreadable. Valid snapshots and recovery
+obligation changes prune unused success bindings and in-memory snapshots. Pending
+operations stay protected, and an unreadable registry suspends pruning. Bounded
+operation receipts remain available until the normal operation-history eviction.

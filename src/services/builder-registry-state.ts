@@ -241,7 +241,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         }
     });
     const reason = (current: Current): string | undefined => {
-      if (stale || !desired) return "registry-admission-closed";
+      if (stale || error || !desired) return "registry-admission-closed";
       if (!current.entry.enabled) return "builder-disabled";
       if (current.duplicate) return "duplicate-host";
       if (current.recheck || !current.identity || current.error)
@@ -558,6 +558,21 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           current.retryAt = 0;
         }
       },
+      enabled: (id: string) =>
+        !stale && !error && entries.get(id)?.entry.enabled === true,
+      matchesSource: (source: {
+        builderId: string;
+        source: string;
+        revision: number;
+      }) => {
+        const entry = entries.get(source.builderId)?.entry;
+        return (
+          desired === undefined ||
+          (!!entry &&
+            sourceReference(entry.secretSource) === source.source &&
+            entry.secretRevision === source.revision)
+        );
+      },
       // Private control-plane access. HTTP and tools must project sanitized fields.
       current: (id: string) => {
         const current = entries.get(id);
@@ -646,10 +661,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           Effect.sync(() => {
             error = cause.code;
             failures.set("registry", cause);
-            if (cause.code === "registry-mount-stale") {
-              stale = true;
-              for (const item of preparations.values()) item.controller.abort();
-            }
+            if (cause.code === "registry-mount-stale") stale = true;
+            for (const item of preparations.values()) item.controller.abort();
           }),
         ),
       ),

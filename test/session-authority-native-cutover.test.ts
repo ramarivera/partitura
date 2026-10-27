@@ -1,3 +1,4 @@
+import { chmod, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect, Option } from "effect";
@@ -6,11 +7,12 @@ import {
   InstallationRepo,
   RunRepo,
 } from "../src/services/store/repositories.js";
-import { document, entry } from "./fixtures/builder-registry.js";
+import { bytes, document, entry } from "./fixtures/builder-registry.js";
 import {
   cutoverFixture,
   cutoverRequest,
 } from "./fixtures/native-build-cutover.js";
+import { testAwait } from "./fixtures/native-build-effects.js";
 import { testPaths } from "./fixtures/paths.js";
 import { createAuthorityFixture } from "./session-authority-fixture.js";
 
@@ -96,6 +98,25 @@ it.live(
                 "state",
               ]);
               yield* live.jobs.wait(data.job);
+              const originalJob = live.state
+                .snapshot()
+                .jobs.find((job) => job.jobId === data.job);
+              expect(originalJob?.generationId).toBeDefined();
+              const sourcePath = join(
+                f.settings.fileSecretRoot ?? "",
+                "primary.json",
+              );
+              yield* testAwait(chmod(sourcePath, 0o600));
+              yield* testAwait(
+                writeFile(
+                  sourcePath,
+                  bytes({
+                    ...f.primary,
+                    hostname: "primary-rotated.example.test",
+                  }),
+                ),
+              );
+              yield* testAwait(chmod(sourcePath, 0o400));
               yield* f.write(
                 document([entry("primary", true, 2), entry("backup")]),
               );
@@ -105,6 +126,20 @@ it.live(
                 { id: "primary", available: true },
                 { id: "backup", available: true },
               ]);
+              const edited = yield* call("native_build_start", input);
+              expect(edited.isError).not.toBe(true);
+              const nextData = edited.details as { job: string };
+              yield* live.jobs.wait(nextData.job);
+              const editedJob = live.state
+                .snapshot()
+                .jobs.find((job) => job.jobId === nextData.job);
+              expect(editedJob?.generationId).not.toBe(
+                originalJob?.generationId,
+              );
+              expect(
+                live.state.snapshot().jobs.find((job) => job.jobId === data.job)
+                  ?.generationId,
+              ).toBe(originalJob?.generationId);
               yield* f.write(document([entry("backup")]));
               yield* live.registry.reload();
               yield* live.registry.awaitIdle();
@@ -137,7 +172,7 @@ it.live(
               expect(
                 (yield* call("native_build_cancel", { job: data.job })).isError,
               ).not.toBe(true);
-              expect(live.state.snapshot().jobs).toHaveLength(1);
+              expect(live.state.snapshot().jobs).toHaveLength(2);
             }),
           {
             nativeJobs: live.jobs,

@@ -1,11 +1,14 @@
-import { access, unlink, writeFile } from "node:fs/promises";
+import { access, readdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Deferred, Effect, Option } from "effect";
+import { BuilderRegistry } from "../src/services/builder-registry.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { NativeBuildServicesLive } from "../src/services/native-build-assembly.js";
 import { NativeBuildJobs } from "../src/services/native-build-jobs.js";
+import { NativeBuildSecretCache } from "../src/services/native-build-secret-cache.js";
 import { journalFile } from "../src/services/native-build-secret-journal.js";
+import { NativeBuildStateService } from "../src/services/native-build-state.js";
 import { document, entry } from "./fixtures/builder-registry.js";
 import {
   cutoverFixture,
@@ -25,14 +28,37 @@ it.live("registry unset acquires no registry services, mounts or helper", () =>
         expect(
           Option.isNone(yield* Effect.serviceOption(NativeBuildJobs)),
         ).toBe(true);
+        expect(
+          Option.isNone(yield* Effect.serviceOption(BuilderRegistry)),
+        ).toBe(true);
+        expect(
+          Option.isNone(yield* Effect.serviceOption(NativeBuildSecretCache)),
+        ).toBe(true);
+        expect(
+          Option.isNone(yield* Effect.serviceOption(NativeBuildStateService)),
+        ).toBe(true);
       }).pipe(
         Effect.provide(NativeBuildServicesLive),
         Effect.provideService(GatewayConfig, {
           ...f.config,
-          nativeBuildRegistry: { ...f.settings, registryFile: undefined },
+          nativeBuildRegistry: {
+            ...f.settings,
+            registryFile: undefined,
+            stateRoot: join(f.root, "unused-state"),
+          },
         }),
       );
-      expect(f.journal.snapshot().operations).toEqual([]);
+      expect(
+        yield* testAwait(
+          Bun.file(join(f.root, "unused-state", "owner.lock")).exists(),
+        ),
+      ).toBe(false);
+      expect(
+        yield* testAwait(
+          Bun.file(journalFile(join(f.root, "unused-state"))).exists(),
+        ),
+      ).toBe(false);
+      expect(yield* testAwait(readdir(f.root))).not.toContain("unused-state");
     }),
   ),
 );

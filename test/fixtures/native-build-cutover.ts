@@ -3,8 +3,10 @@ import { join } from "node:path";
 import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect";
 import { BuilderRegistry } from "../../src/services/builder-registry.js";
 import { GatewayConfig } from "../../src/services/config.js";
-import { BuilderRegistryConfig } from "../../src/services/config-native-build.js";
-import { RegistryNativeBuildServices } from "../../src/services/native-build-assembly.js";
+import {
+  NativeBuildRuntimeAdapters,
+  NativeBuildServicesLive,
+} from "../../src/services/native-build-assembly.js";
 import {
   NativeBuildJobs,
   NativeJobPreparation,
@@ -12,11 +14,7 @@ import {
 import type { NativeEngineOptions } from "../../src/services/native-build-registry-client.js";
 import { NativeBuildSecretCache } from "../../src/services/native-build-secret-cache.js";
 import { NativeSecretJournal } from "../../src/services/native-build-secret-journal.js";
-import {
-  NativeBuildStateService,
-  NativeStateConfig,
-} from "../../src/services/native-build-state.js";
-import { NativeTransportConfig } from "../../src/services/native-build-transport.js";
+import { NativeBuildStateService } from "../../src/services/native-build-state.js";
 import { configProvider } from "../admin-control-plane-helpers.js";
 import { bytes, document, entry, host } from "./builder-registry.js";
 import { testAwait } from "./native-build-effects.js";
@@ -84,30 +82,15 @@ export const cutoverFixture = Effect.fn("Test.cutoverFixture")(function* (
   ) {
     const lifetime = yield* Scope.fork(yield* Scope.Scope);
     const context = yield* Layer.build(
-      RegistryNativeBuildServices.pipe(
+      NativeBuildServicesLive.pipe(
         Layer.provide(Layer.succeed(GatewayConfig, config)),
-        Layer.provide(Layer.succeed(BuilderRegistryConfig, settings)),
         Layer.provide(
-          Layer.succeed(NativeStateConfig, {
-            stateRoot: settings.stateRoot,
-            cacheRoot: settings.cacheRoot,
-            scratchRoot: settings.scratchRoot,
-            bytesPerBuilder: settings.perBuilderBytes,
-            bytesTotal: settings.totalBytes,
-            otherRoots: [
-              ...(settings.otherRoots ?? []),
-              settings.fileSecretRoot ?? "",
-            ],
+          Layer.succeed(NativeBuildRuntimeAdapters, {
             filesystem: async () => ({
               type: 0x01021994,
               bavail: 1e9,
               bsize: 4096,
             }),
-          }),
-        ),
-        Layer.provide(
-          Layer.succeed(NativeTransportConfig, {
-            suffix: settings.suffix,
             executable: f.native.executable,
           }),
         ),
@@ -116,11 +99,11 @@ export const cutoverFixture = Effect.fn("Test.cutoverFixture")(function* (
     ).pipe(Effect.provideService(Scope.Scope, lifetime));
     return {
       context,
-      journal: Context.get(context, NativeSecretJournal),
-      cache: Context.get(context, NativeBuildSecretCache),
-      registry: Context.get(context, BuilderRegistry),
-      state: Context.get(context, NativeBuildStateService),
-      jobs: Context.get(context, NativeBuildJobs),
+      journal: Context.getUnsafe(context, NativeSecretJournal),
+      cache: Context.getUnsafe(context, NativeBuildSecretCache),
+      registry: Context.getUnsafe(context, BuilderRegistry),
+      state: Context.getUnsafe(context, NativeBuildStateService),
+      jobs: Context.getUnsafe(context, NativeBuildJobs),
       close: Scope.close(lifetime, Exit.void),
     };
   });

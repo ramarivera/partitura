@@ -22,6 +22,7 @@ import { makeBuilderRegistryState } from "./builder-registry-state.js";
 import { BuilderSecretProvider } from "./builder-secret-provider.js";
 import { BuilderRegistryConfig } from "./config-native-build.js";
 import { NativeBuildSecretCache } from "./native-build-secret-cache.js";
+import { neededNativeSources } from "./native-build-source-inventory.js";
 import {
   NativeBuildStateService,
   unresolvedRecovery,
@@ -63,6 +64,13 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
           ? secretCache.value.captureSupersede
           : undefined,
       );
+      if (Option.isSome(secretCache))
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            secretCache.value.observeDesired(state.matchesSource),
+          ),
+          (unsubscribe) => Effect.sync(unsubscribe),
+        );
       const transport = yield* Effect.serviceOption(NativeBuildTransport);
       if (Option.isSome(transport))
         yield* Effect.acquireRelease(
@@ -76,6 +84,17 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
           if (Option.isNone(secretCache)) return;
           const desired = state.snapshot().desired;
           if (!desired) return;
+          yield* secretCache.value
+            .retainNeeded(
+              neededNativeSources(desired, Option.getOrUndefined(nativeState)),
+            )
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Native provider retention unavailable", {
+                  code: error.code,
+                }),
+              ),
+            );
           yield* secretCache.value
             .revalidatePending(
               desired.builders

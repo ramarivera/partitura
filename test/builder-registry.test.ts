@@ -215,7 +215,7 @@ it.effect(
 );
 
 it.live(
-  "invalid snapshots retain last desired state and cold invalid input can be repaired locally",
+  "invalid snapshots retain last desired state with admission closed and cold invalid input can be repaired locally",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -236,7 +236,10 @@ it.live(
         expect(registry.snapshot().desired).toEqual(document());
         expect(registry.snapshot().error).toBe("default-not-configured");
         expect(JSON.stringify(registry.snapshot())).not.toContain("sentinel");
-        expect(registry.snapshot().entries[0]?.available).toBe(true);
+        expect(registry.snapshot().entries[0]?.available).toBe(false);
+        expect((yield* registry.admit().pipe(Effect.flip)).code).toBe(
+          "registry-admission-closed",
+        );
         yield* registryIO(() =>
           chmod(fixture.settings.registryFile ?? "", 0o644),
         );
@@ -248,6 +251,7 @@ it.live(
         yield* fixture.write(document());
         yield* registry.reload();
         expect(registry.snapshot().error).toBeUndefined();
+        expect(registry.snapshot().entries[0]?.available).toBe(true);
         expect(fake.reads).toEqual(["primary:1"]);
       }),
     ),

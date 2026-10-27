@@ -31,7 +31,7 @@ export class NativeBuildJobs extends Context.Service<NativeBuildJobs>()(
           return (
             !!admission &&
             !admission.signal.aborted &&
-            registry.current(job.builderId)?.entry.enabled === true
+            registry.enabled(job.builderId)
           );
         },
         submit: (job, persist) => {

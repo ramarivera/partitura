@@ -52,7 +52,7 @@ it.live(
           const record = builder === "primary" ? f.primary : f.backup;
           yield* importLegacyNativeSlot(
             registry.state,
-            Context.get(registry.context, NativeBuildTransport),
+            Context.getUnsafe(registry.context, NativeBuildTransport),
             {
               scratchRoot: legacy.config.scratchRoot,
               privateKeyPath: f.native.keyPath,
