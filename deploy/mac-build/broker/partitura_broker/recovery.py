@@ -180,6 +180,7 @@ def reconcile_locked(config, requested, daemon=False, deadline=None, allow_block
         api.durable_write(root / 'admission-epoch', uuid.uuid4().hex + '\n')
         for name in (*api.FENCES, 'runner.json', 'recovery.json'):
             api.durable_remove(root / name)
+        api.durable_remove(root / 'maintenance-reason')
         if allow_blocked and clear_blocked:
             api.durable_remove(root / 'maintenance-blocked')
         return 'reconciled', sorted(jobs)
@@ -200,6 +201,7 @@ def reconcile(config, job):
         if (api.read_state(root / 'maintenance-blocked') or '').startswith('installation-incomplete'):
             api.emit(config, 'cleanup-required', job=job)
             return 1
+        api.durable_remove(root / 'maintenance-reason')
         api.initialize_epoch(config)
         jobs = {job}
         try:
@@ -281,12 +283,16 @@ def maintenance_state(root, boot):
         raise ValueError('invalid maintenance state')
     if previous and previous['nextAt'] > time.time() + 900:
         previous['nextAt'] = 0  # A backwards clock step makes maintenance due.
+    if previous and (previous['boot'] != boot or previous['revision'] != api.BROKER_REVISION):
+        previous = dict(previous, nextAt=0, failures=0)
     inventory = previous is None or previous['boot'] != boot or previous['revision'] != api.BROKER_REVISION or not previous.get('inventoryComplete', previous['failures'] == 0)
     return previous, inventory
 
 
 def record_maintenance(root, boot, failures=0, inventory_complete=True):
     api.durable_write(root / 'maintenance.json', json.dumps(dict(boot=boot, revision=api.BROKER_REVISION, failures=failures, nextAt=time.time() + min(900, 60 * 2**max(0, failures - 1)) if failures else 0, inventoryComplete=inventory_complete)) + '\n')
+    if not failures and inventory_complete:
+        api.durable_remove(root / 'maintenance-reason')
 
 
 def history_gc_due(root):
@@ -299,7 +305,7 @@ def history_gc_due(root):
     return value['nextAt'] <= now or value['nextAt'] > now + 86400
 
 
-def prune_history(config):
+def prune_history(config, protected_jobs=()):
     """Bounded registry history GC. Expiry fences delayed submission commands.
 
     Legacy commands have no epoch or expiry: their anti-replay receipts and
@@ -310,6 +316,7 @@ def prune_history(config):
     skipped = 0
     if config.get('profile') == 'registry-only':
         protected, _ = api.obligations(config)
+        protected |= set(protected_jobs)
         cutoff = time.time() - api.HISTORY_RETENTION_SECONDS
         deadline = time.monotonic() + api.HISTORY_PASS_SECONDS
         for path in root.iterdir():
@@ -353,6 +360,23 @@ def prune_history(config):
     api.durable_write(root / 'history-gc.json', json.dumps(dict(nextAt=time.time() + (60 if len(expired) == 64 else 86400))) + '\n')
 
 
+def resource_jobs(config, jobs, runner):
+    """Under runner.lock, distinguish inert input debris from execution resources."""
+    root = Path(config['root'])
+    live = {job for name in api.FENCES if (job := api.fence_job(root / name))}
+    recovery = api.json_state(root / 'recovery.json')
+    if recovery:
+        live.update(recovery['jobs'])  # obligations() already validated this record.
+    if runner and runner['stage'] not in ('receiving', 'capacity'):
+        live.add(runner['job'])
+    for job in jobs:
+        kind, receipt = api.registry_status(config, job)
+        _, unlock = api.inspect_job_directory(root / job)
+        if unlock or (kind == 'known' and receipt['state'] == 'running') or api.verify_owned_clone(config, job):
+            live.add(job)
+    return live
+
+
 def local_maintenance(config):
     deadline = time.monotonic() + 120
     root = Path(config['root'])
@@ -361,19 +385,29 @@ def local_maintenance(config):
     previous, inventory = api.maintenance_state(root, boot)
     blocked = api.read_state(root / 'maintenance-blocked') is not None
     if blocked:
-        return 1  # Only successful explicit revalidation may remove this flag.
+        return 0  # Reported by health; repeating an operator block isn't a crash.
     jobs, _ = api.obligations(config)
     inventory |= api.read_state(root / 'inventory-required') is not None
     if previous and time.time() < previous['nextAt']:
-        return 1  # Backoff also applies before the first successful inventory.
+        return 0  # A scheduled backoff wait completed normally.
     gc_due = api.history_gc_due(root)
     if not inventory and not jobs and not gc_due:
-        return 0
+        if api.read_state(root / 'maintenance-reason') is None:
+            return 0
     with api.run_lock(config, 0) as acquired:
         if not acquired:
             return 0  # A live owner is responsible for its own obligations.
-        jobs, _ = api.obligations(config)
+        # SSH reconciliation may have completed while we were acquiring the lock.
+        previous, inventory = api.maintenance_state(root, boot)
+        inventory |= api.read_state(root / 'inventory-required') is not None
+        if api.read_state(root / 'maintenance-blocked') is not None:
+            return 0
+        if api.fence_job(root / 'keychain-relock-pending') and not api.daemon_relock_qualified(config):
+            api.durable_write(root / 'maintenance-reason', 'keychain-relock-pending\n')
+            return 0  # Only SSH or a newly qualified daemon can finish this step.
+        jobs, runner = api.obligations(config)
         complete = not inventory
+        reason = None
         try:
             if inventory and len(jobs) <= 6:
                 api.durable_write(root / 'inventory-required', 'inventory-pending\n')
@@ -382,19 +416,52 @@ def local_maintenance(config):
                     complete = True
                 except api.InventoryPending as pending:
                     jobs |= pending.jobs
+            # Only execution resources need owner proof. A receipt-less empty
+            # directory or partial input cannot be in use with runner.lock free.
+            live = resource_jobs(config, jobs, runner)
+            if live and runner is not None and live - {runner['job']}:
+                reason = 'runner-owner-ambiguous'
+            elif live and runner is None:
+                reason = 'runner-owner-missing'
+            elif live:
+                reason = api.owner_block_reason(runner, boot)
+            if reason:
+                api.durable_write(root / 'inventory-required', 'inventory-pending\n')
+                api.durable_write(root / 'maintenance-reason', reason + '\n')
+                failures = min(16, (previous or {}).get('failures', 0) + 1)
+                api.record_maintenance(root, boot, failures, inventory_complete=False)
+                # Retention can proceed for unrelated terminal history. Protect
+                # every discovered job. An incomplete scan cannot establish the
+                # full protected set, so leave retention for a completed scan.
+                if complete and gc_due and deadline - time.monotonic() >= api.HISTORY_PASS_SECONDS * 2:
+                    try:
+                        api.prune_artifacts(root, protected_jobs=jobs)
+                        api.prune_history(config, protected_jobs=jobs)
+                    except (OSError, ValueError):
+                        print('housekeeping-pass-failed', file=sys.stderr)
+                return 0
             result, _ = api.reconcile_locked(config, jobs, daemon=True, deadline=deadline) if jobs else ('idle', [])
             if complete:
                 api.durable_remove(root / 'inventory-required')
             else:
                 result = 'cleanup-required'
+                reason = 'inventory-incomplete'
         except ValueError:
             api.durable_write(root / 'maintenance-blocked', 'inventory-invalid\n')
             result = 'cleanup-required'
+            reason = 'inventory-invalid'
             complete = False
         except (OSError, subprocess.SubprocessError):
             # IO failures are retryable. No operator-only flag is manufactured.
             result = 'cleanup-required'
+            reason = 'inventory-unavailable'
             complete = False
+        if reason is None and result in ('cleanup-required', 'keychain-relock-pending'):
+            reason = result
+        if reason:
+            api.durable_write(root / 'maintenance-reason', reason + '\n')
+        else:
+            api.durable_remove(root / 'maintenance-reason')
         # Housekeeping cannot create an operator-required inventory flag. A
         # failed pass retries with backoff while the completed inventory stays
         # valid; unsafe individual entries are retained and counted by pruning.
@@ -407,7 +474,7 @@ def local_maintenance(config):
                 result = 'host-maintenance'
         failures = min(16, (previous or {}).get('failures', 0) + 1) if result in ('cleanup-required', 'keychain-relock-pending', 'host-maintenance') else 0
         api.record_maintenance(root, boot, failures, inventory_complete=complete)
-        return 1 if failures else 0
+        return 1 if failures and result != 'keychain-relock-pending' else 0
 
 
 def refuse(config, request, code, persist=True):

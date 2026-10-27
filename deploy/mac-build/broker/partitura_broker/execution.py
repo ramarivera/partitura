@@ -115,6 +115,10 @@ class RunnerMarker:
             api.durable_write(self.root / 'runner.json', json.dumps(self.value) + '\n')
 
     def start(self):
+        start = api.process_start(os.getpid())
+        if start is None:
+            raise ValueError('own process birth time unavailable')
+        self.value['owner'] = dict(pid=os.getpid(), start=start, boot=api.boot_id())
         self.publish()
         self.thread.start()
 

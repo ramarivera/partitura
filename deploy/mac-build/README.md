@@ -649,22 +649,53 @@ broker revision. Boot identity uses `kern.bootsessionuuid`; revision is the
 sealed broker source SHA-256. There's no entry-count admission limit. Each
 inventory scan has a ten-second budget and discovers at most 58 cleanup jobs,
 leaving room for existing markers in the 64-job recovery record. Incomplete
-inventories retain an admission fence and continue in bounded cleanup batches.
+inventories retain an admission fence. Explicit reconciliation continues in
+bounded cleanup batches when daemon recovery lacks owner evidence.
 There is no scan resume cursor. If history alone exceeds the ten-second budget,
 retries can revisit the same prefix forever, keeping health `inventory-pending`
-and refusing both registry and legacy builds. GC waits for complete inventory,
-so it cannot resolve that case. An approved host-admin archival procedure or a
-future resumable scan is required before a host reaches that scale. The
-threshold depends on the filesystem and hasn't been qualified on APFS.
+and refusing both registry and legacy builds. An approved host-admin archival
+procedure or a future resumable scan is required before a host reaches that scale.
+The threshold depends on the filesystem and hasn't been qualified on APFS.
 Subsequent idle minute passes read markers and return without taking the lock or
 scanning history, except when periodic history GC is due. If `run-v2` wins the
 boot race, it performs the same inventory under the lock before input. With an
 obligation, maintenance tries the lock nonblocking and leaves live owners alone.
 
+New runners persist their PID, UTC process birth time and boot UUID privately in
+`runner.json` before receiving input. Maintenance daemon recovery first acquires
+the exclusive runner lock. Jobs with a clone, unlock evidence, a running receipt,
+a safety fence or a recovery entry require an absent original PID, a different
+birth time for that PID, or a different valid boot UUID. A matching process stays
+blocked even with a free lock. Birth times have second resolution, so PID reuse
+within the same second conservatively looks alive. Missing, malformed or
+unreadable owner evidence, including markerless migration debris or additional
+jobs with execution resources, leaves VMs untouched and reports
+`runner-owner-missing`, `runner-owner-unavailable`, `runner-owner-alive` or
+`runner-owner-ambiguous`. Inert directories and partial input without execution
+resources are cleaned automatically, even without a marker. Owner-evidence
+blocks keep exponential backoff and allow bounded retention of unrelated terminal
+history, while all discovered jobs remain protected.
+Explicit SSH reconciliation remains the repair route for older jobs. Proven
+dead jobs use the same exact-clone validation, Tart stop/delete, interrupted
+receipt, partial-input removal, keychain recovery and epoch fencing as manual
+reconciliation. No process is signaled by a stored PID.
+
+Authenticated SSH paths, including resubmission, legacy pre-input recovery and
+legacy cancellation, retain lock-only reconciliation for older owner-less jobs.
+The broker holds this non-inherited lock through the entire build, cleanup and
+result emission. A live process can release it only after `run_job` has returned;
+it cannot resume VM work, even if its final stdout flush stalls. Retrying residual
+cleanup under that lock is safe. The unattended daemon additionally demands
+process identity proof before touching execution resources.
+
 Each cleanup pass has a 120-second deadline. Transient IO failures retry with
 exponential backoff from sixty seconds to fifteen minutes, including retries of
-the first boot inventory. Pending backoff or a maintenance block returns
-nonzero. Validated malformed, linked, foreign or unsafe inventory objects set
+the first boot inventory. A new boot or broker revision starts inventory without
+inheriting an older pass's backoff. Waiting for backoff, operator repair or an
+unqualified keychain relock exits normally while health stays blocked. Inventory
+IO failures report `inventory-unavailable`; invalid inventory reports
+`inventory-invalid`, and budget exhaustion reports `inventory-incomplete`.
+Validated malformed, linked, foreign or unsafe inventory objects set
 `maintenance-blocked` with a fixed reason and require host-admin repair.
 Ordinary IO failures and large history never manufacture that operator-only
 flag.

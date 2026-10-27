@@ -256,7 +256,7 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
         previous = json.loads((self.root / 'maintenance.json').read_text())
         self.assertFalse(previous['inventoryComplete'])
         with patch.object(broker, 'inventory_obligations', side_effect=AssertionError('ignored backoff')):
-            self.assertEqual(self.maintenance(), 1)
+            self.assertEqual(self.maintenance(), 0)
             request = (self.request[0], 'b'*32, *self.request[2:])
             self.assertEqual(self.invoke(request)[1]['code'], 'host-maintenance')
         with patch.object(broker.time, 'time', return_value=previous['nextAt'] + 1):
@@ -270,7 +270,7 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
             self.assertEqual(self.maintenance(), 1)
         first = json.loads((self.root / 'maintenance.json').read_text())
         with patch.object(broker, 'run_lock', side_effect=AssertionError('ignored boot backoff')):
-            self.assertEqual(self.maintenance(), 1)
+            self.assertEqual(self.maintenance(), 0)
         with patch.object(broker.time, 'time', return_value=first['nextAt'] + 1):
             self.assertEqual(self.maintenance(), 0)
         self.assertFalse((self.root / 'maintenance-blocked').exists())
@@ -280,7 +280,7 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
         malformed = self.root / 'vms' / 'partitura-job-operator'
         malformed.mkdir()
         self.assertEqual(self.maintenance(), 1)
-        self.assertEqual(self.maintenance(), 1)
+        self.assertEqual(self.maintenance(), 0)
         self.assertEqual(self.reconcile()[1]['kind'], 'cleanup-required')
         self.assertTrue((self.root / 'maintenance-blocked').exists())
         malformed.rmdir()  # Fake host-admin repair, not a production host action.
@@ -295,14 +295,14 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
         def destroy(config, job, deadline=None):
             shutil.rmtree(Path(config['tartHome']) / 'vms' / ('partitura-job-' + job))
         with patch.object(broker, 'destroy_vm', side_effect=destroy):
-            self.assertEqual(self.maintenance(), 1)
-            with patch.object(broker, 'inventory_obligations', side_effect=AssertionError('ignored boot backoff')):
-                self.assertEqual(self.invoke()[1]['code'], 'host-reconciled')
+            self.assertEqual(self.maintenance(), 0)
+            self.assertIn('runner-owner-missing', self.wire('health')[1]['reasons'])
             for _ in range(5):
                 code, result = self.reconcile()
                 if code == 0:
                     break
-        self.assertEqual((code, result['kind']), (0, 'reconciled-terminal'))
+        self.assertEqual((code, result['kind']), (0, 'reconciled-unknown'))
+        self.assertFalse((self.root / self.job).exists())
         self.assertFalse((self.root / 'maintenance-blocked').exists())
         self.assertFalse((self.root / 'inventory-required').exists())
         self.assertEqual(list((self.root / 'vms').iterdir()), [self.root / 'vms' / self.config['base']])
@@ -314,7 +314,9 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
         self.clone()
         self.clone('b'*32)
         broker.durable_write(self.root / 'active-vm', self.job + '\n')
-        self.assertEqual(self.maintenance(), 1)
+        # A previously fenced multi-job recovery still completes via legacy cancel.
+        broker.durable_write(self.root / 'recovery.json', json.dumps(dict(jobs=[self.job, 'b'*32], relock=True)) + '\n')
+        self.assertEqual(self.maintenance(), 0)
         self.assertEqual(set(json.loads((self.root / 'recovery.json').read_text())['jobs']), {self.job, 'b'*32})
         self.keychain.lock.side_effect = broker.KeychainError('lock failed')
         code, result = self.wire('cancel ' + self.job)
@@ -354,7 +356,8 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
 
     def test_health_distinguishes_pending_daemon_relock_from_failed_ssh_cleanup(self):
         self.clone()
-        self.assertEqual(self.maintenance(), 1)
+        self.marker(stage='workflow')
+        self.assertEqual(self.maintenance(), 0)
         self.assertFalse((self.root / 'cleanup-required').exists())
         self.assertEqual(self.wire('health')[1]['reasons'], ['keychain-relock-pending'])
         self.keychain.lock.side_effect = broker.KeychainError('failed SSH relock')

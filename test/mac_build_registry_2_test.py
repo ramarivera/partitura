@@ -200,7 +200,7 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
         self.marker(stage='workflow')
         broker.durable_write(self.root / 'unlock-attempt', self.job + '\n')
         broker.durable_write(self.root / 'active-vm', self.job + '\n')
-        self.assertEqual(self.maintenance(), 1)
+        self.assertEqual(self.maintenance(), 0)
         self.assertFalse(clone.exists())
         broker.LoginKeychain.assert_not_called()
         self.keychain.lock.assert_not_called()
@@ -214,14 +214,15 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
 
     def test_completed_inventory_pending_relock_is_not_rescanned_and_run_can_recover_during_backoff(self):
         self.clone('b'*32)
+        self.marker('b'*32, stage='workflow')
         with patch.object(broker, 'inventory_obligations', wraps=broker.inventory_obligations) as inventory:
-            self.assertEqual(self.maintenance(), 1)
+            self.assertEqual(self.maintenance(), 0)
             self.assertEqual(inventory.call_count, 1)
             self.assertFalse((self.root / 'inventory-required').exists())
             previous = json.loads((self.root / 'maintenance.json').read_text())
             self.assertTrue(previous['inventoryComplete'])
             with patch.object(broker.time, 'time', return_value=previous['nextAt'] + 1):
-                self.assertEqual(self.maintenance(), 1)
+                self.assertEqual(self.maintenance(), 0)
             self.assertEqual(inventory.call_count, 1)
             self.assertEqual(self.invoke()[1]['code'], 'host-reconciled')
             self.assertEqual(inventory.call_count, 1)
@@ -232,11 +233,12 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
     def test_daemon_build_mismatch_disables_relock_and_backoff_skips_until_due(self):
         self.config.update(daemonRelockQualified=True, daemonRelockMacOSBuild='25A1')
         self.clone()
+        self.marker(stage='workflow')
         with patch.object(broker, 'macos_build', return_value='25B2'):
-            self.assertEqual(self.maintenance(), 1)
+            self.assertEqual(self.maintenance(), 0)
         self.keychain.lock.assert_not_called()
         with patch.object(broker, 'run_lock', side_effect=AssertionError('backoff took lock')):
-            self.assertEqual(self.maintenance(), 1)
+            self.assertEqual(self.maintenance(), 0)
         self.assertEqual(broker.admission_epoch(self.config), self.epoch)
         self.assertTrue(self.config['daemonRelockQualified'])  # No sealed-setting rewrite.
 
@@ -244,6 +246,7 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
     def test_qualified_daemon_requires_locked_readback_and_preserves_fence_on_failure(self):
         self.config.update(daemonRelockQualified=True, daemonRelockMacOSBuild='25A1')
         self.clone()
+        self.marker(stage='workflow')
         self.keychain.state.return_value = 'unlocked'
         with patch.object(broker, 'macos_build', return_value='25A1'):
             self.assertEqual(self.maintenance(), 1)
@@ -254,6 +257,7 @@ class RegistryBrokerTests(RegistryFixture, unittest.TestCase):
     def test_qualified_daemon_rotates_only_after_locked_readback(self):
         self.config.update(daemonRelockQualified=True, daemonRelockMacOSBuild='25A1')
         self.clone()
+        self.marker(stage='workflow')
         with patch.object(broker, 'macos_build', return_value='25A1'):
             self.assertEqual(self.maintenance(), 0)
         self.keychain.lock.assert_called_once()
