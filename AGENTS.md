@@ -55,8 +55,10 @@ and both run in `bun run check`, so an oversized file can't merge:
   in `biome.json`. The rule isn't in the `recommended` preset, so it must stay
   configured explicitly.
 - `test/file-size-limit.test.ts` counts raw lines in `src/`, `test/` and
-  `deploy/` TypeScript, JavaScript and CSS. Biome doesn't count lines inside a
-  template literal, so it misses files that hold one large HTML or CSS string.
+  `deploy/` TypeScript, JavaScript, CSS, Python and shell scripts. Biome
+  doesn't count lines inside a template literal, so it misses files that hold
+  one large HTML or CSS string, and it doesn't lint Python or shell at all.
+  Markdown documentation is exempt.
 
 Don't raise the limit, add a `biome-ignore` comment, exclude a path in
 `biome.json` or the guard test, or lower the rule's severity to get a change

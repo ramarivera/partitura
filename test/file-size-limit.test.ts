@@ -4,11 +4,12 @@ import { describe, expect, it } from "@effect/vitest";
 
 // Biome's style/noExcessiveLinesPerFile enforces the same 800-line cap, but it
 // doesn't count lines inside a template literal, so a file holding one large
-// HTML or CSS string passes it. This guard counts raw lines.
+// HTML or CSS string passes it, and it doesn't lint Python or shell scripts.
+// This guard counts raw lines. Markdown is exempt.
 const MAX_LINES = 800;
 const ROOT = join(import.meta.dirname, "..");
 const DIRECTORIES = ["src", "test", "deploy"];
-const EXTENSIONS = /\.(?:[cm]?[jt]sx?|css)$/;
+const EXTENSIONS = /\.(?:[cm]?[jt]sx?|css|py|sh)$/;
 
 const sourceFiles = (directory: string): ReadonlyArray<string> =>
   readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
