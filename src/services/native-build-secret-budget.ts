@@ -7,6 +7,7 @@ import {
   day,
   hour,
   type SecretBucket,
+  type SecretJournalData,
 } from "./native-build-secret-models.js";
 import { NativeSecretError } from "./native-build-secret-protocol.js";
 
@@ -25,9 +26,12 @@ export class NativeSecretBudget extends Context.Service<NativeSecretBudget>()(
             source: string,
             org: string,
             now: number,
+            eligible?: (data: SecretJournalData) => boolean,
           ) =>
             journal
               .transaction((data, at) => {
+                if (eligible && !eligible(data))
+                  throw NativeSecretError.new("provider-operation-superseded");
                 if (units !== 4 && units !== 12)
                   throw NativeSecretError.new("provider-budget-invalid");
                 let fit = Math.max(

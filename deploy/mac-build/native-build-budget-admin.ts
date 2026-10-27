@@ -4,6 +4,14 @@ import { NativeSecretAdmin } from "../../src/services/native-build-secret-admin.
 import { NativeSecretError } from "../../src/services/native-build-secret-protocol.js";
 import { NativeStateConfig } from "../../src/services/native-build-state-ownership.js";
 
+export const setupNativeBudget = Effect.fn("NativeBudgetAdmin.setup")(
+  function* (...args: Parameters<(typeof NativeSecretAdmin.Service)["setup"]>) {
+    const service = yield* NativeSecretAdmin;
+    return yield* service.setup(...args);
+  },
+  Effect.provide(NativeSecretAdmin.layer),
+);
+
 export const runNativeBudgetAdmin = () => {
   const main = Effect.scoped(
     Effect.gen(function* () {
@@ -50,10 +58,7 @@ export const runNativeBudgetAdmin = () => {
         return yield* Effect.fail(
           NativeSecretError.new("provider-budget-invalid"),
         );
-      const service = yield* NativeSecretAdmin.pipe(
-        Effect.provide(NativeSecretAdmin.layer),
-      );
-      return yield* service.setup(
+      return yield* setupNativeBudget(
         command === "budget-repair" ? "repair" : "initialize",
         values.get("--actor") ?? "",
         values.get("--reason") ?? "",

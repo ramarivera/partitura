@@ -14,6 +14,7 @@ import { BuilderRegistryFiles } from "./builder-registry-files.js";
 import { BuilderRegistryIdentity } from "./builder-registry-identity.js";
 import { BuilderRegistryError } from "./builder-registry-json.js";
 import {
+  credentialRevision,
   parseBuilderRegistry,
   sourceReference,
 } from "./builder-registry-schema.js";
@@ -38,7 +39,21 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
       let capacityError: string | undefined;
       const identity = yield* BuilderRegistryIdentity;
       const scope = yield* Scope.Scope;
-      const state = yield* makeBuilderRegistryState(provider, identity);
+      const state = yield* makeBuilderRegistryState(
+        provider,
+        identity,
+        Date.now,
+        (ids) =>
+          Option.isSome(secretCache)
+            ? secretCache.value
+                .supersede(ids)
+                .pipe(
+                  Effect.mapError((error) =>
+                    BuilderRegistryError.new(error.code),
+                  ),
+                )
+            : Effect.void,
+      );
       const reloadGate = yield* Semaphore.make(1);
       const hints = yield* Queue.dropping<void>(1);
       let directory:
@@ -74,9 +89,14 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
               262_144,
             );
             const nextDigest = createHash("sha256").update(bytes).digest("hex");
-            if (digest === nextDigest && state.snapshot().error === undefined)
+            if (
+              digest === nextDigest &&
+              state.snapshot().error === undefined &&
+              !capacityError
+            )
               return;
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
+            const blocked = new Set<string>();
             if (Option.isSome(secretCache)) {
               const capacity = yield* secretCache.value
                 .capacity(
@@ -96,13 +116,27 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
                 );
               if (!capacity.sufficient) {
                 capacityError = "budget-capacity";
-                return;
-              }
-              capacityError = undefined;
+                const previous = state.snapshot();
+                for (const entry of snapshot.builders) {
+                  const old = previous.desired?.builders.find(
+                    (old) => old.id === entry.id,
+                  );
+                  if (
+                    entry.enabled &&
+                    entry.secretSource.type === "onepassword" &&
+                    (!old?.enabled ||
+                      credentialRevision(old) !== credentialRevision(entry) ||
+                      previous.entries.find((old) => old.id === entry.id)
+                        ?.reason === "budget-capacity")
+                  )
+                    blocked.add(entry.id);
+                }
+              } else capacityError = undefined;
             }
             yield* state.publish(
               snapshot,
               state.snapshot().desired ? "registry" : "startup",
+              blocked,
             );
             digest = nextDigest;
           }).pipe(Effect.catch((cause) => state.fault(cause))),

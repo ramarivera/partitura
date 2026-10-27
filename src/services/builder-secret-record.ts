@@ -35,6 +35,17 @@ export const normalizeBuilderFileRecord = Effect.fn(
       BuilderRegistryError.new("builder-record-invalid", cause),
     ),
   );
+  return yield* normalizeBuilderRecord(record, source, suffix);
+});
+
+/** Validate an already schema-decoded record without serializing and decoding it again. */
+export const normalizeBuilderRecord = Effect.fn(
+  "BuilderSecretProvider.normalizeRecord",
+)(function* (
+  record: typeof BuilderFileRecord.Type,
+  source: string,
+  suffix: string,
+) {
   return yield* Effect.try({
     try: (): BuilderCredential => {
       const key = (encoded: string) => {

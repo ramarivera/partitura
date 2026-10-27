@@ -1,6 +1,7 @@
 import {
   Clock,
   Context,
+  Deferred,
   Effect,
   Layer,
   Queue,
@@ -67,6 +68,12 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
       const clock = yield* Clock.Clock;
       const now = () => clock.currentTimeMillisUnsafe();
       const wake = yield* Queue.dropping<void>(1);
+      let changed = yield* Deferred.make<void>();
+      const notify = Effect.fn("NativeBuildSecretCache.notify")(function* () {
+        const previous = changed;
+        changed = yield* Deferred.make<void>();
+        yield* Deferred.succeed(previous, undefined);
+      });
       const dispatch = yield* Semaphore.make(1);
       const cache = new Map<string, BuilderCredential>();
       let cycleRecorded = false;
@@ -94,14 +101,16 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
             }
       }, now());
       const progress = (id: string) => {
-        const operation = journal
-          .snapshot()
-          .operations.find((item) => item.id === id);
+        const snapshot = journal.snapshot();
+        const operation = snapshot.operations.find((item) => item.id === id);
         if (!operation) return undefined;
         return {
           id,
           acceptedAt: operation.acceptedAt,
-          deadline: operation.deadline,
+          deadline: Math.min(
+            operation.deadline,
+            ...operation.sources.map((work) => work.deadline),
+          ),
           done: operation.sources.every(terminal),
           sources: operation.sources.map((work) => ({
             builderId: work.builderId,
@@ -112,7 +121,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
             code: work.code,
             readStartedAt: work.readStartedAt,
             completedAt: work.completedAt,
-            lastSuccessAt: journal.snapshot().successes[sourceKey(work)],
+            lastSuccessAt: snapshot.successes[sourceKey(work)],
           })),
         };
       };
@@ -246,9 +255,16 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
             const stopped =
               kind === "startup" ? data.startupStops[key] : undefined;
             const resume =
-              kind === "startup" && previous && previous.status !== "succeeded";
-            const cachedNoop =
-              kind === "agent" && data.successes[key] !== undefined;
+              kind === "startup" &&
+              previous &&
+              previous.status !== "succeeded" &&
+              previous.status !== "superseded" &&
+              !(
+                previous.status === "failed" &&
+                (data.successes[key] ?? -1) >
+                  (previous.completedAt ?? previous.createdAt)
+              );
+            const cachedNoop = kind === "agent" && cache.has(key);
             return {
               ...source,
               createdAt:
@@ -282,230 +298,282 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
           return operation.id;
         }, now());
         yield* Queue.offer(wake, undefined);
+        yield* notify();
         return id;
       });
-      const tick = Effect.fn("NativeBuildSecretCache.tick")(() =>
-        dispatch.withPermit(
-          Effect.gen(function* () {
-            const expired = new Map<
-              string,
-              { builderId: string; code: string; nextFit: number }
-            >();
-            const selected = yield* journal.transaction((data, at) => {
-              for (const operation of data.operations)
-                for (const work of operation.sources)
-                  if (work.status === "pending" && work.deadline <= at) {
-                    work.status = "failed";
-                    work.code = work.code ?? "provider-startup-expired";
-                    work.completedAt = at;
-                    if (operation.kind === "startup")
-                      expired.set(sourceKey(work), {
-                        builderId: work.builderId,
-                        code: work.code,
-                        nextFit: work.nextFit,
-                      });
-                    if (operation.kind === "startup")
-                      data.startupStops[sourceKey(work)] = {
-                        code: work.code,
-                        createdAt: work.createdAt,
-                        deadline: work.deadline,
-                        attempts: work.attempts,
-                        nextFit: work.nextFit,
-                      };
-                  }
-              const candidates = data.operations.flatMap((operation) =>
-                operation.sources
-                  .filter((work) => work.status === "pending")
-                  .map((work) => ({ operation, work })),
-              );
-              const queue = runnable(candidates);
-              const ready = queue.find(({ work }) => work.nextFit <= at);
-              return ready
-                ? { operation: ready.operation, work: ready.work }
-                : undefined;
-            }, now());
-            yield* Effect.forEach([...expired.values()], (attention) =>
-              Effect.logWarning(
-                "Native provider startup expired; human resolution required",
-                attention,
-              ),
-            );
-            if (!selected) return;
-            const { operation, work } = selected,
-              key = sourceKey(work);
-            let started: number | undefined;
-            let dispatched = false;
-            const bucket: SecretBucket =
-              operation.kind === "startup"
-                ? work.attempts
-                  ? "retry"
-                  : "bootstrap"
-                : operation.kind === "agent"
-                  ? "agent"
-                  : "human";
-            const mark = Effect.fn("NativeBuildSecretCache.started")(function* (
-              reading = true,
-            ) {
-              const at = yield* journal.transaction((data, at) => {
-                for (const op of data.operations)
-                  for (const candidate of op.sources) {
-                    if (
-                      sourceKey(candidate) !== key ||
-                      !(
-                        candidate.status === "pending" ||
-                        (reading &&
-                          candidate.status === "running" &&
-                          candidate.readStartedAt === undefined)
-                      )
-                    )
-                      continue;
-                    if (candidate.status === "pending") {
-                      candidate.attempts++;
-                      delete candidate.readStartedAt;
-                      delete candidate.code;
+      const tick = Effect.fn("NativeBuildSecretCache.tick")(
+        () =>
+          dispatch.withPermit(
+            Effect.gen(function* () {
+              const expired = new Map<
+                string,
+                { builderId: string; code: string; nextFit: number }
+              >();
+              const selected = yield* journal.transaction((data, at) => {
+                for (const operation of data.operations)
+                  for (const work of operation.sources)
+                    if (work.status === "pending" && work.deadline <= at) {
+                      work.status = "failed";
+                      work.code = work.code ?? "provider-startup-expired";
+                      work.completedAt = at;
+                      if (operation.kind === "startup")
+                        expired.set(sourceKey(work), {
+                          builderId: work.builderId,
+                          code: work.code,
+                          nextFit: work.nextFit,
+                        });
+                      if (operation.kind === "startup")
+                        data.startupStops[sourceKey(work)] = {
+                          code: work.code,
+                          createdAt: work.createdAt,
+                          deadline: work.deadline,
+                          attempts: work.attempts,
+                          nextFit: work.nextFit,
+                        };
                     }
-                    candidate.status = "running";
-                    if (reading) candidate.readStartedAt = at;
-                  }
-                return at;
+                const candidates = data.operations.flatMap((operation) =>
+                  operation.sources
+                    .filter((work) => work.status === "pending")
+                    .map((work) => ({ operation, work })),
+                );
+                const queue = runnable(candidates);
+                const ready = queue.find(({ work }) => work.nextFit <= at);
+                return ready
+                  ? { operation: ready.operation, work: ready.work }
+                  : undefined;
               }, now());
-              dispatched = true;
-              if (reading) started = at;
-            });
-            yield* Effect.gen(function* () {
-              if (
-                operation.kind === "startup" &&
-                work.source.startsWith("onepassword:") &&
-                !cycleRecorded
-              ) {
-                const fit = yield* budget.startupCycle(now());
-                if (fit > now())
-                  return yield* Effect.fail(
-                    NativeSecretError.new("startup-crash-backoff", fit),
-                  );
-                cycleRecorded = true;
-              }
-              if (!work.source.startsWith("onepassword:")) {
-                yield* mark();
-              }
-              const record = yield* reader.read(
-                work.source,
-                (units) =>
-                  budget
-                    .reserve(bucket, units, work.source, operation.org, now())
-                    .pipe(Effect.andThen(mark(false))),
-                () => mark(),
-              );
-              if (started === undefined) yield* mark(); // File sources have the same operation semantics and no provider debit.
-              const credential = yield* normalizeBuilderFileRecord(
-                Buffer.from(JSON.stringify(record)),
-                work.source,
-                settings.suffix,
-              ).pipe(
-                Effect.mapError(() =>
-                  NativeSecretError.new("builder-record-invalid"),
+              yield* Effect.forEach([...expired.values()], (attention) =>
+                Effect.logWarning(
+                  "Native provider startup expired; human resolution required",
+                  attention,
                 ),
               );
-              yield* journal.transaction((data, at) => {
-                if (
-                  Object.keys(data.successes).length >= 320 &&
-                  data.successes[key] === undefined
-                )
-                  throw NativeSecretError.new("provider-queue-full");
-                data.successes[key] = at;
-                delete data.startupStops[key];
-                for (const op of data.operations)
-                  for (const candidate of op.sources)
-                    if (
-                      candidate.status === "running" &&
-                      sourceKey(candidate) === key &&
-                      candidate.readStartedAt === started
-                    ) {
-                      candidate.status = "succeeded";
-                      candidate.completedAt = at;
-                      delete candidate.code;
-                    }
-              }, now());
-              cache.set(key, credential);
-            }).pipe(
-              Effect.catch((error) =>
-                Effect.gen(function* () {
-                  yield* journal.transaction((data, at) => {
-                    if (error.code === "provider-rate-limited")
-                      data.providerBackoff = Math.max(
-                        data.providerBackoff,
-                        at + 900000,
-                        error.nextFit ?? 0,
-                      );
+              if (!selected) return;
+              const { operation, work } = selected,
+                key = sourceKey(work);
+              let started: number | undefined;
+              let dispatched = false;
+              const bucket: SecretBucket =
+                operation.kind === "startup"
+                  ? work.attempts
+                    ? "retry"
+                    : "bootstrap"
+                  : operation.kind === "agent"
+                    ? "agent"
+                    : "human";
+              const mark = Effect.fn("NativeBuildSecretCache.started")(
+                function* (reading = true) {
+                  const at = yield* journal.transaction((data, at) => {
+                    let matched = false;
                     for (const op of data.operations)
                       for (const candidate of op.sources) {
                         if (
                           sourceKey(candidate) !== key ||
-                          (!dispatched
-                            ? candidate.status !== "pending"
-                            : candidate.status !== "running" ||
-                              candidate.readStartedAt !== started)
+                          !(
+                            candidate.status === "pending" ||
+                            (reading &&
+                              candidate.status === "running" &&
+                              candidate.readStartedAt === undefined)
+                          )
                         )
                           continue;
-                        candidate.code = error.code;
-                        const fit = Math.max(
-                          at +
-                            (candidate.attempts
-                              ? retryDelay(candidate.attempts)
-                              : 1),
-                          error.nextFit ?? 0,
-                          data.cooldowns[candidate.source] ?? 0,
-                          data.providerBackoff,
-                        );
-                        const retry = !dispatched
-                          ? error.code === "provider-budget-exhausted" ||
-                            error.code === "startup-crash-backoff"
-                          : op.kind === "startup" &&
-                            transient.has(error.code) &&
-                            candidate.attempts < 8;
-                        candidate.status =
-                          retry && fit < candidate.deadline
-                            ? "pending"
-                            : "failed";
-                        candidate.nextFit = fit;
-                        if (candidate.status === "failed") {
-                          candidate.completedAt = at;
-                          if (op.kind === "startup")
-                            data.startupStops[key] = {
-                              code: error.code,
-                              createdAt: candidate.createdAt,
-                              deadline: candidate.deadline,
-                              attempts: candidate.attempts,
-                              nextFit: candidate.nextFit,
-                            };
+                        matched = true;
+                        if (candidate.status === "pending") {
+                          candidate.attempts++;
+                          delete candidate.readStartedAt;
+                          delete candidate.code;
                         }
+                        candidate.status = "running";
+                        if (reading) candidate.readStartedAt = at;
                       }
+                    if (!matched)
+                      throw NativeSecretError.new(
+                        "provider-operation-superseded",
+                      );
+                    return at;
                   }, now());
-                  yield* Effect.logWarning(
-                    "Native provider operation needs attention",
-                    {
-                      builderId: work.builderId,
-                      code: error.code,
-                      nextFit: error.nextFit,
-                    },
-                  );
-                }),
-              ),
-            );
-          }),
-        ),
+                  dispatched = true;
+                  if (reading) started = at;
+                },
+              );
+              yield* Effect.gen(function* () {
+                if (
+                  operation.kind === "startup" &&
+                  work.source.startsWith("onepassword:") &&
+                  !cycleRecorded
+                ) {
+                  const fit = yield* budget.startupCycle(now());
+                  if (fit > now())
+                    return yield* Effect.fail(
+                      NativeSecretError.new("startup-crash-backoff", fit),
+                    );
+                  cycleRecorded = true;
+                }
+                if (!work.source.startsWith("onepassword:")) {
+                  yield* mark();
+                }
+                const record = yield* reader.read(
+                  work.source,
+                  (units) =>
+                    budget
+                      .reserve(
+                        bucket,
+                        units,
+                        work.source,
+                        operation.org,
+                        now(),
+                        (data) =>
+                          data.operations.some((op) =>
+                            op.sources.some(
+                              (candidate) =>
+                                sourceKey(candidate) === key &&
+                                candidate.status === "pending",
+                            ),
+                          ),
+                      )
+                      .pipe(Effect.andThen(mark(false))),
+                  () => mark(),
+                );
+                if (started === undefined) yield* mark(); // File sources have the same operation semantics and no provider debit.
+                const credential = yield* normalizeBuilderFileRecord(
+                  Buffer.from(JSON.stringify(record)),
+                  work.source,
+                  settings.suffix,
+                ).pipe(
+                  Effect.mapError(() =>
+                    NativeSecretError.new("builder-record-invalid"),
+                  ),
+                );
+                yield* journal.transaction((data, at) => {
+                  if (
+                    Object.keys(data.successes).length >= 320 &&
+                    data.successes[key] === undefined
+                  )
+                    throw NativeSecretError.new("provider-queue-full");
+                  data.successes[key] = at;
+                  delete data.startupStops[key];
+                  for (const op of data.operations)
+                    for (const candidate of op.sources)
+                      if (
+                        candidate.status === "running" &&
+                        sourceKey(candidate) === key &&
+                        candidate.readStartedAt === started
+                      ) {
+                        candidate.status = "succeeded";
+                        candidate.completedAt = at;
+                        delete candidate.code;
+                      }
+                }, now());
+                cache.set(key, credential);
+              }).pipe(
+                Effect.catch((error) =>
+                  Effect.gen(function* () {
+                    yield* journal.transaction((data, at) => {
+                      if (error.code === "provider-rate-limited")
+                        data.providerBackoff = Math.max(
+                          data.providerBackoff,
+                          at + 900000,
+                          error.nextFit ?? 0,
+                        );
+                      for (const op of data.operations)
+                        for (const candidate of op.sources) {
+                          if (
+                            sourceKey(candidate) !== key ||
+                            (!dispatched
+                              ? candidate.status !== "pending"
+                              : candidate.status !== "running" ||
+                                candidate.readStartedAt !== started)
+                          )
+                            continue;
+                          candidate.code = error.code;
+                          const fit = Math.max(
+                            at +
+                              (candidate.attempts
+                                ? retryDelay(candidate.attempts)
+                                : 1),
+                            error.nextFit ?? 0,
+                            data.cooldowns[candidate.source] ?? 0,
+                            data.providerBackoff,
+                          );
+                          const retry = !dispatched
+                            ? error.code === "provider-budget-exhausted" ||
+                              error.code === "startup-crash-backoff"
+                            : op.kind === "startup" &&
+                              transient.has(error.code) &&
+                              candidate.attempts < 8;
+                          candidate.status =
+                            retry && fit < candidate.deadline
+                              ? "pending"
+                              : "failed";
+                          candidate.nextFit = fit;
+                          if (candidate.status === "failed") {
+                            candidate.completedAt = at;
+                            if (op.kind === "startup")
+                              data.startupStops[key] = {
+                                code: error.code,
+                                createdAt: candidate.createdAt,
+                                deadline: candidate.deadline,
+                                attempts: candidate.attempts,
+                                nextFit: candidate.nextFit,
+                              };
+                          }
+                        }
+                    }, now());
+                    yield* Effect.logWarning(
+                      "Native provider operation needs attention",
+                      {
+                        builderId: work.builderId,
+                        code: error.code,
+                        nextFit: error.nextFit,
+                      },
+                    );
+                  }),
+                ),
+              );
+            }),
+          ),
+        Effect.ensuring(notify()),
+      );
+      const supersede = Effect.fn("NativeBuildSecretCache.supersede")(
+        function* (builderIds: readonly string[]) {
+          const ids = new Set(builderIds);
+          yield* journal.transaction((data, at) => {
+            for (const operation of data.operations)
+              for (const work of operation.sources)
+                if (
+                  !work.retained &&
+                  ids.has(work.builderId) &&
+                  (work.status === "pending" ||
+                    (work.status === "running" &&
+                      work.readStartedAt === undefined))
+                ) {
+                  work.status = "superseded";
+                  work.completedAt = at;
+                }
+          }, now());
+          yield* Queue.offer(wake, undefined);
+          yield* notify();
+        },
       );
       const wait = Effect.fn("NativeBuildSecretCache.wait")(function* (
         id: string,
       ) {
         for (;;) {
+          const signal = changed;
           const state = progress(id);
           if (!state)
             return yield* Effect.fail(
               NativeSecretError.new("provider-operation-missing"),
             );
           if (state.done) return state;
-          yield* Effect.sleep(20);
+          if (now() >= state.deadline)
+            return yield* Effect.fail(
+              NativeSecretError.new("provider-operation-expired"),
+            );
+          yield* Effect.raceFirst(
+            Deferred.await(signal),
+            Effect.sleep(state.deadline - now()),
+          );
         }
       });
       if (yield* NativeSecretScheduling)
@@ -531,12 +599,12 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                   Queue.take(wake),
                   Effect.sleep(Math.max(1, next - now())),
                 );
-            }),
-          ).pipe(
-            Effect.catch((error) =>
-              Effect.logError("Native provider scheduler stopped", {
-                code: error.code,
-              }),
+            }).pipe(
+              Effect.catch((error) =>
+                Effect.logError("Native provider scheduler iteration failed", {
+                  code: error.code,
+                }).pipe(Effect.andThen(Effect.sleep(1000))),
+              ),
             ),
           ),
         );
@@ -546,6 +614,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         wait,
         progress,
         capacity,
+        supersede,
         cached: (source: SecretSource) => cache.get(sourceKey(source)),
         retainNeeded: Effect.fn("NativeBuildSecretCache.retainNeeded")(
           function* (sources: readonly SecretSource[]) {

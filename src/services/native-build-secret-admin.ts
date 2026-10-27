@@ -116,7 +116,7 @@ export class NativeSecretAdmin extends Context.Service<NativeSecretAdmin>()(
                 ),
               catch: () => NativeSecretError.new("allocation-evidence-invalid"),
             });
-            if (evidence.actor !== actor)
+            if (evidence.actor !== actor || evidence.reason !== reason)
               return yield* Effect.fail(
                 NativeSecretError.new("allocation-evidence-invalid"),
               );

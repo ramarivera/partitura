@@ -2,7 +2,7 @@ import { Effect, Schema } from "effect";
 import { decodeBuilderJson } from "../../src/services/builder-registry-json.js";
 import {
   BuilderFileRecord,
-  normalizeBuilderFileRecord,
+  normalizeBuilderRecord,
 } from "../../src/services/builder-secret-record.js";
 import {
   nativeFile,
@@ -62,8 +62,8 @@ export const runBuilderSecret = Effect.fn("BuilderSecret.run")(
                 NativeSecretError.new("builder-record-invalid"),
               ),
             );
-            yield* normalizeBuilderFileRecord(
-              bytes,
+            yield* normalizeBuilderRecord(
+              value,
               "operator-input",
               input.suffix,
             ).pipe(

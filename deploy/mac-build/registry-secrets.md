@@ -75,8 +75,9 @@ cycles in 15 minutes defer later cycles until 30 minutes after the last one.
 
 Capacity reports independent daily/hourly complete cold starts, subtracts unfinished
 bootstrap demand and checks `Cstart(N)=8+4N`, or zero for file-only pools. New desired
-pools that can't cover 4/day and 2/hour are rejected with `budget-capacity`, retaining
-the prior accepted desired state. Custom total budgets retain bucket proportions.
+pools that can't cover 4/day and 2/hour hold new or changed enabled 1Password
+entries with `budget-capacity`. Disables, removals and policy changes still publish;
+unchanged serving entries retain their state. Custom total budgets retain bucket proportions.
 
 ## Initialize and repair locally
 

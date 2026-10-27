@@ -1,6 +1,7 @@
 import { chmod, symlink, writeFile } from "node:fs/promises";
 import { expect, it } from "@effect/vitest";
 import { Effect, Logger } from "effect";
+import { vi } from "vitest";
 import { runBuilderSecret } from "../deploy/mac-build/builder-secret.js";
 import { registryIO } from "../src/services/builder-registry-files.js";
 import {
@@ -103,3 +104,44 @@ for (const invalid of ["mode", "symlink", "json", "missing-file"] as const)
         }),
       ),
   );
+
+it.effect(
+  "operator input is decoded once before validating the same record",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* secretFixture(path("single-decode"));
+        const inputFile = `${f.root}/input.json`;
+        const text = JSON.stringify(f.record);
+        yield* registryIO(() => writeFile(inputFile, text, { mode: 0o600 }));
+        const parse = vi.spyOn(JSON, "parse");
+        yield* runBuilderSecret({
+          action: "update",
+          vaultId: f.settings.vaultId,
+          itemId: "b".repeat(26),
+          inputFile,
+          desktopAccount: "dummy-account",
+          suffix: f.settings.suffix,
+        }).pipe(
+          Effect.provideService(NativeSecretPipe, {
+            stop: () => Effect.void,
+            alive: () => false,
+            session: (use) =>
+              use(() =>
+                Effect.fail(NativeSecretError.new("provider-unavailable")),
+              ),
+          }),
+          Effect.flip,
+          Effect.tap((error) =>
+            Effect.sync(() => {
+              expect(error.code).toBe("provider-unavailable");
+              expect(
+                parse.mock.calls.filter(([value]) => value === text),
+              ).toHaveLength(1);
+            }),
+          ),
+          Effect.ensuring(Effect.sync(() => parse.mockRestore())),
+        );
+      }),
+    ),
+);

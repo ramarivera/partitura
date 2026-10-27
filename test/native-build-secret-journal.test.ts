@@ -206,7 +206,7 @@ for (const unused of [false, true])
                   allocationUnused: true,
                   accountId: "dummy-account",
                   actor: "human",
-                  reason: "dedicated unused test allocation",
+                  reason: "new installation",
                 }),
                 { mode: 0o600 },
               ),
