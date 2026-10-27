@@ -41,12 +41,15 @@ const FailureFields = {
       "cleanup-required",
       "unlock-failed",
       "host-capacity-unavailable",
+      "host-disk-space-unavailable",
       "workflow-failed",
     ]),
   ),
   stage: Schema.optionalKey(
     Schema.Literals([
       "capacity",
+      "disk-preflight",
+      "disk-post-transfer",
       "unlock",
       "clone",
       "boot",
@@ -87,7 +90,7 @@ const FailedReceiptSchema = Schema.Struct({
   ...ArtifactFields,
   state: Schema.Literal("failed"),
 });
-const JobSchema = Schema.Struct({
+export const NativeBuildJobSchema = Schema.Struct({
   ...FailureFields,
   job: Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u)),
   sessionId: Schema.String,
@@ -103,8 +106,35 @@ const JobSchema = Schema.Struct({
   ...ArtifactFields,
 });
 type Job = {
-  -readonly [K in keyof typeof JobSchema.Type]: (typeof JobSchema.Type)[K];
+  -readonly [K in keyof typeof NativeBuildJobSchema.Type]: (typeof NativeBuildJobSchema.Type)[K];
 };
+
+/** Shared by receipt ingress, persisted records and the offline rollback tool. */
+export function validateNativeBuildDiagnostics(
+  failure: Omit<typeof FailedReceiptSchema.Type, "state">,
+) {
+  if (
+    (failure.failureCode === "host-key-unavailable" &&
+      failure.stage !== "boot") ||
+    (failure.failureCode === "unlock-failed" && failure.stage !== "unlock") ||
+    (failure.failureCode === "host-capacity-unavailable" &&
+      failure.stage !== "capacity") ||
+    (failure.failureCode === "host-disk-space-unavailable") !==
+      (failure.stage === "disk-preflight" ||
+        failure.stage === "disk-post-transfer") ||
+    (failure.bootExitCode !== undefined && failure.stage !== "boot") ||
+    (failure.failureCode === "workflow-failed" &&
+      failure.stage !== "workflow") ||
+    (failure.workflowExitCode !== undefined &&
+      failure.failureCode !== "workflow-failed") ||
+    ((failure.artifactSha256 !== undefined ||
+      failure.artifactBytes !== undefined) &&
+      (failure.failureCode !== "workflow-failed" ||
+        failure.artifactSha256 === undefined ||
+        failure.artifactBytes === undefined))
+  )
+    throw new Error("Inconsistent native build failure diagnostic");
+}
 
 const MAX_BUNDLE = 1024 * 1024 * 1024;
 const MAX_ARTIFACT = 2 * MAX_BUNDLE;
@@ -241,8 +271,25 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             child.stdin,
           )
         : Promise.resolve(child.stdin.end());
-      const [, , exitCode] = await Promise.all([
-        input,
+      // A pre-input refusal can close stdin before the bundle finishes. Drain
+      // bounded stdout and wait for exit before deciding whether EPIPE matters.
+      // EPIPE is the qualified signal on the pinned Bun runtime. Other stream
+      // errors stay failures unless separately reproduced and qualified.
+      const [inputResult, , exitCode] = await Promise.all([
+        input.then(
+          () => ({ error: undefined }),
+          (error: unknown) => {
+            if (
+              options.acceptFailedReceipt &&
+              typeof error === "object" &&
+              error !== null &&
+              "code" in error &&
+              error.code === "EPIPE"
+            )
+              return { error };
+            throw error;
+          },
+        ),
         pipeline(
           child.stdout,
           limit(options.outputLimit ?? 65_536, options.hash),
@@ -250,7 +297,13 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
         ),
         exited,
       ]);
-      return { output: Buffer.concat(chunks).toString("utf8"), exitCode };
+      if (inputResult.error !== undefined && exitCode !== 1)
+        throw inputResult.error;
+      return {
+        output: Buffer.concat(chunks).toString("utf8"),
+        exitCode,
+        inputComplete: inputResult.error === undefined,
+      };
     } finally {
       clearTimeout(timer);
       if (child.exitCode === null) child.kill("SIGKILL");
@@ -377,9 +430,10 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
   for (const file of await readdir(config.scratchRoot)) {
     if (!/^[a-f0-9]{32}\.json$/u.test(file)) continue;
     await privatePath(join(config.scratchRoot, file), false);
-    const job: Job = Schema.decodeUnknownSync(JobSchema)(
+    const job: Job = Schema.decodeUnknownSync(NativeBuildJobSchema)(
       JSON.parse(await readFile(join(config.scratchRoot, file), "utf8")),
     );
+    if (job.state === "failed") validateNativeBuildDiagnostics(job);
     if (job.job !== file.slice(0, 32)) {
       throw new Error("Invalid persisted native build ownership");
     }
@@ -526,26 +580,9 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
           if (result.exitCode === 1) {
             const failure =
               Schema.decodeUnknownSync(FailedReceiptSchema)(response);
-            if (
-              (failure.failureCode === "host-key-unavailable" &&
-                failure.stage !== "boot") ||
-              (failure.failureCode === "unlock-failed" &&
-                failure.stage !== "unlock") ||
-              (failure.failureCode === "host-capacity-unavailable" &&
-                failure.stage !== "capacity") ||
-              (failure.bootExitCode !== undefined &&
-                failure.stage !== "boot") ||
-              (failure.failureCode === "workflow-failed" &&
-                failure.stage !== "workflow") ||
-              (failure.workflowExitCode !== undefined &&
-                failure.failureCode !== "workflow-failed") ||
-              ((failure.artifactSha256 !== undefined ||
-                failure.artifactBytes !== undefined) &&
-                (failure.failureCode !== "workflow-failed" ||
-                  failure.artifactSha256 === undefined ||
-                  failure.artifactBytes === undefined))
-            )
-              throw new Error("Inconsistent native build failure diagnostic");
+            validateNativeBuildDiagnostics(failure);
+            if (!result.inputComplete && failure.stage !== "disk-preflight")
+              throw new Error("Invalid native pre-input refusal");
             Object.assign(job, failure);
             return;
           }

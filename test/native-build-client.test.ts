@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   chmod,
   mkdir,
@@ -28,6 +29,10 @@ const config=JSON.parse(readFileSync(cfg,"utf8"));
 const command=args.at(-1).split(" ");
 appendFileSync(config.trace,JSON.stringify({args,env:Object.keys(process.env)})+"\\n");
 if(command[0]==="run") {
+ if(config.earlyRefusal) {
+  console.log(config.invalidOutput?"invalid-json":JSON.stringify({job:command[1],commit:command[2],action:command[4],state:"failed",stage:"disk-preflight",failureCode:"host-disk-space-unavailable",...config.receiptOverrides}));
+  process.exit(config.exitCode??1);
+ }
  const received=await new Response(Bun.stdin.stream()).arrayBuffer();
  const secretLength=Number(command[6]??0);
  if(received.byteLength!==Number(command[5])+secretLength)process.exit(2);
@@ -571,6 +576,8 @@ it.live("waits for a current prune before leasing a fresh artifact", () =>
 for (const [stage, failureCode] of [
   ["unlock", "unlock-failed"],
   ["capacity", "host-capacity-unavailable"],
+  ["disk-preflight", "host-disk-space-unavailable"],
+  ["disk-post-transfer", "host-disk-space-unavailable"],
 ] as const) {
   it.live(`preserves ${failureCode} through the native gateway`, () =>
     Effect.promise(async () => {
@@ -604,6 +611,96 @@ for (const [stage, failureCode] of [
         await client.close();
       }
     }),
+  );
+}
+
+for (const invalid of [
+  false,
+  true,
+  "foreign-job",
+  "wrong-stage",
+  "success-exit",
+  "transport-exit",
+  "post-transfer",
+  "workflow",
+] as const) {
+  it.live(
+    `validates pre-input disk refusal after a broken stdin: ${invalid}`,
+    () =>
+      Effect.promise(async () => {
+        const fixture = await setup();
+        // An incompressible bundle larger than a pipe forces the writer to still
+        // be streaming when the fake broker exits without consuming input.
+        await writeFile(
+          join(fixture.workspace, "large.bin"),
+          randomBytes(2 * 1024 * 1024),
+        );
+        fixture.git("add", "large.bin");
+        fixture.git(
+          "-c",
+          "core.hooksPath=/dev/null",
+          "commit",
+          "--quiet",
+          "-m",
+          "large input",
+        );
+        await writeFile(
+          fixture.configFile,
+          JSON.stringify({
+            trace: fixture.trace,
+            earlyRefusal: true,
+            exitCode:
+              invalid === "success-exit"
+                ? 0
+                : invalid === "transport-exit"
+                  ? 255
+                  : 1,
+            invalidOutput: invalid === true,
+            receiptOverrides:
+              invalid === "foreign-job"
+                ? { job: "f".repeat(32) }
+                : invalid === "wrong-stage"
+                  ? { stage: "capacity" }
+                  : invalid === "post-transfer"
+                    ? { stage: "disk-post-transfer" }
+                    : invalid === "workflow"
+                      ? {
+                          stage: "workflow",
+                          failureCode: "workflow-failed",
+                          workflowExitCode: 1,
+                          artifactBytes: payload.length,
+                          artifactSha256: "a".repeat(64),
+                        }
+                      : {},
+          }),
+        );
+        const client = await createNativeBuildClient(fixture.config);
+        try {
+          const job = await client.start({
+            sessionId: "session-a",
+            workspacePath: fixture.workspace,
+            commit: fixture.git("rev-parse", "HEAD"),
+            pullRequest: 12,
+            action: "archive",
+          });
+          const result = await settled(client, job.job);
+          expect(result.state).toBe("failed");
+          if (invalid === false)
+            expect(result).toMatchObject({
+              failureCode: "host-disk-space-unavailable",
+              stage: "disk-preflight",
+            });
+          else {
+            expect(result.failureCode).toBeUndefined();
+            expect(result.stage).toBeUndefined();
+            await expect(client.artifact("session-a", job.job)).rejects.toThrow(
+              "no deliverable artifact",
+            );
+          }
+        } finally {
+          await client.close();
+        }
+      }),
   );
 }
 
@@ -709,6 +806,43 @@ it.live("preserves only validated failed-job diagnostics across restart", () =>
   }),
 );
 
+it.live(
+  "loads both disk diagnostics after restart and rejects inconsistent persisted fields",
+  () =>
+    Effect.promise(async () => {
+      for (const stage of ["disk-preflight", "disk-post-transfer", "boot"]) {
+        const fixture = await setup(`persisted-${stage}`);
+        await mkdir(fixture.config.scratchRoot, { mode: 0o700 });
+        const job = {
+          job: "a".repeat(32),
+          sessionId: "session-a",
+          commit: fixture.commit,
+          action: "archive",
+          state: "failed",
+          failureCode: "host-disk-space-unavailable",
+          stage,
+        };
+        await writeFile(
+          join(fixture.config.scratchRoot, `${job.job}.json`),
+          JSON.stringify(job),
+          { mode: 0o600 },
+        );
+        if (stage === "boot") {
+          await expect(createNativeBuildClient(fixture.config)).rejects.toThrow(
+            "Inconsistent",
+          );
+        } else {
+          const client = await createNativeBuildClient(fixture.config);
+          try {
+            expect(await client.status("session-a", job.job)).toEqual(job);
+          } finally {
+            await client.close();
+          }
+        }
+      }
+    }),
+);
+
 it.live("rejects foreign, untrusted and transport failure diagnostics", () =>
   Effect.promise(async () => {
     for (const [index, invalid] of [
@@ -724,6 +858,9 @@ it.live("rejects foreign, untrusted and transport failure diagnostics", () =>
       { receiptOverrides: { state: "succeeded" } },
       { receiptOverrides: { failureCode: "workflow-failed" } },
       { receiptOverrides: { workflowExitCode: 1 } },
+      { receiptOverrides: { failureCode: "host-disk-space-unavailable" } },
+      { receiptOverrides: { stage: "disk-preflight" } },
+      { receiptOverrides: { stage: "disk-post-transfer" } },
       {
         receiptOverrides: {
           stage: "workflow",
