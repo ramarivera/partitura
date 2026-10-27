@@ -11,7 +11,6 @@ import argparse
 import ast
 import base64
 import hashlib
-import importlib.util
 import json
 import os
 import pwd
@@ -21,9 +20,9 @@ import stat
 import plistlib
 import subprocess
 import sys
+import types
 
 WRITER_PATH = "deploy/mac-build/credential-writer.py"
-BROKER_PATH = "deploy/mac-build/broker"
 GUEST_RUNNER_PATH = "deploy/mac-build/guest-run.sh"
 NATIVE_HOST_PATH = "deploy/mac-build/native_host.py"
 INSTALL_HOST_PATH = "deploy/mac-build/install-host.sh"
@@ -62,10 +61,24 @@ MINIMUM_FREE_BYTES = 50 * 1024**3
 BROKER_POLICY_KEYS = {"host_id", "protocol", "profile", "minimum_free_bytes", "daemon_relock_qualified", "daemon_relock_macos_build"}
 
 
-_VALIDATION_PATH = Path(__file__).with_name("host_setup_validation.py")
-_validation_spec = importlib.util.spec_from_file_location("partitura_host_validation", _VALIDATION_PATH)
-_validation = importlib.util.module_from_spec(_validation_spec)
-_validation_spec.loader.exec_module(_validation)
+# Pinned host_setup.py bytes pin its helpers transitively: each helper is hashed
+# before it runs, so a drifted working tree can't execute unpinned code.
+HOST_SETUP_VALIDATION_SHA256 = "a1a7d417d746549a4afc4e22f38e1d0370bcb0ca0da04239ebdd64b5bb5c2efa"
+BROKER_ARCHIVE_SHA256 = "f7b713b945f8a4adffc80149ada9a5845c2c0eced4ad0c2a2ca0fe58aaab430e"
+
+
+def _load_pinned_helper(name: str, filename: str, expected: str) -> types.ModuleType:
+    path = Path(__file__).with_name(filename)
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != expected:
+        raise ValueError(f"{filename} differs from the copy pinned by host_setup.py")
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(compile(payload, str(path), "exec"), module.__dict__)
+    return module
+
+
+_validation = _load_pinned_helper("partitura_host_validation", "host_setup_validation.py", HOST_SETUP_VALIDATION_SHA256)
 NativeHostError = _validation.NativeHostError
 sha256_bytes = _validation.sha256_bytes
 sha256_file = _validation.sha256_file
@@ -80,10 +93,7 @@ required_mapping = _validation.required_mapping
 validate_settings = _validation.validate_settings
 validate_authorized_keys = _validation.validate_authorized_keys
 validate_public_key = _validation.validate_public_key
-_archive_path = Path(__file__).with_name("broker_archive.py")
-_archive_spec = importlib.util.spec_from_file_location("partitura_broker_archive", _archive_path)
-_archive = importlib.util.module_from_spec(_archive_spec)
-_archive_spec.loader.exec_module(_archive)
+_archive = _load_pinned_helper("partitura_broker_archive", "broker_archive.py", BROKER_ARCHIVE_SHA256)
 broker_from_commit = _archive.broker_from_commit
 broker_from_directory = _archive.broker_from_directory
 BROKER_FILES = _archive.BROKER_FILES

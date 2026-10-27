@@ -192,6 +192,18 @@ class NativeHostSetupTests(unittest.TestCase):
             self.assertNotEqual(seal().returncode, 0)
             self.assertTrue(control.is_symlink())
 
+    def test_host_setup_pins_its_helper_modules(self):
+        for constant, name in (('HOST_SETUP_VALIDATION_SHA256', 'host_setup_validation.py'), ('BROKER_ARCHIVE_SHA256', 'broker_archive.py')):
+            self.assertEqual(getattr(host_setup, constant), hashlib.sha256((ROOT / 'deploy/mac-build' / name).read_bytes()).hexdigest())
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            for name in ('host_setup.py', 'host_setup_validation.py', 'broker_archive.py'):
+                (Path(directory) / name).write_bytes((ROOT / 'deploy/mac-build' / name).read_bytes())
+            drifted = Path(directory) / 'broker_archive.py'
+            drifted.write_bytes(drifted.read_bytes() + b'\nraise SystemExit("unpinned helper ran")\n')
+            copy = importlib.util.spec_from_file_location('drifted_host_setup', Path(directory) / 'host_setup.py')
+            with self.assertRaisesRegex(ValueError, 'broker_archive.py differs from the copy pinned'):
+                copy.loader.exec_module(importlib.util.module_from_spec(copy))
+
     def test_root_launcher_snapshots_only_manifest_pinned_payloads(self):
         loader = importlib.util.spec_from_file_location('native_installer', ROOT / 'deploy/mac-build/native_host.py')
         launcher = importlib.util.module_from_spec(loader)
