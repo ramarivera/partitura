@@ -858,3 +858,9 @@ focused checks. On macOS, this also compiles and ad-hoc signs a small simulator
 app using the selected Xcode SDK, then validates it without launching it or
 opening a simulator. Python can use the qualified Command Line Tools selection;
 the test compiler uses the global Xcode selection for its iOS SDK.
+
+## Internal registry engine, slice 4
+
+See [the internal engine and offline import contract](registry-engine.md) for
+Effect scope ownership, recovery, credential restoration and resumable imports.
+Production legacy slot callers remain unchanged.
