@@ -28,6 +28,7 @@ export {
   validateNativeBuildDiagnostics,
 } from "./native-build-legacy-receipt.js";
 
+import { legacyReceiptRefresh } from "./native-build-legacy-status.js";
 import { workerIdentityCommand } from "./worker-security.js";
 
 export interface NativeBuildConfig {
@@ -336,18 +337,45 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       pruneFailure = error;
     }
   };
+  const receipts = legacyReceiptRefresh({
+    read: async (id, signal) =>
+      (
+        await remote(`status ${id}`, {
+          timeout: 10_000,
+          signal,
+          acceptFailedReceipt: true,
+        })
+      ).output,
+    save,
+    retain: retainArtifact,
+    current: (job) => jobs.get(job.job) === job && !retiringJobs.has(job.job),
+  });
   // Durable ownership survives a gateway crash. Cancel old jobs before serving
   // new requests; never reassign another session's in-flight native build.
   for (const file of await readdir(config.scratchRoot)) {
     if (!/^[a-f0-9]{32}\.json$/u.test(file)) continue;
     await privatePath(join(config.scratchRoot, file), false);
-    const job: Job = Schema.decodeUnknownSync(NativeBuildJobSchema)(
-      JSON.parse(await readFile(join(config.scratchRoot, file), "utf8")),
-    );
-    if (job.state === "failed") validateNativeBuildDiagnostics(job);
-    if (job.job !== file.slice(0, 32)) {
-      throw new Error("Invalid persisted native build ownership");
+    let job: Job;
+    try {
+      job = Schema.decodeUnknownSync(NativeBuildJobSchema)(
+        JSON.parse(await readFile(join(config.scratchRoot, file), "utf8")),
+      );
+      if (job.state === "failed") validateNativeBuildDiagnostics(job);
+      if (job.job !== file.slice(0, 32))
+        throw new Error("Invalid persisted native build ownership");
+    } catch {
+      await rename(
+        join(config.scratchRoot, file),
+        join(config.scratchRoot, `${file}.invalid`),
+      );
+      await Effect.runPromise(
+        Effect.logWarning("Invalid native build record quarantined", {
+          code: "native-record-invalid",
+        }),
+      );
+      continue;
     }
+    if (job.state === "failed" && !job.failureCode) receipts.track(job.job);
     jobs.set(job.job, job);
     if (job.state === "starting" || job.state === "running") {
       await remote(`cancel ${job.job}`);
@@ -475,7 +503,10 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
               signal: abort.signal,
               acceptFailedReceipt: true,
             },
-          );
+          ).catch((error: unknown) => {
+            receipts.track(job.job);
+            throw error;
+          });
           const response: unknown = JSON.parse(result.output);
           if (
             typeof response !== "object" ||
@@ -495,6 +526,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             if (!result.inputComplete && failure.stage !== "disk-preflight")
               throw new Error("Invalid native pre-input refusal");
             Object.assign(job, failure);
+            receipts.confirm(job.job);
             return;
           }
           if (
@@ -534,40 +566,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     status: async (sessionId: string, jobId: string) => {
       await pruneBestEffort();
       const job = ownedJob(sessionId, jobId);
-      // SSH can die before the broker records its cleanup receipt. Read it on
-      // later status requests, but never replace a known outcome or ownership.
-      if (job.state === "failed" && !job.failureCode) {
-        try {
-          const receipt = await remote(`status ${job.job}`, {
-            timeout: 10_000,
-            acceptFailedReceipt: true,
-          });
-          const response: unknown = JSON.parse(receipt.output);
-          if (
-            typeof response !== "object" ||
-            response === null ||
-            !("job" in response) ||
-            response.job !== job.job ||
-            !("commit" in response) ||
-            response.commit !== job.commit ||
-            !("action" in response) ||
-            response.action !== job.action
-          )
-            throw new Error("Invalid native build receipt identity");
-          const failure =
-            Schema.decodeUnknownSync(FailedReceiptSchema)(response);
-          validateNativeBuildDiagnostics(failure);
-          const updated = { ...job, ...failure };
-          await save(updated);
-          Object.assign(job, updated);
-        } catch {
-          await Effect.runPromise(
-            Effect.logWarning("Native failure receipt unavailable", {
-              code: "native-receipt-unavailable",
-            }),
-          );
-        }
-      }
+      if (job.state === "failed" && !job.failureCode) receipts.poll(job);
       return { ...job };
     },
     artifact: async (sessionId: string, jobId: string) => {
@@ -647,7 +646,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     cancel: async (sessionId: string, jobId: string) => {
       await pruneBestEffort();
       const job = ownedJob(sessionId, jobId);
-      if (job.state !== "starting" && job.state !== "running")
+      if (receipts.confirmed(job))
         return { ...job, cancellationRequested: false };
       const pending = active.get(job.job);
       pending?.abort.abort();
@@ -659,6 +658,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       return { ...job, cancellationRequested: true };
     },
     close: async () => {
+      await receipts.close();
       const pending = [...active.entries()];
       await Promise.all(
         pending.map(async ([id, handle]) => {

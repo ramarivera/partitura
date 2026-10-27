@@ -21,9 +21,10 @@ import type { T3LaunchConfig } from "../src/services/config.js";
 import { sessionWorkerEnvironment } from "../src/services/worker-security.js";
 import { workspaceProcess } from "../src/services/workspace-process.js";
 import { testPaths } from "./fixtures/paths.js";
-import { unusedT3PortRange } from "./fixtures/t3-ports.js";
+import { occupyOldT3Range, t3TestPorts } from "./fixtures/t3-ports.js";
 
 const pathFor = testPaths();
+const portsFor = t3TestPorts();
 const fakeCli = fileURLToPath(
   new URL("./fixtures/fake-t3-cli.ts", import.meta.url),
 );
@@ -41,7 +42,7 @@ const cliFor = (behavior: "ok" | "crash"): string => {
 const launchConfig = (cliPath: string): T3LaunchConfig => ({
   _tag: "Launch",
   cliPath,
-  portBase: unusedT3PortRange(8),
+  portBase: portsFor(8),
   portCount: 8,
   launchTimeoutMs: 10_000,
   codexExecutable: "codex",
@@ -246,6 +247,7 @@ describe("T3 launcher lifecycle", () => {
     "starts t3 serve on a pool port with a private bearer and stops it with the scope",
     () =>
       Effect.gen(function* () {
+        yield* occupyOldT3Range(20_000 + ((process.pid * 7) % 20_000), 8);
         const launch = launchConfig(cliFor("ok"));
         const ports = new T3PortPool(launch.portBase, launch.portCount);
         const cwd = workspaceFor("lifecycle");
@@ -306,7 +308,7 @@ describe("T3 launcher lifecycle", () => {
         expect(listenerOwnerUids(procTables(), daemon.port)).toEqual([]);
         // The port returns to the pool.
         expect(ports.allocate(() => true)).toBe(launch.portBase);
-      }),
+      }).pipe(Effect.scoped),
     20_000,
   );
 

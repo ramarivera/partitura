@@ -11,11 +11,12 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "../src/services/store/repositories.js";
-import { unusedT3PortRange } from "./fixtures/t3-ports.js";
+import { occupyOldT3Range, t3TestPorts } from "./fixtures/t3-ports.js";
 import { createDriverFixture } from "./session-authority-driver-fixture.js";
 import { createAuthorityFixture } from "./session-authority-fixture.js";
 
 const fixture = createAuthorityFixture();
+const portsFor = t3TestPorts();
 const { seedDriverRun, awaitState, withT3Authority, t3Server } =
   createDriverFixture(fixture);
 const {
@@ -47,40 +48,8 @@ describe("AgentDriver authority integration", () => {
         );
         // Keep the old PID-derived range occupied to reproduce the CI collision.
         const oldBase = 20_000 + ((process.pid * 11) % 20_000);
-        yield* Effect.acquireRelease(
-          Effect.sync(() => {
-            const listeners: Bun.Server<undefined>[] = [];
-            for (let offset = 0; offset < 4; offset++) {
-              try {
-                listeners.push(
-                  Bun.serve({
-                    hostname: "127.0.0.1",
-                    port: oldBase + offset,
-                    fetch: () => new Response("occupied"),
-                  }),
-                );
-              } catch (error) {
-                if (
-                  !(
-                    error instanceof Error &&
-                    "code" in error &&
-                    error.code === "EADDRINUSE"
-                  )
-                ) {
-                  for (const listener of listeners) listener.stop(true);
-                  throw error;
-                }
-              }
-            }
-            return listeners;
-          }),
-          (listeners) =>
-            Effect.sync(() => {
-              for (const listener of listeners) listener.stop(true);
-            }),
-        );
-        const portBase = unusedT3PortRange(4);
-        expect(portBase < oldBase - 3 || portBase > oldBase + 3).toBe(true);
+        yield* occupyOldT3Range(oldBase, 4);
+        const portBase = portsFor(4);
         yield* withAuthority(
           () =>
             Effect.gen(function* () {

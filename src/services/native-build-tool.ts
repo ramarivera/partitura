@@ -8,6 +8,7 @@ import type { NativeBuildJobs } from "./native-build-jobs.js";
 import {
   type NativeRegistryJob,
   terminalNativeJob,
+  unresolvedRecovery,
 } from "./native-build-state.js";
 import type { RpcHostToolCall, RpcHostToolResult } from "./rpc-worker.js";
 import type { RunRepo } from "./store/repositories.js";
@@ -128,7 +129,7 @@ export const callRegistryNativeTool = Effect.fn(
           case "native_build_status":
             return result(project(owned));
           case "native_build_cancel": {
-            if (terminalNativeJob(owned))
+            if (terminalNativeJob(owned) && !unresolvedRecovery(owned))
               return result({
                 ...project(owned),
                 cancellationRequested: false,

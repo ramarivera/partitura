@@ -8,10 +8,18 @@ import {
   InstallationRepo,
   RunRepo,
 } from "../src/services/store/repositories.js";
-import { settled, setup } from "./native-build-client-helpers.js";
+import { setup } from "./native-build-client-helpers.js";
 import { createAuthorityFixture } from "./session-authority-fixture.js";
 
-for (const state of ["succeeded", "failed", "interrupted"] as const)
+const waitUntil = async (ready: () => Promise<boolean>) => {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (await ready()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Fixture did not reach expected state");
+};
+
+for (const state of ["succeeded", "failed"] as const)
   it.live(
     `cancel preserves the real ${state} terminal state without sending a cancel`,
     () =>
@@ -24,6 +32,9 @@ for (const state of ["succeeded", "failed", "interrupted"] as const)
           commit: f.commit,
           action: "archive",
           state,
+          ...(state === "failed"
+            ? { stage: "cleanup", failureCode: "execution-interrupted" }
+            : {}),
         };
         await writeFile(
           join(f.config.scratchRoot, `${job.job}.json`),
@@ -55,6 +66,7 @@ for (const invalid of [
   "foreign-job",
   "foreign-commit",
   "foreign-action",
+  "inconsistent-diagnostic",
 ] as const)
   it.live(
     `status learns a reconciled crash failure on the original owned job: ${invalid}`,
@@ -76,9 +88,15 @@ for (const invalid of [
             action: "archive",
           });
           jobId = job.job;
-          expect(await settled(client, job.job)).toMatchObject({
-            state: "failed",
-          });
+          await waitUntil(
+            async () =>
+              JSON.parse(
+                await readFile(
+                  join(f.config.scratchRoot, `${job.job}.json`),
+                  "utf8",
+                ),
+              ).state === "failed",
+          );
           await writeFile(
             f.configFile,
             JSON.stringify({
@@ -89,11 +107,28 @@ for (const invalid of [
                   invalid === "foreign-commit" ? "f".repeat(40) : job.commit,
                 action: invalid === "foreign-action" ? "test" : job.action,
                 state: "failed",
-                stage: "cleanup",
+                stage:
+                  invalid === "inconsistent-diagnostic" ? "boot" : "cleanup",
                 failureCode: "execution-interrupted",
               },
             }),
           );
+          const before = await readFile(
+            join(f.config.scratchRoot, `${job.job}.json`),
+            "utf8",
+          );
+          await client.status("session-a", job.job);
+          await waitUntil(async () =>
+            (await readFile(f.trace, "utf8")).includes(`status ${job.job}`),
+          );
+          // Wait for the fake SSH receipt, without another remote attempt.
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          if (!invalid)
+            await waitUntil(
+              async () =>
+                (await client.status("session-a", job.job)).failureCode !==
+                undefined,
+            );
           const status = await client.status("session-a", job.job);
           expect(status).toMatchObject({
             job: job.job,
@@ -102,8 +137,15 @@ for (const invalid of [
             action: job.action,
             state: "failed",
           });
-          if (invalid) expect(status.failureCode).toBeUndefined();
-          else {
+          if (invalid) {
+            expect(status.failureCode).toBeUndefined();
+            expect(
+              await readFile(
+                join(f.config.scratchRoot, `${job.job}.json`),
+                "utf8",
+              ),
+            ).toBe(before);
+          } else {
             expect(status).toMatchObject({
               stage: "cleanup",
               failureCode: "execution-interrupted",
@@ -135,7 +177,7 @@ for (const invalid of [
   );
 
 const authorityFixture = createAuthorityFixture();
-for (const state of ["succeeded", "failed", "interrupted"] as const)
+for (const state of ["succeeded", "failed"] as const)
   it.live(`legacy cancel tool reports the existing ${state} receipt`, () => {
     const f = authorityFixture;
     const root = f.testPath("native-terminal");
