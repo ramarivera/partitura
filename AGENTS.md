@@ -44,6 +44,24 @@ Vitest must run on the Bun runtime (`bunx --bun`): source and tests import
 Configuration comes from environment variables; `.env.example` lists them with
 comments. Secrets accept a `<NAME>_FILE` alternative (Docker secrets).
 
+## File size limit
+
+No source or test file may exceed 800 lines. Split by responsibility before
+that, not by arbitrary line ranges, and keep the original module path
+re-exporting its public names so importers don't change. Two checks enforce it,
+and both run in `bun run check`, so an oversized file can't merge:
+
+- Biome `style/noExcessiveLinesPerFile` with `maxLines: 800` at `error` level
+  in `biome.json`. The rule isn't in the `recommended` preset, so it must stay
+  configured explicitly.
+- `test/file-size-limit.test.ts` counts raw lines in `src/`, `test/` and
+  `deploy/` TypeScript, JavaScript and CSS. Biome doesn't count lines inside a
+  template literal, so it misses files that hold one large HTML or CSS string.
+
+Don't raise the limit, add a `biome-ignore` comment, exclude a path in
+`biome.json` or the guard test, or lower the rule's severity to get a change
+through.
+
 ## Layout
 
 ```
