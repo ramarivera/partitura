@@ -285,13 +285,20 @@ export function createNativeBuildRecovery(
             throw NativeOperationError.new("native-state-corrupt");
           return generation;
         });
-        yield* Effect.acquireRelease(
+        const claimed = yield* Effect.acquireRelease(
           Effect.sync(() => {
+            const releaseHost = state.claimRecovery(job.verifiedHostId);
+            if (!releaseHost) return undefined;
             inFlight.add(id);
-            return [state.retainGeneration(generation.id), state.retainJob(id)];
+            return [
+              releaseHost,
+              state.retainGeneration(generation.id),
+              state.retainJob(id),
+            ];
           }),
           (releases) =>
             Effect.gen(function* () {
+              if (!releases) return;
               for (const release of releases) release();
               inFlight.delete(id);
               const current = state
@@ -307,6 +314,7 @@ export function createNativeBuildRecovery(
                   .pipe(Effect.orDie);
             }),
         );
+        if (!claimed) return;
         if (!transport.hasCredential(generation.id)) {
           if (
             job.recovery.state === "operator-required" &&

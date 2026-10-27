@@ -176,6 +176,7 @@ export async function openNativeStorage(
         );
         return structuredClone(result);
       });
+    const recoveryHosts = new Set<string>();
     const generationLeases = new Map<string, number>();
     const jobLeases = new Map<string, number>();
     const fileLeases = new Map<string, number>();
@@ -468,6 +469,13 @@ export async function openNativeStorage(
       });
     return {
       options,
+      claimRecovery: (hostId: string) => {
+        if (recoveryHosts.has(hostId)) return undefined;
+        recoveryHosts.add(hostId);
+        return () => {
+          recoveryHosts.delete(hostId);
+        };
+      },
       registerCredentialCleanup: (cleanup: () => Promise<void>) => {
         credentialCleanup.add(cleanup);
       },
@@ -484,6 +492,33 @@ export async function openNativeStorage(
       generationPath,
       jobPath,
       snapshot: () => structuredClone(data),
+      accounting: () => ({
+        usedBytes: [...usage.values()].reduce(
+          (sum, item) => sum + item.bytes,
+          0,
+        ),
+        reservedBytes: [...reservations.values()].reduce(
+          (sum, item) => sum + item.bytes,
+          0,
+        ),
+        limitBytes: options.bytesTotal,
+        builders: [
+          ...new Set(
+            [...usage.values(), ...reservations.values()].map(
+              (item) => item.builder,
+            ),
+          ),
+        ].map((id) => ({
+          id,
+          usedBytes: [...usage.values()]
+            .filter((item) => item.builder === id)
+            .reduce((sum, item) => sum + item.bytes, 0),
+          reservedBytes: [...reservations.values()]
+            .filter((item) => item.builder === id)
+            .reduce((sum, item) => sum + item.bytes, 0),
+          limitBytes: options.bytesPerBuilder,
+        })),
+      }),
       addGeneration: (
         builder: string,
         transport: NativeTransportMetadata,
@@ -540,6 +575,10 @@ export async function openNativeStorage(
       },
       retainFile: (path: string) => retain(fileLeases, path),
       quarantined: (hostId: string) =>
+        data.fleet?.retiredHosts.includes(hostId) === true ||
+        data.fleet?.maintenance.some(
+          (item) => item.hostId === hostId && item.state === "pending",
+        ) === true ||
         data.jobs.some(
           (j) =>
             j.verifiedHostId === hostId &&

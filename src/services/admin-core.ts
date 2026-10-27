@@ -11,6 +11,7 @@ import type { GatewayConfigShape } from "./config.js";
 import type { Executor } from "./executor.js";
 import type { LinearGateway } from "./linear-gateway.js";
 import type { McpOAuth } from "./mcp-oauth.js";
+import type { NativeBuildFleet } from "./native-build-fleet.js";
 import type { NixEnvironment } from "./nix-environment.js";
 import type { ReconcilerStatus } from "./reconciler.js";
 import type {
@@ -92,6 +93,7 @@ export interface ReconcilerShape {
   readonly trigger: () => Effect.Effect<void, never>;
 }
 export interface AdminDeps {
+  readonly nativeBuilders?: NativeBuildFleet["Service"];
   readonly config: GatewayConfigShape;
   readonly adminSessionRepo: AdminSessionRepo["Service"];
   readonly executorInstanceRepo: ExecutorInstanceRepo["Service"];

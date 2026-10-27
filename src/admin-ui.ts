@@ -106,7 +106,12 @@ export function renderLandingPage(): string {
 export function renderAdminPage(gatewayAdmin = false): string {
   return renderDocument({
     title: "Partitura · Console",
-    body: ADMIN_BODY,
+    body: gatewayAdmin
+      ? ADMIN_BODY.replace(
+          '<div class="header-actions">',
+          '<div class="header-actions"><a href="/admin/native-builders">Native builders</a>',
+        )
+      : ADMIN_BODY,
     script: `${THEME_SCRIPT}
 ${ADMIN_SCRIPT}`,
     extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}${gatewayAdmin ? 'document.documentElement.setAttribute("data-gateway-admin", "");' : ""}</script>`,
@@ -133,3 +138,5 @@ ${RUN_DETAIL_SCRIPT}`,
     pageClass: "run-detail-shell",
   });
 }
+
+export { renderNativeBuildersPage } from "./admin-ui/native-builders.js";

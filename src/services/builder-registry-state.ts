@@ -9,6 +9,7 @@ import {
   type BuilderRegistrySnapshot,
   credentialRevision,
   registrySemanticKey,
+  sourceReference,
 } from "./builder-registry-schema.js";
 import type {
   BuilderCredential,
@@ -379,6 +380,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     const refreshHealth = Effect.fn("BuilderRegistry.checkHealth")(function* (
       id: string,
       admissionCheck = false,
+      forced = false,
     ) {
       yield* gate.withPermit(
         Effect.sync(() => {
@@ -386,7 +388,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           if (
             current?.entry.enabled &&
             current.credential &&
-            now() >= current.retryAt &&
+            (forced || now() >= current.retryAt) &&
             (!admissionCheck || !reserved(current)) &&
             !pending.has(id) &&
             !workers.has(id)
@@ -398,6 +400,11 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         }),
       );
       yield* launch();
+      const flight = workers.get(id);
+      if (forced && flight)
+        yield* Fiber.join(flight).pipe(
+          Effect.onInterrupt(() => Fiber.interrupt(flight)),
+        );
     });
     const awaitIdle = Effect.fn("BuilderRegistry.awaitIdle")(function* () {
       while (workers.size || pending.size) {
@@ -541,6 +548,84 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       );
     });
     return {
+      // Private control-plane access. HTTP and tools must project sanitized fields.
+      current: (id: string) => {
+        const current = entries.get(id);
+        return current === undefined ? undefined : structuredClone(current);
+      },
+      recordHealth: Effect.fn("BuilderRegistry.recordHealth")(
+        (
+          id: string,
+          generationId: string,
+          health: BuilderIdentityResult["health"],
+          failure?: string,
+        ) =>
+          gate.withPermit(
+            Effect.sync(() => {
+              const current = entries.get(id);
+              if (
+                !current?.identity ||
+                current.identity.generation.id !== generationId
+              )
+                return;
+              const error =
+                failure ||
+                health.kind !== "health" ||
+                health.hostId !==
+                  current.identity.generation.transport.hostId ||
+                health.profile !== "registry-only"
+                  ? (failure ?? "builder-identity-mismatch")
+                  : undefined;
+              const checkedAt = now();
+              current.error = error;
+              if (!error) {
+                current.identity = { ...current.identity, health };
+                current.checkedAt = checkedAt;
+              }
+              // Share the verified observation, never a mutable admission object.
+              for (const preparation of preparations.values()) {
+                if (
+                  preparation.admission.generationId !== generationId ||
+                  !preparation.current.identity
+                )
+                  continue;
+                preparation.current.error = error;
+                if (!error) {
+                  preparation.current.identity = structuredClone({
+                    ...preparation.current.identity,
+                    health,
+                  });
+                  preparation.current.checkedAt = checkedAt;
+                }
+              }
+            }),
+          ),
+      ),
+      installCredential: Effect.fn("BuilderRegistry.installCredential")(
+        function* (
+          id: string,
+          revision: number,
+          credential: BuilderCredential,
+        ) {
+          yield* gate.withPermit(
+            Effect.sync(() => {
+              const current = entries.get(id);
+              if (
+                !current?.entry.enabled ||
+                current.entry.secretRevision !== revision ||
+                sourceReference(current.entry.secretSource) !==
+                  credential.transport.source
+              )
+                return;
+              current.credential = credential;
+              current.recheck = true;
+              current.ticket = ++ticket;
+              enqueue(current, false);
+            }),
+          );
+          yield* launch();
+        },
+      ),
       publish,
       refreshHealth,
       awaitIdle,

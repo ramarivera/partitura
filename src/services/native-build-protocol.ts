@@ -41,6 +41,11 @@ export class NativeTransportError extends Schema.TaggedError<NativeTransportErro
     });
   }
 }
+export type NativeBrokerBinding = Pick<NativeRegistryJob, "jobId"> &
+  Partial<
+    Pick<NativeRegistryJob, "commit" | "action" | "attempt" | "imported">
+  >;
+
 export type BrokerEnvelope = {
   protocolVersion: 2;
   hostId: string;
@@ -69,6 +74,7 @@ export type BrokerEnvelope = {
   } | null;
   reasons?: string[];
   reconciledJobs?: string[];
+  maintenanceJobId?: string;
   artifactBytes?: number;
   artifactSha256?: string;
   artifactExpired?: boolean;
@@ -153,7 +159,7 @@ const stages = new Set([
 export function decodeBrokerEnvelope(
   bytes: string,
   generation: NativeGeneration,
-  job?: NativeRegistryJob,
+  job?: NativeBrokerBinding,
 ): BrokerEnvelope {
   const invalid = () => {
     throw NativeTransportError.new("protocol-mismatch");
@@ -189,6 +195,8 @@ export function decodeBrokerEnvelope(
     invalid();
   if (value.kind === "health") {
     if (
+      (value.maintenanceJobId !== undefined &&
+        !validId(value.maintenanceJobId)) ||
       !validId(value.epoch) ||
       !["ready", "busy", "blocked"].includes(String(value.status)) ||
       typeof value.accepting !== "boolean" ||
@@ -239,6 +247,9 @@ export function decodeBrokerEnvelope(
   if (value.kind === "known" || value.kind === "refused") {
     if (
       !job ||
+      typeof job.commit !== "string" ||
+      typeof job.action !== "string" ||
+      (!job.imported && typeof job.attempt !== "string") ||
       value.commit !== job.commit ||
       value.action !== job.action ||
       (value.attempt !== job.attempt &&

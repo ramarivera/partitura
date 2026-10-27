@@ -12,6 +12,7 @@ import {
 import {
   type BrokerEnvelope,
   NativeBuildTransport,
+  NativeTransportError,
 } from "./native-build-transport.js";
 
 export interface BuilderIdentityResult {
@@ -63,11 +64,25 @@ export class BuilderRegistryIdentity extends Context.Service<BuilderRegistryIden
               }),
             ).pipe(
               Effect.mapError((cause) =>
-                BuilderRegistryError.new("builder-health-unavailable", cause),
+                BuilderRegistryError.new(
+                  cause instanceof NativeTransportError &&
+                    ["needs-refresh", "host-key-mismatch"].includes(
+                      cause.reason,
+                    )
+                    ? cause.reason
+                    : "builder-health-unavailable",
+                  cause,
+                ),
               ),
             ),
         ),
         reserved: (hostId: string) =>
+          state.snapshot().fleet?.retiredHosts.includes(hostId) === true ||
+          state
+            .snapshot()
+            .fleet?.maintenance.some(
+              (item) => item.hostId === hostId && item.state === "pending",
+            ) === true ||
           state
             .snapshot()
             .jobs.some(
