@@ -13,13 +13,13 @@ import {
   recoverNativeMetadata,
 } from "../src/services/native-build-recovery.js";
 import { openNativeBuildState } from "../src/services/native-build-state.js";
-import { createNativeBuildTransport } from "../src/services/native-build-transport.js";
 import { memoryBroker } from "./fixtures/native-build-broker.js";
 import {
   fixturePrivateKey,
   registryFixture,
   registryJob,
 } from "./fixtures/native-build-registry.js";
+import { createNativeBuildTransport } from "./fixtures/native-build-transport.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const path = testPaths();
@@ -122,7 +122,7 @@ it.live(
         expect(
           fixture.state.owned("org-a", "session-a", job.jobId).recovery
             .observation,
-        ).toBe("unavailable");
+        ).toBe("broker-state-unavailable");
         broker.settings.healthError = false;
         for (const failure of [
           "needs-refresh",
@@ -332,7 +332,7 @@ it.live(
     Effect.scoped(
       Effect.gen(function* () {
         const fixture = yield* registryFixture(path("recovered-receipt"));
-        const time = 1_000_000;
+        let time = 1_000_000;
         const job = registryJob(fixture.generation, {
           state: "submitting",
           submissionExpiresAt: 1,
@@ -363,38 +363,70 @@ it.live(
         // Clean matching health is still required to release quarantine.
         expect(current.recovery.state).toBe("pending");
         expect(current.recovery.lastReason).toBe("unavailable");
+        time = current.recovery.nextAt;
+        broker.settings.healthFailure = "";
+        yield* createNativeBuildRecovery(state, broker.transport, {
+          now: () => time,
+        }).tick(job.jobId);
+        expect(
+          state.owned("org-a", "session-a", job.jobId).recovery.state,
+        ).toBe("resolved-terminal");
+        expect(
+          state.owned("org-a", "session-a", job.jobId).recovery.resolvedEpoch,
+        ).toBe("a".repeat(32));
         yield* state.close();
       }),
     ),
 );
 
-it.live(
-  "an authenticated broker-state-unavailable error follows the retry schedule",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const fixture = yield* registryFixture(path("broker-state"));
-        const time = 1_000_000;
-        const job = registryJob(fixture.generation, {
-          state: "submitting",
-          submissionExpiresAt: 1,
-        });
-        yield* fixture.state.transaction((draft) => {
-          draft.jobs.push(job);
-        });
-        yield* recoverNativeMetadata(fixture.state, time);
-        const broker = memoryBroker(() => time);
-        broker.settings.cancelError = true;
-        yield* createNativeBuildRecovery(fixture.state, broker.transport, {
-          now: () => time,
-        }).tick(job.jobId);
-        const current = fixture.state.owned("org-a", "session-a", job.jobId);
-        expect(current.recovery.state).toBe("pending");
-        expect(current.recovery.lastReason).toBe("unavailable");
-        expect(current.recovery.returnEligible).toBe(true);
-      }),
-    ),
-);
+for (const command of ["cancel", "reconcile", "status", "health"])
+  it.live(
+    `an authenticated broker-state-unavailable error on ${command} exhausts the retry budget`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fixture = yield* registryFixture(path("broker-state"));
+          let time = 1_000_000;
+          const job = registryJob(fixture.generation, {
+            state: "submitting",
+            submissionExpiresAt: 1,
+          });
+          yield* fixture.state.transaction((draft) => {
+            draft.jobs.push(job);
+          });
+          yield* recoverNativeMetadata(fixture.state, time);
+          const broker = memoryBroker(() => time);
+          broker.settings.errorCommand = command;
+          broker.settings.terminal = true;
+          yield* createNativeBuildRecovery(fixture.state, broker.transport, {
+            now: () => time,
+          }).tick(job.jobId);
+          const current = fixture.state.owned("org-a", "session-a", job.jobId);
+          expect(current.recovery.state).toBe("pending");
+          expect(current.recovery.lastReason).toBe("unavailable");
+          expect(current.recovery.returnEligible).toBe(true);
+          expect(current.recovery.observation).toBe("broker-state-unavailable");
+          const recovery = createNativeBuildRecovery(
+            fixture.state,
+            broker.transport,
+            { now: () => time },
+          );
+          for (let attempt = 1; attempt < 6; attempt++) {
+            time = fixture.state.owned("org-a", "session-a", job.jobId).recovery
+              .nextAt;
+            yield* recovery.tick(job.jobId);
+          }
+          const exhausted = fixture.state.owned(
+            "org-a",
+            "session-a",
+            job.jobId,
+          ).recovery;
+          expect(exhausted.attempts).toBe(6);
+          expect(exhausted.state).toBe("operator-required");
+          expect(exhausted.observation).toBe("broker-state-unavailable");
+        }),
+      ),
+  );
 
 it.live("a fractional broker heartbeat keeps the busy schedule", () =>
   Effect.scoped(

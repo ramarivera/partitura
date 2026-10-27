@@ -31,20 +31,18 @@ export function nativeProcess(
     stdio: ["pipe", "pipe", "pipe"],
   });
   let failure: unknown;
-  let closed = false;
   const completion = new Promise<{ code: number | null; error: unknown }>(
     (resolve) => {
       child.once("error", (error) => {
         failure = NativeOperationError.new("native-process-unavailable", error);
       });
       child.once("close", (code) => {
-        closed = true;
         resolve({ code, error: failure });
       });
     },
   );
   const kill = () => {
-    if (closed || !child.pid) return;
+    if (!child.pid) return;
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {

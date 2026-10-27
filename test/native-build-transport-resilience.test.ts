@@ -10,14 +10,14 @@ import {
   openNativeBuildState,
 } from "../src/services/native-build-state.js";
 import {
-  createNativeBuildTransport,
-  publishNativeArtifact,
-} from "../src/services/native-build-transport.js";
-import {
   fixturePayload,
   registryFixture,
   registryJob,
 } from "./fixtures/native-build-registry.js";
+import {
+  createNativeBuildTransport,
+  publishNativeArtifact,
+} from "./fixtures/native-build-transport.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const path = testPaths();

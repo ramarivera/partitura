@@ -11,11 +11,6 @@ import {
   nativeLimits,
   openNativeBuildState,
 } from "../src/services/native-build-state.js";
-import {
-  type BrokerEnvelope,
-  createNativeBuildTransport,
-  decodeBrokerEnvelope,
-} from "../src/services/native-build-transport.js";
 import { memoryBroker } from "./fixtures/native-build-broker.js";
 import { testAwait, testRejects } from "./fixtures/native-build-effects.js";
 import {
@@ -24,6 +19,11 @@ import {
   registryFixture,
   registryJob,
 } from "./fixtures/native-build-registry.js";
+import {
+  type BrokerEnvelope,
+  createNativeBuildTransport,
+  decodeBrokerEnvelope,
+} from "./fixtures/native-build-transport.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const path = testPaths();

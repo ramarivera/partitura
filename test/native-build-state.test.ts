@@ -18,12 +18,6 @@ import {
   nativeLimits,
   openNativeBuildState,
 } from "../src/services/native-build-state.js";
-import {
-  classifyNativeSsh,
-  createNativeBuildTransport,
-  renderNativeSsh,
-  validateNativeTransport,
-} from "../src/services/native-build-transport.js";
 import { testAwait, testRejects } from "./fixtures/native-build-effects.js";
 import {
   fixturePrivateKey,
@@ -31,6 +25,12 @@ import {
   registryFixture,
   registryJob,
 } from "./fixtures/native-build-registry.js";
+import {
+  classifyNativeSsh,
+  createNativeBuildTransport,
+  renderNativeSsh,
+  validateNativeTransport,
+} from "./fixtures/native-build-transport.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const path = testPaths();

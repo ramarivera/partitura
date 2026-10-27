@@ -104,20 +104,22 @@ export function createNativeBuildRecovery(
       current.recovery.state = "cancel-requested";
       current.recovery.attempts++;
     });
-    // The broker reports transient state/IO failures as an authenticated
-    // error envelope. Those follow the unavailable retry schedule; any other
+    // Broker state/IO faults may be permanent or transient. Authenticated
+    // faults follow the unavailable retry schedule with a distinct observation; any other
     // unexpected kind is a protocol mismatch.
+    let brokerStateUnavailable = false;
     const send = (command: string) =>
-      transport
-        .envelope(generation, command, job, { timeout: remaining })
-        .pipe(
-          Effect.flatMap((envelope) =>
-            envelope.kind === "error" &&
-            envelope.code === "broker-state-unavailable"
-              ? Effect.fail(NativeTransportError.new("unavailable"))
-              : Effect.succeed(envelope),
-          ),
-        );
+      transport.envelope(generation, command, job, { timeout: remaining }).pipe(
+        Effect.flatMap((envelope) =>
+          envelope.kind === "error" &&
+          envelope.code === "broker-state-unavailable"
+            ? Effect.suspend(() => {
+                brokerStateUnavailable = true;
+                return Effect.fail(NativeTransportError.new("unavailable"));
+              })
+            : Effect.succeed(envelope),
+        ),
+      );
     const remote = Effect.gen(function* () {
       const cancelled = yield* send(`cancel ${job.jobId}`);
       if (cancelled.kind !== "cancellation-requested")
@@ -239,6 +241,9 @@ export function createNativeBuildRecovery(
         return update(job.jobId, (current) => {
           const recovery = current.recovery;
           recovery.lastReason = "unavailable";
+          recovery.observation = brokerStateUnavailable
+            ? "broker-state-unavailable"
+            : "unavailable";
           recovery.returnEligible = true;
           recovery.state =
             recovery.attempts >= 6 || now() >= recovery.deadline
@@ -368,7 +373,10 @@ export function createNativeBuildRecovery(
           if (!health) return;
           if (health.kind === "error") {
             yield* update(id, (current) => {
-              current.recovery.observation = "unavailable";
+              current.recovery.observation =
+                health.code === "broker-state-unavailable"
+                  ? "broker-state-unavailable"
+                  : "unavailable";
             });
             return;
           }

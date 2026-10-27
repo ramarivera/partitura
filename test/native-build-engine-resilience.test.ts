@@ -8,14 +8,14 @@ import { NativeBuildFiles } from "../src/services/native-build-files.js";
 import { createRegistryNativeBuildClient } from "../src/services/native-build-registry-client.js";
 import { openNativeBuildState } from "../src/services/native-build-state.js";
 import {
-  decodeBrokerEnvelope,
-  type NativeBrokerTransport,
-  NativeTransportError,
-} from "../src/services/native-build-transport.js";
-import {
   registryFixture,
   registryJob,
 } from "./fixtures/native-build-registry.js";
+import {
+  decodeBrokerEnvelope,
+  type NativeBrokerTransport,
+  NativeTransportError,
+} from "./fixtures/native-build-transport.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const path = testPaths();
@@ -367,7 +367,7 @@ it.live(
               ),
             );
             const { createNativeBuildTransport } = yield* nativeIO(
-              () => import("../src/services/native-build-transport.js"),
+              () => import("./fixtures/native-build-transport.js"),
             );
             yield* fixture.transport.dispose(fixture.generation.id);
             const transport = yield* createNativeBuildTransport(fixture.state, {
