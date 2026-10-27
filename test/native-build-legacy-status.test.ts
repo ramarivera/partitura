@@ -11,6 +11,41 @@ const jobFixture = (): NativeBuildJob => ({
   state: "failed",
 });
 
+it("only success or a pre-ownership disk refusal proves cancel can be suppressed", () => {
+  const refresh = legacyReceiptRefresh({
+    read: async () => {
+      throw new Error("must remain local");
+    },
+    save: async () => {},
+    retain: () => () => {},
+    current: () => true,
+  });
+  const job = jobFixture();
+  // Even receipt confirmation alone says nothing about outstanding obligations.
+  refresh.confirm(job.job);
+  expect(refresh.confirmed(job)).toBe(false);
+  for (const diagnostic of [
+    { stage: "boot", failureCode: "host-key-unavailable" },
+    { stage: "cleanup", failureCode: "cleanup-required" },
+    { stage: "unlock", failureCode: "unlock-failed" },
+    { stage: "capacity", failureCode: "host-capacity-unavailable" },
+    { stage: "disk-post-transfer", failureCode: "host-disk-space-unavailable" },
+    { stage: "workflow", failureCode: "workflow-failed" },
+    { stage: "cleanup", failureCode: "execution-interrupted" },
+    { stage: "receiving", failureCode: "receive-interrupted" },
+    { stage: "keychain-policy", failureCode: "keychain-policy-unavailable" },
+  ] as const)
+    expect(refresh.confirmed({ ...job, ...diagnostic })).toBe(false);
+  expect(
+    refresh.confirmed({
+      ...job,
+      stage: "disk-preflight",
+      failureCode: "host-disk-space-unavailable",
+    }),
+  ).toBe(true);
+  expect(refresh.confirmed({ ...job, state: "succeeded" })).toBe(true);
+});
+
 it.live(
   "uncertain status refresh is single-flight, nonblocking and bounded by backoff and four attempts",
   () =>
@@ -69,7 +104,7 @@ it.live(
 );
 
 it.live(
-  "a confirmed code-less failed receipt stops refresh and allows terminal cancel suppression",
+  "a confirmed code-less failed receipt stops refresh but still permits broker cleanup",
   () =>
     Effect.promise(async () => {
       const job = jobFixture();
@@ -86,7 +121,7 @@ it.live(
       try {
         refresh.track(job.job);
         await refresh.poll(job);
-        expect(refresh.confirmed(job)).toBe(true);
+        expect(refresh.confirmed(job)).toBe(false);
         for (let poll = 0; poll < 20; poll++) await refresh.poll(job);
         expect(reads).toBe(1);
       } finally {

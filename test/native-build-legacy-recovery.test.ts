@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import { createNativeBuildClient } from "../src/services/native-build-client.js";
-import { setup } from "./native-build-client-helpers.js";
+import { settled, setup } from "./native-build-client-helpers.js";
 
 const waitUntil = async (ready: () => Promise<boolean>) => {
   for (let attempt = 0; attempt < 200; attempt++) {
@@ -12,6 +12,67 @@ const waitUntil = async (ready: () => Promise<boolean>) => {
   }
   throw new Error("Fixture did not reach expected state");
 };
+
+for (const failureCode of [
+  "cleanup-required",
+  "execution-interrupted",
+] as const)
+  for (const source of ["persisted", "confirmed-run"] as const)
+    it.live(
+      `${source} ${failureCode} receipt still sends broker cancel to retry cleanup`,
+      () =>
+        Effect.promise(async () => {
+          const f = await setup();
+          const failure = { state: "failed", stage: "cleanup", failureCode };
+          const persisted = {
+            job: "a".repeat(32),
+            sessionId: "session-a",
+            commit: f.commit,
+            action: "archive",
+            ...failure,
+          };
+          if (source === "persisted") {
+            await mkdir(f.config.scratchRoot, { mode: 0o700 });
+            await writeFile(
+              join(f.config.scratchRoot, `${persisted.job}.json`),
+              JSON.stringify(persisted),
+              { mode: 0o600 },
+            );
+          } else {
+            await writeFile(
+              f.configFile,
+              JSON.stringify({
+                trace: f.trace,
+                exitCode: 1,
+                receiptOverrides: failure,
+              }),
+            );
+          }
+          const client = await createNativeBuildClient(f.config);
+          try {
+            const job =
+              source === "persisted"
+                ? persisted
+                : await client.start({
+                    sessionId: "session-a",
+                    workspacePath: f.workspace,
+                    commit: f.commit,
+                    pullRequest: 12,
+                    action: "archive",
+                  });
+            expect(await settled(client, job.job)).toMatchObject(failure);
+            expect(await client.cancel("session-a", job.job)).toMatchObject({
+              ...failure,
+              cancellationRequested: true,
+            });
+            expect(await readFile(f.trace, "utf8")).toContain(
+              `cancel ${job.job}`,
+            );
+          } finally {
+            await client.close();
+          }
+        }),
+    );
 
 it.live(
   "cancel reaches a still-running broker after the SSH run fails locally",

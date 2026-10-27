@@ -15,14 +15,12 @@ export const legacyReceiptRefresh = (deps: {
   readonly now?: () => number;
 }) => {
   const pending = new Map<string, { attempts: number; next: number }>();
-  const confirmed = new Set<string>();
   const flights = new Map<
     string,
     { task: Promise<void>; abort: AbortController }
   >();
   const now = deps.now ?? Date.now;
   const confirm = (id: string) => {
-    confirmed.add(id);
     pending.delete(id);
   };
   let closed = false;
@@ -30,8 +28,12 @@ export const legacyReceiptRefresh = (deps: {
     track: (id: string) => pending.set(id, { attempts: 0, next: 0 }),
     confirmed: (job: NativeBuildJob) =>
       job.state === "succeeded" ||
+      // Only this refusal precedes runner/VM/keychain ownership. Other failed
+      // receipts, including execution-interrupted, can precede reconciliation;
+      // cancel must still retry cleanup even after a confirmed status receipt.
       (job.state === "failed" &&
-        (job.failureCode !== undefined || confirmed.has(job.job))),
+        job.stage === "disk-preflight" &&
+        job.failureCode === "host-disk-space-unavailable"),
     confirm,
     poll: (job: NativeBuildJob) => {
       const retry = pending.get(job.job);

@@ -33,7 +33,10 @@ for (const state of ["succeeded", "failed"] as const)
           action: "archive",
           state,
           ...(state === "failed"
-            ? { stage: "cleanup", failureCode: "execution-interrupted" }
+            ? {
+                stage: "disk-preflight",
+                failureCode: "host-disk-space-unavailable",
+              }
             : {}),
         };
         await writeFile(
@@ -194,7 +197,7 @@ for (const state of ["succeeded", "failed"] as const)
             await writeFile(sshConfigFile, "# dummy transport", {
               mode: 0o600,
             });
-            // A terminal cancel must not contact the broker.
+            // Success and pre-ownership refusal need no broker cleanup.
             await writeFile(sshExecutable, "#!/bin/sh\nexit 1\n", {
               mode: 0o700,
             });
@@ -207,7 +210,10 @@ for (const state of ["succeeded", "failed"] as const)
                 action: "test",
                 state,
                 ...(state === "failed"
-                  ? { stage: "cleanup", failureCode: "execution-interrupted" }
+                  ? {
+                      stage: "disk-preflight",
+                      failureCode: "host-disk-space-unavailable",
+                    }
                   : {}),
               }),
               { mode: 0o600 },
@@ -242,7 +248,7 @@ for (const state of ["succeeded", "failed"] as const)
             state,
             cancellationRequested: false,
             ...(state === "failed"
-              ? { failureCode: "execution-interrupted" }
+              ? { failureCode: "host-disk-space-unavailable" }
               : {}),
           });
         }),
