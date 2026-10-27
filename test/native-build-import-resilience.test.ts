@@ -10,15 +10,15 @@ import {
 } from "../src/services/native-build-errors.js";
 import { NativeBuildProcesses } from "../src/services/native-build-process.js";
 import { openNativeBuildState } from "../src/services/native-build-state.js";
-import {
-  createNativeBuildTransport,
-  publishNativeArtifact,
-} from "../src/services/native-build-transport.js";
 import { legacyFixture } from "./fixtures/native-build-import.js";
 import {
   fixturePayload,
   registryFixture,
 } from "./fixtures/native-build-registry.js";
+import {
+  createNativeBuildTransport,
+  publishNativeArtifact,
+} from "./fixtures/native-build-transport.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const path = testPaths();

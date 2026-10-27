@@ -9,6 +9,7 @@ import {
   Result,
 } from "effect";
 import { RUNTIME_MODES, type RuntimeMode } from "../drivers/driver.js";
+import { loadBuilderRegistrySettings } from "./config-native-build.js";
 import type {
   GatewayConfigShape,
   T3Connection,
@@ -631,8 +632,16 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
             `T3_MODE=launch supports T3_PROVIDER_INSTANCE ${[...T3_LAUNCH_INSTANCES].join(" or ")}`,
           );
       }
+      const nativeBuildRegistry = yield* loadBuilderRegistrySettings(
+        [
+          values.workspaceRoot,
+          values.nativeBuildScratchRoot,
+          values.nativeBuildBackupScratchRoot,
+        ].filter((root): root is string => root !== undefined),
+      );
       return {
         ...values,
+        nativeBuildRegistry,
         ...(values.nativeBuildSshConfigFile === undefined ||
         values.nativeBuildScratchRoot === undefined
           ? {}

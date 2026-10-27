@@ -10,8 +10,8 @@ import {
   newRecovery,
   openNativeBuildState,
 } from "../../src/services/native-build-state.js";
-import { createNativeBuildTransport } from "../../src/services/native-build-transport.js";
 import { testAwait } from "./native-build-effects.js";
+import { createNativeBuildTransport } from "./native-build-transport.js";
 
 export const fixtureHost = "11111111-1111-4111-8111-111111111111";
 export const fixturePayload = "opaque archive bytes";

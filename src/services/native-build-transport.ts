@@ -69,8 +69,8 @@ export interface NativeTransportOptions {
 export const createNativeBuildTransport = Effect.fn(
   "NativeBuildTransport.make",
 )(function* (state: NativeBuildState, options: NativeTransportOptions) {
-  const files = yield* NativeBuildFiles.make;
-  const processes = yield* NativeBuildProcesses.make;
+  const files = yield* NativeBuildFiles;
+  const processes = yield* NativeBuildProcesses;
   const materialized = new Set<string>();
   const missing = new Set<string>();
   const failed = new Set<string>();
@@ -508,5 +508,10 @@ export class NativeBuildTransport extends Context.Service<NativeBuildTransport>(
     }),
   },
 ) {
-  static readonly layer = Layer.effect(this, this.make);
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide(
+      Layer.mergeAll(NativeBuildFiles.layer, NativeBuildProcesses.layer),
+    ),
+  );
 }

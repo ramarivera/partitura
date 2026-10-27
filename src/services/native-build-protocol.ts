@@ -58,6 +58,9 @@ export type BrokerEnvelope = {
   accepting?: boolean;
   profile?: string;
   capacity?: number;
+  jobRootFreeBytes?: number;
+  tartRootFreeBytes?: number;
+  hostFloorBytes?: number;
   runner?: {
     job: string;
     attempt: string;

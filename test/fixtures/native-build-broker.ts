@@ -19,6 +19,7 @@ export function memoryBroker(
     healthError: false,
     healthFailure: "" as "" | NativeTransportError["reason"],
     cancelError: false,
+    errorCommand: "",
     terminal: false,
   };
   const transport: NativeBrokerTransport = {
@@ -36,6 +37,8 @@ export function memoryBroker(
             protocolVersion: 2 as const,
             hostId: generation.transport.hostId,
           };
+          if (command.split(" ")[0] === settings.errorCommand)
+            return { ...base, kind: "error", code: "broker-state-unavailable" };
           if (command === "health") {
             if (settings.healthFailure)
               throw NativeTransportError.new(settings.healthFailure);

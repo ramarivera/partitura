@@ -72,6 +72,7 @@ export const Recovery = Schema.Struct({
   observation: Schema.optionalKey(
     Schema.Literals([
       "unavailable",
+      "broker-state-unavailable",
       "needs-refresh",
       "host-key-mismatch",
       "credentials-pending",
