@@ -8,6 +8,56 @@ toolbox checkout or fnox infrastructure.
 Deployment and acceptance are separate steps. Require the live checks below for
 the installed revision before calling a configured host ready.
 
+## Disk diagnostic compatibility and offline downgrade
+
+The gateway accepts `host-disk-space-unavailable` only with `disk-preflight`
+or `disk-post-transfer`. These diagnostics identify the requested job, commit
+and action even when a broker refuses input and closes stdin early. Unidentified,
+malformed or inconsistent output remains a generic failed build. The existing
+`primary` and `backup` clients and their legacy configuration remain in use.
+This gateway change doesn't install disk enforcement on a Mac.
+
+Deploy this compatible gateway before approving a host broker that emits the new
+disk diagnostics. A pre-change gateway's persisted decoder can't read those new
+literals. Before downgrading the gateway:
+
+1. Stop native tool consumers and the gateway. Reconcile unfinished jobs with the
+   compatible gateway before stopping it. Don't run two versions against the same
+   scratch directory. The offline helper requires an explicit stopped-gateway
+   acknowledgement; it doesn't detect or stop a running gateway.
+2. Approve and install an old-emitting broker profile before accepting new work
+   with the old gateway. This slice doesn't change any installed broker.
+3. From a protected checkout of this revision with its frozen dependencies
+   installed, run the root-local helper with the pinned Bun runtime. Use each
+   configured legacy scratch root separately and an existing root-owned mode-0700
+   backup directory outside both scratch roots, on the same filesystem. For example:
+
+   ```nu
+   sudo /path/to/pinned/bun /path/to/checkout/deploy/mac-build/native-build-admin.ts rollback-disk-diagnostics --legacy-root /app/native-build-scratch --backup-root /app/native-build-rollback --gateway-stopped
+   ```
+
+4. Inspect the JSON result. `projected` lists affected job IDs, `unchanged` lists
+   compatible records and `quarantined` lists corrupt/unprojectable records moved
+   out of legacy state. The helper exits 2 when it quarantines records. Resolve
+   those affected jobs before resuming native tools. It exits 1 without rewriting
+   records on preflight failure, including unfinished jobs or unsafe paths. An IO
+   failure during mutation can leave a partially completed run; inspect its private
+   backups before retrying. Exact original bytes are fsynced under the printed
+   backup directory's `originals/`; quarantine lives beside it. Retain those bytes
+   for rollback and incident investigation. Never discard unfinished jobs to make
+   an old binary start.
+5. Start the old gateway only after the affected records and host emitting profile
+   are compatible. Preserve the original scratch/artifact ownership and paths.
+
+The projection changes only terminal failed disk diagnostics to
+`host-capacity-unavailable` and `capacity`. It preserves the job ID, session owner,
+commit, action and terminal state. Other compatible records remain byte-for-byte
+unchanged. Files must be private, singly linked regular files; symlinks and unsafe
+directories are refused. An exclusive `.native-build-admin.lock` fences concurrent
+offline helpers, not gateway processes. After a helper crash, remove a leftover
+lock only after confirming the gateway and all helper processes are stopped and
+inspecting any partial backup. No helper operation contacts a Mac or secret provider.
+
 ## Repository contract
 
 Commit `.partitura/native-build.sh` in the repository. Partitura checks out the
