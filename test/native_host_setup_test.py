@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import socket
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import subprocess
@@ -18,7 +19,131 @@ host_setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host_setup)
 
 
+SCRATCH = Path(os.environ.get('TMPDIR') or Path.home() / 'dev/agentic-scratchpads/partitura/builder-registry-impl/python-tests').resolve()
+SCRATCH.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
 class NativeHostSetupTests(unittest.TestCase):
+    def test_root_identity_journal_survives_reruns_and_refuses_conflicts(self):
+        loader = importlib.util.spec_from_file_location('native_identity', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            journal = Path(directory) / 'installation.json'
+            config = dict(hostId='12345678-1234-1234-1234-123456789abc')
+            actual_lstat = Path.lstat
+            def root_metadata(path):
+                info = actual_lstat(path)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+            def installed(path):
+                return path.read_bytes() if path == journal and path.exists() else None
+            with patch.object(launcher, 'IDENTITY_PATH', journal), patch.object(launcher, 'read_installed', side_effect=installed), patch.object(Path, 'lstat', root_metadata):
+                old_umask = os.umask(0o777)
+                try:
+                    launcher.ensure_identity(config, 'builder')
+                finally:
+                    os.umask(old_umask)
+                first = journal.read_bytes()
+                launcher.ensure_identity(config, 'builder')
+                self.assertEqual(journal.read_bytes(), first)
+                self.assertEqual(journal.stat().st_mode & 0o777, 0o444)
+                with self.assertRaisesRegex(ValueError, 'identity journal differs'):
+                    launcher.ensure_identity(dict(config, hostId='aaaaaaaa-1234-1234-1234-123456789abc'), 'builder')
+                with self.assertRaisesRegex(ValueError, 'identity journal differs'):
+                    launcher.ensure_identity(config, 'other-account')
+                self.assertEqual(journal.read_bytes(), first)
+
+    def test_guard_timeout_before_classification_or_start_never_strands_new_fences(self):
+        import fcntl
+        loader = importlib.util.spec_from_file_location('guard_timeout', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        original_helper = (ROOT / 'deploy/mac-build/provision.py').read_text()
+        broker = (ROOT / 'deploy/mac-build/broker.py').read_bytes()
+        real_popen, real_select = subprocess.Popen, launcher.select.select
+        for phase, line in ((1, "print('classified', flush=True)"), (2, "print('ready', flush=True)")):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+                root = Path(directory)
+                runtime, tart = root / 'runtime', root / 'tart'
+                runtime.mkdir(mode=0o700)
+                (tart / 'vms').mkdir(parents=True)
+                helper = original_helper.replace(line, "__import__('time').sleep(0.2); " + line).encode()
+                def fake_sudo(args, **kwargs):
+                    start = args.index('-c')
+                    return real_popen([sys.executable, '-I', *args[start:]], **kwargs)
+                calls = []
+                def timed(read, write, error, timeout):
+                    calls.append(timeout)
+                    return real_select(read, write, error, 0.03 if len(calls) == phase else 3)
+                with patch.object(launcher.subprocess, 'Popen', side_effect=fake_sudo), patch.object(launcher.select, 'select', side_effect=timed):
+                    with self.assertRaisesRegex(ValueError, 'busy, fenced or unsafe'):
+                        with launcher.installation_guard(dict(root=str(runtime), tartHome=str(tart)), 'builder', helper, broker):
+                            self.fail('transaction must not start after a guard timeout')
+                self.assertEqual(len(calls), phase)
+                for marker in ('cleanup-required', 'maintenance-blocked', 'inventory-required'):
+                    self.assertFalse((runtime / marker).exists(), marker)
+                with (runtime / 'runner.lock').open('rb') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_guard_late_ready_on_closed_stdout_releases_only_new_fences(self):
+        loader = importlib.util.spec_from_file_location('guard_closed_pipe', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        helper = (ROOT / 'deploy/mac-build/provision.py').read_text().replace("print('ready', flush=True)", "__import__('time').sleep(0.2); print('ready', flush=True)")
+        script = launcher.helper_constant(helper.encode(), 'INSTALL_GUARD_SCRIPT')
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            runtime, tart = Path(directory) / 'runtime', Path(directory) / 'tart'
+            runtime.mkdir(mode=0o700)
+            (tart / 'vms').mkdir(parents=True)
+            child = subprocess.Popen([sys.executable, '-I', '-c', script, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(launcher.select.select([child.stdout], [], [], 3)[0])
+                self.assertEqual(child.stdout.readline(), b'classified\n')
+                child.stdin.write(b'fence\n'); child.stdin.flush()
+                child.stdout.close()
+                child.stdout = None
+                _, error = child.communicate(timeout=3)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn(b'BrokenPipeError', error)
+                self.assertFalse((runtime / 'maintenance-blocked').exists())
+                self.assertFalse((runtime / 'cleanup-required').exists())
+            finally:
+                if child.poll() is None: child.kill()
+                child.communicate(timeout=3)
+
+    def test_root_apply_checks_exact_predecessor_and_every_payload(self):
+        loader = importlib.util.spec_from_file_location('native_predecessor', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            root = Path(directory)
+            broker, writer, plist, tart = [root / name for name in ('broker', 'writer', 'plist', 'tart')]
+            manifest_path = root / 'manifest'
+            for path in (broker, writer, tart):
+                path.write_bytes(path.name.encode())
+                path.chmod(0o555)
+            manifest = dict(schema=1, files={str(path): dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), mode=0o555) for path in (broker, writer, tart)})
+            payload = json.dumps(manifest).encode()
+            pin = hashlib.sha256(payload).hexdigest()
+            real_lstat = Path.lstat
+            def root_metadata(path):
+                info = real_lstat(path)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+            with patch.object(launcher, 'MANIFEST_PATH', manifest_path), patch.object(launcher, 'TART_TARGET', str(tart)), patch.object(launcher, 'PLIST_TARGET', str(plist)), patch.object(launcher, 'WRITER_TARGET', str(writer)), patch.object(launcher, 'STAGED_FILES', {str(broker): 'broker', str(writer): 'writer', str(plist): 'plist'}), patch.object(launcher, 'read_installed', return_value=payload), patch.object(Path, 'lstat', root_metadata):
+                launcher.verify_predecessor({}, pin)
+                for invalid in ('', 'f' * 64):
+                    with self.assertRaisesRegex(ValueError, 'exact predecessor'):
+                        launcher.verify_predecessor({}, invalid)
+                plist.write_bytes(b'unmanaged')
+                with self.assertRaisesRegex(ValueError, 'unmanaged installation target'):
+                    launcher.verify_predecessor({}, pin)
+                plist.unlink()
+                broker.chmod(0o755)
+                broker.write_bytes(b'changed')
+                broker.chmod(0o555)
+                with self.assertRaisesRegex(ValueError, 'payload differs'):
+                    launcher.verify_predecessor({}, pin)
+
     def test_qualification_mount_check_is_portable_and_fails_on_awk_errors(self):
         source = (ROOT / "deploy/mac-build/qualify-base.sh").read_text()
         check = source[source.index("mount_check=$("):source.index("\nprintf 'PARTITURA_NATIVE_BASE_QUALIFIED")]
@@ -82,6 +207,7 @@ class NativeHostSetupTests(unittest.TestCase):
             manifest = json.dumps({'schema': 1, 'files': entries}).encode()
             (stage / 'managed-files.json').write_bytes(manifest)
             pin = hashlib.sha256(manifest).hexdigest()
+            (stage / 'provision.py').write_bytes((ROOT / 'deploy/mac-build/provision.py').read_bytes())
             snapshot = launcher.verified_payloads(stage, pin, 'a'*64)
             self.assertEqual(snapshot['broker.py'], b'broker.py')
             (stage / 'broker.py').write_bytes(b'tampered')
@@ -136,6 +262,8 @@ class NativeHostSetupTests(unittest.TestCase):
                 "x11forwarding no",
                 "permittty no",
                 "permituserenvironment no",
+                "clientaliveinterval 15",
+                "clientalivecountmax 3",
             ]
         )
         calls = []

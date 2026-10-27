@@ -8,6 +8,7 @@ files for the separate root installer. It has no Toolbox runtime dependency.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import hashlib
 import json
@@ -16,6 +17,7 @@ import pwd
 from pathlib import Path
 import re
 import stat
+import plistlib
 import subprocess
 import sys
 
@@ -52,6 +54,11 @@ ROOT_AUTHORIZED_KEYS = Path("/Library/Partitura/NativeBuild/authorized_keys")
 ROOT_SSHD_CONFIG = Path("/private/etc/ssh/sshd_config")
 ROOT_SSHD_DROPIN = Path("/private/etc/ssh/sshd_config.d/90-partitura-native-build.conf")
 ROOT_TART_APP = Path("/Library/Partitura/NativeBuild/tart.app")
+ROOT_PLIST = Path("/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist")
+ROOT_IDENTITY = Path("/Library/Partitura/NativeBuild/installation.json")
+MAINTENANCE_LABEL = "net.partitura.native-build-maintenance"
+MINIMUM_FREE_BYTES = 50 * 1024**3
+BROKER_POLICY_KEYS = {"host_id", "protocol", "profile", "minimum_free_bytes", "daemon_relock_qualified", "daemon_relock_macos_build"}
 
 
 class NativeHostError(ValueError):
@@ -221,14 +228,38 @@ def validate_settings(settings: object) -> dict:
         "host",
         "account",
         "guest_user",
-        "authorized_key",
         "source",
         "predecessor_manifest_sha256",
         "tart",
         "base",
         "runtime",
     }
-    config = required_mapping(settings, top_keys, "settings")
+    if not isinstance(settings, dict) or set(settings) - top_keys - {"authorized_key", "authorized_keys", "broker"} or top_keys - set(settings) or ("authorized_key" in settings) == ("authorized_keys" in settings):
+        raise NativeHostError("settings require exactly one of authorized_key or authorized_keys and known settings fields")
+    config = dict(settings)
+    keys = config.get("authorized_keys", [config.get("authorized_key")] if config.get("authorized_key") else [])
+    validate_authorized_keys(keys, config['enabled'])
+    config.pop("authorized_key", None)
+    config["authorized_keys"] = keys
+    policy = dict(host_id="", protocol=2, profile="legacy", minimum_free_bytes=MINIMUM_FREE_BYTES, daemon_relock_qualified=False, daemon_relock_macos_build="", keychain_policy=None)
+    if "broker" in config:
+        raw = config['broker']
+        if not isinstance(raw, dict) or set(raw) - BROKER_POLICY_KEYS - {'keychain_policy'} or BROKER_POLICY_KEYS - set(raw):
+            raise NativeHostError('invalid broker policy fields')
+        policy.update(raw)
+    value = policy['keychain_policy']
+    if value is not None and (not isinstance(value, dict) or set(value) != {'lockOnSleep', 'lockInterval'} or type(value['lockOnSleep']) is not bool or type(value['lockInterval']) is not int or not 0 <= value['lockInterval'] <= 2**31 - 1):
+        raise NativeHostError('invalid broker keychain_policy')
+    if not isinstance(policy["host_id"], str) or policy["host_id"] and not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", policy["host_id"]):
+        raise NativeHostError("broker.host_id must be a canonical UUID")
+    if type(policy["protocol"]) is not int or policy["protocol"] != 2 or policy["profile"] not in ("legacy", "registry-only"):
+        raise NativeHostError("invalid broker protocol/profile")
+    if type(policy["minimum_free_bytes"]) is not int or not MINIMUM_FREE_BYTES <= policy["minimum_free_bytes"] <= 2**63 - 1:
+        raise NativeHostError("invalid broker minimum_free_bytes")
+    if type(policy["daemon_relock_qualified"]) is not bool or not isinstance(policy["daemon_relock_macos_build"], str) or not re.fullmatch(r"[A-Za-z0-9]{0,32}", policy["daemon_relock_macos_build"]) or policy["daemon_relock_qualified"] and not policy["daemon_relock_macos_build"]:
+        raise NativeHostError("invalid broker daemon relock qualification")
+    if "broker" in settings:
+        config["broker"] = policy
     if not isinstance(config["enabled"], bool):
         raise NativeHostError("enabled must be a boolean")
     if not isinstance(config["host"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", config["host"]):
@@ -281,11 +312,11 @@ def validate_settings(settings: object) -> dict:
         raise NativeHostError("source.broker_commit must be a full lowercase Git commit")
     if not isinstance(tart["sha256"], str) or not HASH.fullmatch(tart["sha256"]):
         raise NativeHostError("tart.sha256 must be a lowercase SHA-256")
-    for section, keys in ((source, ("partitura_repository", "qualifier_source")),
+    for section, path_keys in ((source, ("partitura_repository", "qualifier_source")),
                           (tart, ("source_app", "installed_app")),
                           (base, ("source_path", "mise_binary", "dedicated_path", "qualification_receipt")),
                           (runtime, ("root", "tart_home"))):
-        for key in keys:
+        for key in path_keys:
             if not isinstance(section[key], str) or not Path(section[key]).is_absolute():
                 raise NativeHostError(f"configured path must be absolute: {key}")
     if not isinstance(base["name"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", base["name"]):
@@ -307,21 +338,34 @@ def validate_settings(settings: object) -> dict:
         raise NativeHostError("unexpected Tart executable path")
     if tart["installed_app"] != str(ROOT_TART_APP):
         raise NativeHostError(f"tart.installed_app must be {ROOT_TART_APP}")
-    if not isinstance(config["authorized_key"], str):
-        raise NativeHostError("authorized_key must be a string")
     if config["enabled"]:
-        validate_public_key(config["authorized_key"])
+        if not keys:
+            raise NativeHostError("enabled provisioning requires one or two authorized_keys")
         if not base["sha256"]:
             raise NativeHostError("enabled provisioning requires a qualified base SHA-256")
-    elif config["authorized_key"]:
+    elif keys:
         raise NativeHostError("keep authorized_key empty while provisioning is disabled")
     if config["enabled"] and (not base["source_sha256"] or not base["mise_sha256"]):
         raise NativeHostError("enabled provisioning requires pinned source VM and Mise SHA-256 values")
     return config
 
 
+def validate_authorized_keys(keys: list, enabled: bool) -> None:
+    if not isinstance(keys, list) or len(keys) > 2 or any(not isinstance(key, str) for key in keys) or enabled and not keys:
+        raise NativeHostError("authorized_keys must contain one or two public keys when enabled")
+    if not enabled and keys:
+        raise NativeHostError("keep authorized_key empty while provisioning is disabled")
+    identities = set()
+    for key in keys:
+        validate_public_key(key)
+        identity = base64.b64decode(key.split()[1], validate=True)
+        if identity in identities:
+            raise NativeHostError("duplicate authorized public key")
+        identities.add(identity)
+
+
 def validate_public_key(public_key: str) -> None:
-    if not PUBLIC_KEY.fullmatch(public_key):
+    if len(public_key) > 16384 or any(ord(char) < 32 or ord(char) == 127 for char in public_key) or not PUBLIC_KEY.fullmatch(public_key):
         raise NativeHostError("authorized_key must be one supported OpenSSH public key")
     algorithm, encoded, *_ = public_key.split(" ", 2)
     try:
@@ -336,11 +380,11 @@ def validate_public_key(public_key: str) -> None:
         raise NativeHostError("authorized_key algorithm does not match its key blob")
 
 
-def make_broker_config(config: dict) -> dict[str, str]:
+def make_broker_config(config: dict) -> dict:
     """Render exactly the broker config contract from deploy/mac-build/README.md."""
     tart = config["tart"]
     source = config["source"]
-    return {
+    result = {
         "tart": str(ROOT_TART_APP / tart["executable_relative_path"]),
         "tartSha256": tart["sha256"],
         "base": config["base"]["name"],
@@ -353,6 +397,11 @@ def make_broker_config(config: dict) -> dict[str, str]:
         "keychainPath": f"/Users/{config['account']}/Library/Keychains/login.keychain-db",
         "keychainCredentialPath": f"/Users/{config['account']}/.partitura-native-login.password",
     }
+    policy = config.get("broker")
+    if policy and policy["host_id"]:
+        result.update(hostId=policy["host_id"], profile=policy["profile"], minimumFreeBytes=policy["minimum_free_bytes"], daemonRelockQualified=policy["daemon_relock_qualified"], daemonRelockMacOSBuild=policy["daemon_relock_macos_build"])
+        result['keychainPolicy'] = policy.get('keychain_policy')
+    return result
 
 
 def authorized_key_line(public_key: str) -> str:
@@ -377,9 +426,134 @@ def sshd_dropin(account: str) -> str:
             "    AllowAgentForwarding no",
             "    X11Forwarding no",
             "    PermitTTY no",
+            "    ClientAliveInterval 15",
+            "    ClientAliveCountMax 3",
             "",
         ]
     )
+
+
+def maintenance_plist(account: str) -> bytes:
+    return plistlib.dumps({
+        "Label": MAINTENANCE_LABEL, "UserName": account, "GroupName": "staff",
+        "ProgramArguments": ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", f"HOME=/Users/{account}", "DEVELOPER_DIR=/Library/Developer/CommandLineTools", "/usr/bin/python3", "-I", str(ROOT_BROKER), "local-maintenance"],
+        "RunAtLoad": True, "StartInterval": 60, "ProcessType": "Background", "WorkingDirectory": "/",
+        "Umask": 0o077, "ExitTimeOut": 150, "ThrottleInterval": 60,
+        "HardResourceLimits": {"Core": 0}, "SoftResourceLimits": {"Core": 0},
+    }, sort_keys=True)
+
+
+def read_root_json(path: Path) -> dict | None:
+    reject_symlink_ancestors(path)
+    if not os.path.lexists(path):
+        return None
+    trusted_root_path(path, "installed state")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > 65536:
+            raise NativeHostError("unsafe installed state")
+        pairs = lambda values: unique_settings(values)
+        value = json.loads(stream.read(65537), object_pairs_hook=pairs)
+    if not isinstance(value, dict):
+        raise NativeHostError("invalid installed state")
+    return value
+
+
+def unique_settings(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise NativeHostError("duplicate settings key")
+        result[key] = value
+    return result
+
+
+def resolve_broker_policy(config: dict) -> dict:
+    """A check never mints an identity or silently downgrades an installed profile."""
+    installed = read_root_json(ROOT_CONFIG)
+    identity = read_root_json(ROOT_IDENTITY)
+    account = config['account']
+    if installed:
+        extension = {"hostId", "profile", "minimumFreeBytes", "daemonRelockQualified", "daemonRelockMacOSBuild"}
+        shapes = (BROKER_CONFIG_KEYS, BROKER_CONFIG_KEYS | extension, BROKER_CONFIG_KEYS | (extension - {"minimumFreeBytes"}), BROKER_CONFIG_KEYS | extension | {'keychainPolicy'}, BROKER_CONFIG_KEYS | (extension - {'minimumFreeBytes'}) | {'keychainPolicy'})
+        if set(installed) not in shapes or installed.get('keychainPath') != f'/Users/{account}/Library/Keychains/login.keychain-db':
+            raise NativeHostError("installed broker state/account differs")
+        if installed['root'] != config['runtime']['root'] or installed['tartHome'] != config['runtime']['tart_home']:
+            raise NativeHostError("runtime root migration requires separate drained host repair")
+    if identity and (set(identity) != {'schema', 'hostId', 'account'} or identity['schema'] != 1 or identity['account'] != account):
+        raise NativeHostError("installation identity journal differs")
+    identifiers = {value for value in ((installed or {}).get('hostId'), (identity or {}).get('hostId'), config.get('broker', {}).get('host_id')) if value}
+    if len(identifiers) > 1:
+        raise NativeHostError("conflicting installed host identity")
+    if not identifiers:
+        raise NativeHostError("initialize a stable host identity through the approved one-shot installer before staging")
+    policy = config.get('broker', dict(host_id='', protocol=2, profile=(installed or {}).get('profile', 'legacy'), minimum_free_bytes=(installed or {}).get('minimumFreeBytes', MINIMUM_FREE_BYTES), daemon_relock_qualified=(installed or {}).get('daemonRelockQualified', False), daemon_relock_macos_build=(installed or {}).get('daemonRelockMacOSBuild', ''), keychain_policy=(installed or {}).get('keychainPolicy')))
+    result = dict(config, broker=dict(policy, host_id=identifiers.pop()))
+    return validate_settings(result)
+
+
+def checked_provision_blob(config: dict) -> bytes:
+    source = config['source']
+    return subprocess.run(["/usr/bin/git", "-C", source['partitura_repository'], "show", f"{source['broker_commit']}:deploy/mac-build/provision.py"], check=True, capture_output=True, env=git_environment()).stdout
+
+
+def provision_constant(blob: bytes, name: str) -> str:
+    for node in ast.parse(blob).body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            value = ast.literal_eval(node.value)
+            if isinstance(value, str):
+                return value
+    raise NativeHostError("pinned provision helper lacks the fixed entry point")
+
+
+def verify_runtime_capacity(config: dict, run=subprocess.run) -> None:
+    script = r'''
+import os, sys
+floor = int(sys.argv[1])
+free = []
+for path in sys.argv[2:]:
+    info = os.statvfs(path)
+    free.append(info.f_bavail * info.f_frsize)
+if min(free) < floor:
+    raise SystemExit('runtime job/Tart root below sealed free-space floor')
+print('runtime capacity verified: jobRootFreeBytes=%d tartRootFreeBytes=%d minimumFreeBytes=%d' % (*free, floor))
+'''
+    result = run([*account_python(config['account']), '-c', script, str(config['broker']['minimum_free_bytes']), config['runtime']['root'], config['runtime']['tart_home']], check=True, capture_output=True, text=True, timeout=15, cwd='/')
+    print(result.stdout, end='')
+
+
+def verify_host_policy(config: dict, run=subprocess.run) -> bool:
+    # Never call a keychain API from sudo. Only the broker's unlocked SSH
+    # session can qualify the optional sealed keychain policy.
+    result = run(['/bin/launchctl', 'print', 'system/' + MAINTENANCE_LABEL], check=False, capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        if 'Could not find service' in result.stderr:
+            return False
+        raise NativeHostError('cannot read system maintenance daemon state')
+    return True
+
+
+def installation_pending(config: dict, run=subprocess.run) -> bool:
+    script = r'''
+import os, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1]) / 'maintenance-blocked'
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except FileNotFoundError:
+    print('clear')
+else:
+    with os.fdopen(fd, 'r') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 128:
+            raise SystemExit('unsafe installation fence')
+        print('incomplete' if stream.read(129).startswith('installation-incomplete') else 'clear')
+'''
+    result = run([*account_python(config['account']), '-c', script, config['runtime']['root']], check=True, capture_output=True, text=True, timeout=15, cwd='/')
+    if result.stdout.strip() not in ('clear', 'incomplete'):
+        raise NativeHostError('invalid installation fence readback')
+    return result.stdout.strip() == 'incomplete'
 
 
 def safe_read(path: Path) -> bytes:
@@ -572,8 +746,9 @@ def expected_host_files(config: dict, blobs: tuple[bytes, bytes, bytes, bytes, b
         ROOT_WRITER: (blobs[5], 0o555),
         # The forced-command broker runs as the dedicated host account.
         ROOT_CONFIG: (json.dumps(make_broker_config(config), sort_keys=True, indent=2).encode() + b"\n", 0o444),
-        ROOT_AUTHORIZED_KEYS: (authorized_key_line(config["authorized_key"]).encode(), 0o444),
+        ROOT_AUTHORIZED_KEYS: (''.join(authorized_key_line(key) for key in config.get("authorized_keys", [config["authorized_key"]] if config.get("authorized_key") else [])).encode(), 0o444),
         ROOT_SSHD_DROPIN: (sshd_dropin(config["account"]).encode(), 0o644),
+        ROOT_PLIST: (maintenance_plist(config["account"]), 0o644),
     }
 
 
@@ -630,7 +805,8 @@ def check_existing_files(
     migrating = manifest and set(previous) != target_names
     if migrating:
         predecessor = config["predecessor_manifest_sha256"]
-        if set(previous) != target_names - {str(ROOT_WRITER)} or not predecessor or sha256_file(manifest_path) != predecessor:
+        predecessors = (target_names - {str(ROOT_PLIST)}, target_names - {str(ROOT_PLIST), str(ROOT_WRITER)})
+        if set(previous) not in predecessors or not predecessor or sha256_file(manifest_path) != predecessor:
             raise NativeHostError("managed-files manifest does not match the frozen predecessor target set")
         # Every predecessor entry must still match. The pin alone does not
         # authorize arbitrary intervening changes or a partial prior install.
@@ -640,8 +816,9 @@ def check_existing_files(
             metadata = path.lstat()
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != entry["mode"] or sha256_file(path) != entry["sha256"]:
                 raise NativeHostError("frozen predecessor payload differs")
-        if os.path.lexists(ROOT_WRITER):
-            raise NativeHostError("unexpected credential writer before migration")
+        for added in target_names - set(previous):
+            if os.path.lexists(added):
+                raise NativeHostError("unexpected new managed target before migration")
         stale = True
 
     def known_or_desired(path: Path, expected_hash: str, expected_mode: int, actual_hash: str, actual_mode: int) -> None:
@@ -711,6 +888,8 @@ def verify_effective_sshd(settings: dict, effective: dict[str, str]) -> None:
         "x11forwarding": "no",
         "permittty": "no",
         "permituserenvironment": "no",
+        "clientaliveinterval": "15",
+        "clientalivecountmax": "3",
     }
     mismatch = [key for key, value in expected.items() if effective.get(key) != value]
     if mismatch:
@@ -724,18 +903,23 @@ def check(settings: object, *, system: str | None = None, run=subprocess.run) ->
         return 0
     if (system or os.uname().sysname) != "Darwin":
         raise NativeHostError("enabled native host provisioning requires macOS")
+    config = resolve_broker_policy(config)
     blobs = checked_source_blobs(config)
     verify_tart_source(config)
     verify_qualified_base(config, run)
     verify_account(config["account"], run)
     verify_private_runtime(config, run)
+    verify_runtime_capacity(config, run)
     effective = sshd_effective(config, run)
     files = expected_host_files(config, blobs)
     stale = check_existing_files(files, config)
-    if stale:
+    if stale or installation_pending(config, run):
         print("partitura native host: prerequisites verified; managed files need installation")
         return 2
     verify_effective_sshd(config, effective)
+    if not verify_host_policy(config, run):
+        print("partitura native host: managed files current; maintenance daemon needs installation")
+        return 2
     print("partitura native host: pinned sources, account, Tart, base, sshd and files verified")
     return 0
 
@@ -793,11 +977,13 @@ def stage(settings: object, destination: Path) -> None:
         raise NativeHostError("cannot stage native host files while disabled")
     if os.uname().sysname != "Darwin":
         raise NativeHostError("native host staging requires macOS")
+    config = resolve_broker_policy(config)
     blobs = checked_source_blobs(config)
     app = verify_tart_source(config)
     verify_qualified_base(config)
     verify_account(config["account"])
     verify_private_runtime(config)
+    verify_runtime_capacity(config)
     sshd_effective(config)
     reject_symlink_ancestors(destination)
     if destination.exists():
@@ -817,9 +1003,11 @@ def stage(settings: object, destination: Path) -> None:
     (destination / "config.json").write_text(
         json.dumps(make_broker_config(config), sort_keys=True, indent=2) + "\n"
     )
-    (destination / "authorized_keys").write_text(authorized_key_line(config["authorized_key"]))
+    (destination / "authorized_keys").write_text(''.join(authorized_key_line(key) for key in config.get('authorized_keys', [config['authorized_key']] if config.get('authorized_key') else [])))
     (destination / "sshd_config").write_text(sshd_dropin(config["account"]))
-    for name in ("config.json", "authorized_keys", "sshd_config"):
+    (destination / "maintenance.plist").write_bytes(maintenance_plist(config['account']))
+    (destination / "provision.py").write_bytes(checked_provision_blob(config))
+    for name in ("config.json", "authorized_keys", "sshd_config", "maintenance.plist", "provision.py"):
         os.chmod(destination / name, 0o600)
     managed = expected_host_files(config, blobs)
     (destination / "managed-files.json").write_bytes(expected_managed_manifest(managed, config))
@@ -848,7 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         verify_root_interpreter()
-        settings = json.loads(arguments.config.read_text())
+        settings = json.loads(arguments.config.read_text(), object_pairs_hook=unique_settings)
         if arguments.check:
             return check(settings)
         stage(settings, arguments.stage)

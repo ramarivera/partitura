@@ -11,7 +11,11 @@ usage() {
   cat <<'EOF'
 Usage: provision-host.sh --source-vm PATH --source-sha256 HASH --authorized-key KEY
   [--tart-home PATH | --create-volume CONTAINER] [--host NAME] [--base NAME]
-  [--account NAME] [--inputs DIR] [--apply]
+  [--account NAME] [--inputs DIR] [--apply] [--policy-only]
+  [--authorized-key SECOND_KEY] [--host-id UUID] [--profile legacy|registry-only]
+  [--minimum-free-bytes BYTES] [--predecessor-manifest-sha256 HASH]
+  [--daemon-relock-qualified --daemon-relock-macos-build BUILD]
+  [--daemon-relock-unqualified] [--keychain-policy preserve|JSON]
 
   --source-vm       clean Tart VM directory, laid out as <tart home>/vms/<name>
   --source-sha256   pinned tree hash of that VM (see README)
@@ -20,13 +24,15 @@ Usage: provision-host.sh --source-vm PATH --source-sha256 HASH --authorized-key 
   --tart-home       existing build storage (default
                     /Volumes/PartituraBuilds/partitura-native/tart)
   --host            builder name (default: short hostname)
+  --policy-only     update installed policy/keys without account/base/keychain creation
   --inputs          download cache (default
                     ~/dev/agentic-scratchpads/partitura/host-inputs)
 
 Steps, each skipped when already done: storage, account, base VM preparation
-and qualification, root install of the broker and SSH policy, SSH admission,
-build credential and password, build keychain, readback for the gateway.
-The first build proves the keychain unlocks; nothing earlier can (see step 8).
+and qualification, missing build credential/password/keychain initialization,
+root install of the broker and SSH policy, SSH admission and final readback.
+The first approved SSH build proves unlock. The installer never checks or
+changes keychain settings; an optional sealed policy runs after SSH unlock.
 EOF
 }
 
@@ -45,7 +51,7 @@ GUEST_USER=partitura
 VOLUME=PartituraBuilds
 VOLUME_RESERVE=120g
 MIN_STORAGE_KB=$((120 * 1024 * 1024))
-MIN_INTERNAL_KB=$((5 * 1024 * 1024))
+MIN_INTERNAL_KB=$((50 * 1024 * 1024))
 CLT=/Library/Developer/CommandLineTools
 PY=(/usr/bin/env "DEVELOPER_DIR=$CLT" /usr/bin/python3 -I)
 GIT=(/usr/bin/env -i PATH=/usr/bin:/bin "HOME=$HOME" "DEVELOPER_DIR=$CLT"
@@ -54,13 +60,32 @@ ROOT_GIT=(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/root "DEVELOPER_DIR=$CLT"
           GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 /usr/bin/git)
 INSTALL=/Library/Partitura/NativeBuild
 
-source_vm= source_sha= authorized_key= tart_home= container= host= base= account=partitura-build
+authorized_keys=()
+policy_args=()
+policy_only=0 predecessor= minimum_free_bytes= daemon_qualification= daemon_build=
+source_vm= source_sha= tart_home= container= host= base= account=partitura-build
 inputs="$HOME/dev/agentic-scratchpads/partitura/host-inputs" apply=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --source-vm) source_vm=${2-}; shift 2 ;;
     --source-sha256) source_sha=${2-}; shift 2 ;;
-    --authorized-key) authorized_key=${2-}; shift 2 ;;
+    --authorized-key) authorized_keys+=("${2-}"); shift 2 ;;
+    --host-id)
+      [[ "${2-}" =~ ^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$ ]] || { echo "invalid host UUID" >&2; exit 2; }
+      policy_args+=("$1" "$2"); shift 2 ;;
+    --profile)
+      [[ "${2-}" = legacy || "${2-}" = registry-only ]] || { echo "invalid profile" >&2; exit 2; }
+      policy_args+=("$1" "$2"); shift 2 ;;
+    --daemon-relock-macos-build)
+      [[ "${2-}" =~ ^[A-Za-z0-9]{1,32}$ ]] || { echo "invalid macOS build" >&2; exit 2; }
+      daemon_build=$2; policy_args+=("$1" "$2"); shift 2 ;;
+    --keychain-policy) policy_args+=("$1" "${2-}"); shift 2 ;;
+    --minimum-free-bytes) minimum_free_bytes=${2-}; policy_args+=("$1" "${2-}"); shift 2 ;;
+    --predecessor-manifest-sha256) predecessor=${2-}; shift 2 ;;
+    --daemon-relock-qualified|--daemon-relock-unqualified)
+      [ -z "$daemon_qualification" ] || { echo "supply only one relock qualification flag" >&2; exit 2; }
+      daemon_qualification=$1; policy_args+=("$1"); shift ;;
+    --policy-only) policy_only=1; shift ;;
     --tart-home) tart_home=${2-}; shift 2 ;;
     --create-volume) container=${2-}; shift 2 ;;
     --host) host=${2-}; shift 2 ;;
@@ -103,15 +128,26 @@ id -Gn | tr ' ' '\n' | grep -x admin >/dev/null || die "$(id -un) is not an admi
 [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}$ ]] || die "invalid host name: $host"
 [ -n "$base" ] || base=partitura-base-$(printf %s "$host" | tr 'A-Z' 'a-z')
 [[ "$base" =~ ^[a-z0-9][a-z0-9-]{0,79}$ ]] || die "invalid base name: $base"
-[[ "$source_sha" =~ ^[a-f0-9]{64}$ ]] || die "--source-sha256 must be a lowercase SHA-256"
-[[ "$authorized_key" =~ ^(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa)\ [A-Za-z0-9+/]+={0,3}(\ [^[:cntrl:]]+)?$ ]] \
-  || die "--authorized-key must be one OpenSSH public key line"
+[ "${#authorized_keys[@]}" -ge 1 ] && [ "${#authorized_keys[@]}" -le 2 ] || die "supply one or two --authorized-key values"
+for key in "${authorized_keys[@]}"; do
+  [[ "$key" =~ ^(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa)\ [A-Za-z0-9+/]+={0,3}(\ [^[:cntrl:]]+)?$ ]] \
+    || die "--authorized-key must be one OpenSSH public key line"
+done
+[ -z "$predecessor" ] || [[ "$predecessor" =~ ^[a-f0-9]{64}$ ]] || die "invalid predecessor SHA-256"
+if [ -n "$minimum_free_bytes" ]; then
+  [[ "$minimum_free_bytes" =~ ^[0-9]{1,19}$ ]] || die "invalid disk floor"
+  MIN_INTERNAL_KB=$("${PY[@]}" -c 'import sys; n=int(sys.argv[1]); assert 53687091200 <= n <= 2**63-1; print((n+1023)//1024)' "$minimum_free_bytes") \
+    || die "disk floor must be from 50 GiB through 2^63-1 bytes"
+fi
+[ "$daemon_qualification" != --daemon-relock-qualified ] || [ -n "$daemon_build" ] || die "qualification requires --daemon-relock-macos-build"
+[ "$policy_only" -eq 0 ] || [ -z "$container" ] || die "--policy-only cannot create a volume"
 if [ -n "$container" ] && [ -n "$tart_home" ]; then die "use --create-volume or --tart-home, not both"; fi
 [ -n "$tart_home" ] || tart_home=/Volumes/$VOLUME/partitura-native/tart
 case "$tart_home" in /*) ;; *) die "--tart-home must be absolute" ;; esac
 
 checkout=$(cd "$(dirname "$0")/../.." && pwd)
 MB=$checkout/deploy/mac-build
+"${PY[@]}" "$MB/provision.py" validate-keys "${authorized_keys[@]}" || die "invalid/duplicate authorized public keys"
 commit=$("${GIT[@]}" -C "$checkout" rev-parse HEAD) || die "cannot read the Partitura checkout"
 [ -z "$("${GIT[@]}" -C "$checkout" status --porcelain)" ] || die "Partitura checkout $checkout has uncommitted changes"
 mkdir -p -m 0700 "$inputs"
@@ -128,9 +164,18 @@ done
   || die "Command Line Tools tree has group/other-writable entries"
 "${PY[@]}" -c 'import sys; assert sys.version_info >= (3, 9)' || die "Command Line Tools Python 3.9+ is unavailable"
 
+# Policy/key rotation uses installed inputs and never prepares a VM/account.
+if [ "$policy_only" -eq 1 ]; then
+  [ -f "$receipt" ] && id "$account" >/dev/null 2>&1 || die "--policy-only requires an installed account and qualified base"
+  source_sha=$("${PY[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["sourceSha256"])' "$receipt")
+  source_vm=/unused/vms/$("${PY[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["sourceName"])' "$receipt")
+  tart_app=$INSTALL/tart.app
+else
+  tart_app=$inputs/tart.app
+fi
+[[ "$source_sha" =~ ^[a-f0-9]{64}$ ]] || die "--source-sha256 must be a lowercase SHA-256"
 # Inputs: download once, verify every time.
-tart_app=$inputs/tart.app
-if [ ! -d "$tart_app" ]; then
+if [ "$policy_only" -eq 0 ] && [ ! -d "$tart_app" ]; then
   curl -fsSL --proto '=https' -o "$inputs/tart.tar.gz" "$TART_URL" || die "Tart download failed"
   [ "$(sha "$inputs/tart.tar.gz")" = "$TART_TGZ_SHA" ] || die "Tart archive hash differs from the pin"
   mkdir -m 0700 "$inputs/tart-extract"
@@ -143,15 +188,18 @@ tart=$tart_app/Contents/MacOS/tart
 codesign --verify --deep --strict "$tart_app" || die "Tart signature check failed"
 codesign -dv "$tart_app" 2>&1 | grep -x "TeamIdentifier=$TART_TEAM" >/dev/null || die "Tart is not signed by team $TART_TEAM"
 mise_binary=$inputs/mise-v$MISE_VERSION-macos-arm64
+if [ "$policy_only" -eq 0 ]; then
 if [ ! -f "$mise_binary" ]; then
   curl -fsSL --proto '=https' -o "$mise_binary.part" "$MISE_URL" || die "Mise download failed"
   mv "$mise_binary.part" "$mise_binary"
 fi
 [ "$(sha "$mise_binary")" = "$MISE_SHA" ] || die "Mise binary hash differs from the pin"
 chmod 0755 "$mise_binary"
-echo "inputs verified: Tart 2.41.1 ($TART_TEAM), Mise $MISE_VERSION"
+fi
+echo "Tart verified: 2.41.1 ($TART_TEAM); Mise $MISE_VERSION is checked when preparing a base"
 
 # Source VM: Tart addresses it by name inside its own home.
+if [ "$policy_only" -eq 0 ]; then
 source_vm=${source_vm%/}
 [ -d "$source_vm" ] && [ ! -L "$source_vm" ] || die "--source-vm is not a directory: $source_vm"
 source_name=${source_vm##*/}
@@ -188,7 +236,8 @@ else
   [ "$(df -k "$volume_root" | awk 'NR==2{print $4}')" -gt "$MIN_STORAGE_KB" ] || die "less than 120 GB free on $volume_root"
 fi
 [ "$(df -k /System/Volumes/Data | awk 'NR==2{print $4}')" -gt "$MIN_INTERNAL_KB" ] \
-  || die "less than 5 GiB free on the internal disk"
+  || die "internal disk is below the sealed runtime floor (at least 50 GiB)"
+fi
 
 # SSH: Remote Login must already be on; this never enables it globally.
 nc -z -G 2 127.0.0.1 22 >/dev/null 2>&1 || die "Remote Login is off (System Settings > General > Sharing)"
@@ -214,6 +263,15 @@ KEEPALIVE=$!
 trap 'kill "$KEEPALIVE" 2>/dev/null; sudo -k' EXIT
 caffeinate -i -s -w $$ &
 
+# Refuse an incomplete existing credential pair before any install mutation.
+cred=/Users/$account/.partitura-native-login.password
+kc=/Users/$account/Library/Keychains/login.keychain-db
+if sudo test -e "$kc"; then
+  sudo test -e "$cred" || die "existing keychain has no saved credential; explicit host repair required"
+elif [ "$policy_only" -eq 1 ]; then
+  die "installed host requires an initialized credential/keychain; explicit host repair required"
+fi
+if [ "$policy_only" -eq 0 ]; then
 step "2 build storage"
 if [ -n "$container" ] && [ ! -d "/Volumes/$VOLUME" ]; then
   sudo diskutil apfs addVolume "$container" APFS "$VOLUME" -reserve "$VOLUME_RESERVE" || die "could not create $VOLUME"
@@ -244,12 +302,18 @@ else
   bash "$MB/prepare-base.sh" "${prep[@]}" --apply || die "base preparation failed"
 fi
 
+fi
+
 step "5 install the broker and restricted SSH policy (quiet while it rehashes the base)"
 out=$inputs/out-$host
-"${PY[@]}" "$MB/provision.py" settings --clone "$checkout" --receipt "$receipt" --root-dir "$ROOT" \
-  --tart-app "$tart_app" --tart-sha256 "$TART_SHA" --mise-binary "$mise_binary" --source-path "$source_vm" \
-  --host "$host" --account "$account" --guest-user "$GUEST_USER" --authorized-key "$authorized_key" \
-  --runtime-root "$runtime_root" --tart-home "$tart_home" --out "$out" > "$out.hashes" || die "could not render host settings"
+render=(settings --clone "$checkout" --receipt "$receipt" --root-dir "$ROOT"
+  --tart-app "$tart_app" --tart-sha256 "$TART_SHA" --mise-binary "$mise_binary" --source-path "$source_vm"
+  --host "$host" --account "$account" --guest-user "$GUEST_USER"
+  --runtime-root "$runtime_root" --tart-home "$tart_home" --out "$out")
+# Keep this array nonempty for macOS Bash 3.2 with nounset.
+policy_args+=(--predecessor-manifest-sha256 "$predecessor")
+for key in "${authorized_keys[@]}"; do render+=(--authorized-key "$key"); done
+"${PY[@]}" "$MB/provision.py" "${render[@]}" "${policy_args[@]}" > "$out.hashes" || die "could not render host settings"
 manifest_sha=$(awk -F= '/^manifest_sha256=/{print $2}' "$out.hashes")
 settings_sha=$(sha "$out/settings.json")
 bundle=$inputs/partitura-${commit:0:12}.bundle
@@ -274,6 +338,33 @@ sudo install -m 0600 "$out/settings.json" "$ROOT/settings.json"
 [ "$(root_sha "$ROOT/settings.json")" = "$settings_sha" ] || die "root copy of the settings differs"
 RMB=$ROOT/checkout/deploy/mac-build
 set +e; sudo -H "${PY[@]}" "$RMB/host_setup.py" --config "$ROOT/settings.json" --check; rc=$?; set -e
+case $rc in 0|2) ;; *) die "host_setup --check exited $rc" ;; esac
+step "5a initialize missing fresh-host credentials"
+cred=/Users/$account/.partitura-native-login.password
+kc=/Users/$account/Library/Keychains/login.keychain-db
+state=$INSTALL/provisioning
+asbuild() { sudo -H -u "$account" "$@"; }
+# Stable, protected state survives a newer commit's root staging directory.
+sudo install -d -o root -g wheel -m 0700 "$state"
+if sudo test -e "$kc"; then
+  sudo test -e "$cred" || die "existing keychain has no saved credential; explicit host repair required"
+  echo "existing credential/keychain preserved; account password is unchanged"
+else
+  [ "$policy_only" -eq 0 ] || die "--policy-only requires an initialized credential/keychain"
+  if ! sudo test -e "$cred"; then
+    echo "Paste a NEW password for $account (store it in your password manager first). Asked twice."
+    sudo -H "${PY[@]}" "$RMB/provision.py" bootstrap-binding --account "$account" || die "credential bootstrap binding failed"
+    sudo cat "$RMB/credential-writer.py" | asbuild "${PY[@]}" - --bootstrap || die "credential writer failed"
+  fi
+  if ! sudo test -e "$state/password-set"; then
+    sudo -H "${PY[@]}" "$RMB/provision.py" password --account "$account" || die "setting the account password failed"
+    sudo touch "$state/password-set"
+  fi
+  # No existing keychain is deleted or replaced automatically.
+  sudo cat "$RMB/provision.py" | asbuild "${PY[@]}" - keychain || die "keychain create failed"
+  echo "build keychain created from the saved credential"
+fi
+
 case $rc in
   0) echo "host files already installed" ;;
   2)
@@ -282,9 +373,8 @@ case $rc in
     [ "$(root_sha "$STAGE/managed-files.json")" = "$manifest_sha" ] || die "staged manifest differs from the rendered one"
     for mode in --check --apply; do
       sudo -H "${PY[@]}" "$RMB/native_host.py" --stage "$STAGE" --account "$account" \
-        --tart-sha256 "$TART_SHA" --manifest-sha256 "$manifest_sha" "$mode" || die "native_host $mode failed"
+        --tart-sha256 "$TART_SHA" --manifest-sha256 "$manifest_sha" --predecessor-manifest-sha256 "$predecessor" "$mode" || die "native_host $mode failed"
     done
-    sudo -H "${PY[@]}" "$RMB/host_setup.py" --config "$ROOT/settings.json" --check || die "post-install check failed"
     ;;
   *) die "host_setup --check exited $rc" ;;
 esac
@@ -293,45 +383,19 @@ step "6 admit $account to SSH (public key only, forced build command)"
 sudo -H "${PY[@]}" "$RMB/provision.py" sshd --account "$account" --apply || die "sshd admission failed"
 sudo -H "${PY[@]}" "$RMB/remote_login.py" --account "$account" --apply || die "Remote Login admission failed"
 
-step "7 build credential and account password"
-cred=/Users/$account/.partitura-native-login.password
-if ! sudo test -e "$cred"; then
-  echo "Paste a NEW password for $account (store it in your password manager first). Asked twice."
-  sudo -H -u "$account" "${PY[@]}" "$INSTALL/credential-writer.py" || die "credential writer failed"
-fi
-if ! sudo test -e "$ROOT/password-set"; then
-  sudo -H "${PY[@]}" "$RMB/provision.py" password --account "$account" || die "setting the account password failed"
-  sudo touch "$ROOT/password-set"
-fi
+step "7 final policy/readback"
+sudo -H "${PY[@]}" "$RMB/host_setup.py" --config "$ROOT/settings.json" --check || die "post-install check failed"
+echo "the first approved broker-session build proves unlock; daemon relock qualification is separate"
 
-step "8 build keychain"
-# Create it once, with the saved credential. Don't verify the unlock here: on
-# macOS 27 an unlock attempted through sudo -u from the operator's session fails
-# even when the keychain and credential are right, while the broker's own SSH
-# session unlocks it. The first build is the proof; the broker returns
-# unlock-failed before cloning anything.
-kc=/Users/$account/Library/Keychains/login.keychain-db
-asbuild() { sudo -H -u "$account" "$@"; }
-if ! sudo test -e "$ROOT/keychain-created"; then
-  if sudo test -e "$kc"; then
-    old=$kc.pre-$(date -u +%Y%m%dT%H%M%SZ)
-    asbuild cp -p "$kc" "$old" && asbuild security delete-keychain "$kc" || die "could not set aside the old keychain"
-    echo "previous keychain kept at $old"
-  fi
-  # The build account can't traverse root's checkout; hand it the helper on stdin.
-  sudo cat "$RMB/provision.py" | asbuild "${PY[@]}" - keychain || die "keychain create failed"
-  sudo touch "$ROOT/keychain-created"
-  echo "build keychain created from the saved credential; the first build proves it unlocks"
-  echo "if that build stops with unlock-failed: sudo rm $ROOT/keychain-created, then rerun with --apply"
-fi
-
-step "9 readback for the gateway"
+step "8 readback for the gateway"
 host_key=$(awk '{print $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)
 cat <<EOF
 builder:          $host
 base sha256:      $("${PY[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseSha256"])' "$receipt")
 broker commit:    $commit
-authorized key:   $(printf '%s\n' "$authorized_key" | ssh-keygen -lf /dev/stdin | awk '{print $2}')
+host identity:    $("${PY[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["broker"]["host_id"])' "$out/settings.json")
+profile:          $("${PY[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["broker"]["profile"])' "$out/settings.json")
+authorized keys:  ${#authorized_keys[@]} restricted keys
 known_hosts line: <tailnet name of $host> $host_key
 gateway transport: User $account, IdentityFile <private key>, StrictHostKeyChecking yes
 EOF

@@ -8,6 +8,7 @@ Subcommands (each runs with the identity provision-host.sh gives it):
   keychain  build account: create its login keychain once
 """
 import argparse
+import uuid
 import errno
 import fnmatch
 import glob
@@ -34,6 +35,172 @@ SSHD_CONFIG = Path('/private/etc/ssh/sshd_config')
 SSHD_BACKUPS = Path('/Library/Partitura/NativeBuild/sshd-backup')
 CREDENTIAL = '.partitura-native-login.password'
 KEYCHAIN = 'Library/Keychains/login.keychain-db'
+BOOTSTRAP_BINDING = Path('/Library/Partitura/NativeBuild/credential-bootstrap.json')
+
+
+def bootstrap_binding(account):
+    if os.geteuid() != 0 or not ACCOUNT.fullmatch(account) or account == 'root':
+        raise ValueError('bootstrap binding requires root and the dedicated account')
+    identity = pwd.getpwnam(account)
+    if identity.pw_uid == 0 or identity.pw_dir != '/Users/' + account:
+        raise ValueError('invalid dedicated account identity')
+    missing = []
+    current = BOOTSTRAP_BINDING.parent
+    while not os.path.lexists(current):
+        missing.append(current)
+        current = current.parent
+    for path in (current, *current.parents):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('unsafe bootstrap binding ancestor')
+    for path in reversed(missing):
+        path.mkdir(mode=0o755)
+        path.chmod(0o755)
+    config_path = BOOTSTRAP_BINDING.with_name('config.json')
+    if os.path.lexists(config_path):
+        descriptor = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 65536:
+                raise ValueError('unsafe installed credential binding')
+            config = json.load(source)
+        if config['keychainPath'] != identity.pw_dir + '/Library/Keychains/login.keychain-db' or config['keychainCredentialPath'] != identity.pw_dir + '/' + CREDENTIAL:
+            raise ValueError('installed config binds a different dedicated account')
+    value = dict(schema=1, account=account, uid=identity.pw_uid, home=identity.pw_dir)
+    if os.path.lexists(BOOTSTRAP_BINDING):
+        info = BOOTSTRAP_BINDING.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o444 or json.loads(BOOTSTRAP_BINDING.read_bytes()) != value:
+            raise ValueError('bootstrap binding differs')
+        return 0
+    descriptor = os.open(BOOTSTRAP_BINDING, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+    with os.fdopen(descriptor, 'w') as stream:
+        os.fchmod(stream.fileno(), 0o444)
+        stream.write(json.dumps(value) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(BOOTSTRAP_BINDING.parent, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return 0
+
+INSTALL_GUARD_SCRIPT = r'''
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import uuid
+import re
+import types
+
+root = Path(sys.argv[1])
+if not root.is_absolute() or root.resolve() != root:
+    raise SystemExit('unsafe runtime root')
+info = root.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+    raise SystemExit('unsafe runtime root')
+descriptor = os.open(root / 'runner.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+info = os.fstat(descriptor)
+if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    raise SystemExit('unsafe runner lock')
+fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+fences = ('active-vm', 'cleanup-required', 'unlock-attempt', 'keychain-relock-pending', 'runner.json', 'recovery.json', 'maintenance-blocked', 'inventory-required')
+def marker(name):
+    fd = os.open(root / name, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 128:
+            raise SystemExit('unsafe installation marker')
+        return stream.read(129)
+existing = {name for name in fences if os.path.lexists(root / name)}
+blocked = marker('maintenance-blocked') if 'maintenance-blocked' in existing else ''
+match = re.fullmatch('installation-incomplete ([a-f0-9]{32})\n', blocked)
+token = match[1] if match else uuid.uuid4().hex
+resume = bool(match) and existing <= {'cleanup-required', 'maintenance-blocked', 'inventory-required'} and not os.path.lexists(root / token)
+if resume and 'cleanup-required' in existing:
+    resume = marker('cleanup-required') == token + '\n'
+if resume and 'inventory-required' in existing:
+    resume = marker('inventory-required') == 'installation\n'
+if existing and not resume:
+    raise SystemExit('drain and reconcile existing native jobs before installation')
+tart = Path(sys.argv[2])
+if tart.resolve() != tart or (tart / 'vms').is_symlink() or any(item.name.startswith('partitura-job-') for item in (tart / 'vms').iterdir()):
+    raise SystemExit('drain owned clones before installation')
+# Execute only the root wrapper's hash-verified broker bytes, never code from a
+# job tree. Classification does no keychain IO and cannot start a native build.
+broker = types.ModuleType('installation_inventory')
+broker.__file__ = '/dev/null'
+exec(compile(sys.argv[3], '<sealed broker inventory>', 'exec'), broker.__dict__)
+config = json.loads(sys.argv[4])
+jobs = broker.inventory_obligations(config)
+for job in jobs:
+    broker.inspect_job_directory(root / job)
+if jobs:
+    print('legacy job receipts require broker SSH recovery: ' + ','.join(sorted(jobs)), file=sys.stderr)
+def sync():
+    fd = os.open(root, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+def write(name, value):
+    path = root / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync()
+# Classification never mutates admission. A timed-out wrapper closes stdin
+# without authorizing fences, even if inventory finishes much later.
+print('classified', flush=True)
+if sys.stdin.readline() != 'fence\n':
+    raise SystemExit('installation not authorized; admission unchanged')
+started = False
+try:
+    if not resume:
+        write('maintenance-blocked', 'installation-incomplete ' + token + '\n')
+    if 'cleanup-required' not in existing:
+        write('cleanup-required', token + '\n')
+    print('ready', flush=True)
+    if sys.stdin.readline() != 'start\n':
+        raise SystemExit('installation not started; prior admission restored')
+    started = True
+finally:
+    # Includes a late BrokenPipeError after the root wrapper has timed out and
+    # closed stdout. No transaction was started, so only our new fences may go.
+    if not started and not resume:
+        owned = {'maintenance-blocked': 'installation-incomplete ' + token + '\n', 'cleanup-required': token + '\n'}
+        present = {name for name in owned if os.path.lexists(root / name)}
+        if all(marker(name) == owned[name] for name in present):
+            for name in ('cleanup-required', 'maintenance-blocked'):
+                if name in present:
+                    (root / name).unlink()
+                    sync()
+command = sys.stdin.readline()
+if command not in ('commit\n', 'abort-restored\n'):
+    raise SystemExit('installation incomplete; admission remains fenced')
+if command == 'abort-restored\n' and resume:
+    raise SystemExit('prior incomplete installation still requires successful readback')
+if marker('maintenance-blocked') != 'installation-incomplete ' + token + '\n' or marker('cleanup-required') != token + '\n':
+    raise SystemExit('installation fence ownership changed')
+# Every policy/profile change invalidates commands queued before installation.
+if command == 'commit\n':
+    epoch = root / 'admission-epoch'
+    pending = root / ('.installation-epoch-' + uuid.uuid4().hex)
+    write(pending.name, uuid.uuid4().hex + '\n')
+    pending.replace(epoch)
+    sync()
+# A new host or upgraded broker must complete its bounded boot inventory.
+if command == 'commit\n' and not os.path.lexists(root / 'inventory-required'):
+    write('inventory-required', 'installation\n')
+for name in ('cleanup-required', 'maintenance-blocked'):
+    (root / name).unlink()
+    sync()
+'''
 
 
 def render_settings(args):
@@ -51,12 +218,24 @@ def render_settings(args):
                             capture_output=True, text=True, env=hs.git_environment()).stdout.strip()
     receipt = json.loads(Path(args.receipt).read_text())
     root = Path(args.root_dir)
+    out = Path(args.out)
+    installed = hs.read_root_json(hs.ROOT_CONFIG) or {}
+    identity = hs.read_root_json(hs.ROOT_IDENTITY) or {}
+    cached = {}
+    if not installed.get('hostId') and not identity.get('hostId') and (out / 'settings.json').exists():
+        cached = json.loads((out / 'settings.json').read_text()).get('broker', {})
+    host_id = args.host_id or identity.get('hostId') or installed.get('hostId') or cached.get('host_id') or str(uuid.uuid4())
+    old = dict(host_id=host_id, protocol=2, profile=installed.get('profile', 'legacy'), minimum_free_bytes=installed.get('minimumFreeBytes', hs.MINIMUM_FREE_BYTES), daemon_relock_qualified=installed.get('daemonRelockQualified', False), daemon_relock_macos_build=installed.get('daemonRelockMacOSBuild', ''), keychain_policy=installed.get('keychainPolicy'))
+    if args.keychain_policy is not None:
+        old['keychain_policy'] = None if args.keychain_policy == 'preserve' else json.loads(args.keychain_policy)
+    policy = dict(old, **{key: value for key, value in dict(profile=args.profile, minimum_free_bytes=args.minimum_free_bytes, daemon_relock_qualified=args.daemon_relock_qualified, daemon_relock_macos_build=args.daemon_relock_macos_build).items() if value is not None})
     names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
     blobs = {name: show(name) for name in names}
     digest = {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()}
     settings = {
         'account': args.account,
-        'authorized_key': args.authorized_key,
+        'authorized_keys': args.authorized_key,
+        'broker': policy,
         'base': {
             'dedicated_path': receipt['basePath'],
             'mise_binary': args.mise_binary,
@@ -74,7 +253,7 @@ def render_settings(args):
         'enabled': True,
         'guest_user': args.guest_user,
         'host': args.host,
-        'predecessor_manifest_sha256': '',
+        'predecessor_manifest_sha256': args.predecessor_manifest_sha256,
         'runtime': {'root': args.runtime_root, 'tart_home': args.tart_home},
         'source': {
             'partitura_repository': str(root / 'checkout'),
@@ -95,13 +274,12 @@ def render_settings(args):
             'source_app': args.tart_app,
         },
     }
-    config = hs.validate_settings(settings)
+    config = hs.resolve_broker_policy(hs.validate_settings(settings))
     manifest = hs.expected_managed_manifest(
         hs.expected_host_files(config, tuple(blobs[name] for name in names)), config)
     settings['tart'] = dict(settings['tart'], source_app=str(root / 'tart.app'))
     hs.validate_settings(settings)
     data = json.dumps(settings, sort_keys=True, indent=2).encode() + b'\n'
-    out = Path(args.out)
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     (out / 'settings.json').write_bytes(data)
     (out / 'managed-files.json').write_bytes(manifest)
@@ -349,8 +527,20 @@ def main(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     render = commands.add_parser('settings')
     for name in ('clone', 'receipt', 'root-dir', 'tart-app', 'tart-sha256', 'mise-binary', 'source-path',
-                 'host', 'account', 'guest-user', 'authorized-key', 'runtime-root', 'tart-home', 'out'):
+                 'host', 'account', 'guest-user', 'runtime-root', 'tart-home', 'out'):
         render.add_argument(f'--{name}', required=True)
+    render.add_argument('--authorized-key', action='append', required=True)
+    render.add_argument('--host-id')
+    render.add_argument('--profile', choices=('legacy', 'registry-only'))
+    render.add_argument('--minimum-free-bytes', type=int)
+    render.add_argument('--keychain-policy', help='preserve, or explicit JSON lockOnSleep/lockInterval settings')
+    qualification = render.add_mutually_exclusive_group()
+    qualification.add_argument('--daemon-relock-qualified', action='store_true', default=None)
+    qualification.add_argument('--daemon-relock-unqualified', action='store_false', dest='daemon_relock_qualified')
+    render.add_argument('--daemon-relock-macos-build')
+    render.add_argument('--predecessor-manifest-sha256', default='')
+    commands.add_parser('validate-keys').add_argument('keys', nargs='+')
+    commands.add_parser('bootstrap-binding').add_argument('--account', required=True)
     for name in ('sshd', 'password'):
         sub = commands.add_parser(name)
         sub.add_argument('--account', required=True)
@@ -359,6 +549,14 @@ def main(argv=None):
     commands.add_parser('keychain')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'validate-keys':
+            spec = importlib.util.spec_from_file_location('public_keys', Path(__file__).with_name('host_setup.py'))
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            helper.validate_authorized_keys(args.keys, True)
+            return 0
+        if args.command == 'bootstrap-binding':
+            return bootstrap_binding(args.account)
         if args.command == 'settings':
             render_settings(args)
             return 0

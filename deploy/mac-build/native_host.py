@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import contextlib
 import hashlib
 import json
 import os
@@ -10,12 +12,14 @@ from pathlib import Path
 import pwd
 import re
 import stat
+import select
 import subprocess
 import sys
 import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
-INSTALL_HOST_SHA256 = "a9ee4ea0723a5a02820556b41c157299199170d7297b21b2afbdc1b759773055"
+INSTALL_HOST_SHA256 = "b8863ad7ae1f203b8889dcd198536683e599206cd59ad4275fe0930fa41d1009"
+PROVISION_SHA256 = "74e31a8b5f2fd442d66cd38f735f0e2f86ee2ba152decddfa5d853b7e8d3e623"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 STAGED_FILES = {
     '/Library/Partitura/NativeBuild/credential-writer.py': 'credential-writer.py',
@@ -23,8 +27,14 @@ STAGED_FILES = {
     '/Library/Partitura/NativeBuild/config.json': 'config.json',
     '/Library/Partitura/NativeBuild/authorized_keys': 'authorized_keys',
     '/private/etc/ssh/sshd_config.d/90-partitura-native-build.conf': 'sshd_config',
+    '/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist': 'maintenance.plist',
 }
 TART_TARGET = '/Library/Partitura/NativeBuild/tart.app/Contents/MacOS/tart'
+MANIFEST_PATH = Path('/Library/Partitura/NativeBuild/managed-files.json')
+CONFIG_PATH = Path('/Library/Partitura/NativeBuild/config.json')
+IDENTITY_PATH = Path('/Library/Partitura/NativeBuild/installation.json')
+PLIST_TARGET = '/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist'
+WRITER_TARGET = '/Library/Partitura/NativeBuild/credential-writer.py'
 
 
 def verified_payloads(stage: Path, manifest_sha256: str, tart_sha256: str) -> dict[str, bytes]:
@@ -49,7 +59,153 @@ def verified_payloads(stage: Path, manifest_sha256: str, tart_sha256: str) -> di
         if hashlib.sha256(payload).hexdigest() != decoded['files'][target]['sha256']:
             raise ValueError('staged payload differs from the approved manifest: ' + name)
         payloads[name] = payload
+    helper = read('provision.py')
+    if hashlib.sha256(helper).hexdigest() != PROVISION_SHA256:
+        raise ValueError('staged provision helper differs from the Partitura pin')
+    payloads['provision.py'] = helper
     return payloads
+
+
+def read_installed(path: Path) -> bytes | None:
+    if not os.path.lexists(path):
+        return None
+    for item in (path, *path.parents):
+        info = item.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('unsafe installed state')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 2 * 1024 * 1024:
+            raise ValueError('unsafe installed payload')
+        return stream.read()
+
+
+def verify_predecessor(payloads: dict, predecessor: str) -> None:
+    manifest_path = MANIFEST_PATH
+    manifest = read_installed(manifest_path)
+    targets = set(STAGED_FILES) | {TART_TARGET}
+    previous = {}
+    if manifest is not None:
+        decoded = json.loads(manifest)
+        previous = decoded['files']
+        if set(decoded) != {'schema', 'files'} or decoded['schema'] != 1:
+            raise ValueError('invalid installed manifest')
+        allowed = (targets, targets - {PLIST_TARGET}, targets - {PLIST_TARGET, WRITER_TARGET})
+        if set(previous) not in allowed or (set(previous) != targets and not predecessor) or set(previous) != targets and hashlib.sha256(manifest).hexdigest() != predecessor:
+            raise ValueError('installed manifest differs from the approved exact predecessor')
+        for target, entry in previous.items():
+            path = Path(target)
+            for item in (path, *path.parents):
+                info = item.lstat()
+                if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                    raise ValueError('unsafe installed predecessor')
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            digest = hashlib.sha256()
+            with os.fdopen(descriptor, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError('unsafe installed predecessor')
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            if set(entry) != {'sha256', 'mode'} or digest.hexdigest() != entry['sha256'] or stat.S_IMODE(info.st_mode) != entry['mode']:
+                raise ValueError('installed predecessor payload differs')
+    for target in targets - set(previous):
+        if os.path.lexists(target):
+            raise ValueError('unexpected unmanaged installation target')
+
+
+def ensure_identity(config: dict, account: str) -> None:
+    path = IDENTITY_PATH
+    value = dict(schema=1, account=account, hostId=config['hostId'])
+    installed = read_installed(CONFIG_PATH)
+    if installed is not None:
+        old = json.loads(installed)
+        if old.get('hostId', config['hostId']) != config['hostId'] or old['keychainPath'] != f'/Users/{account}/Library/Keychains/login.keychain-db' or any(old[key] != config[key] for key in ('root', 'tartHome')):
+            raise ValueError('installed identity/account/runtime roots differ')
+    prior = read_installed(path)
+    if prior is not None:
+        if json.loads(prior) != value:
+            raise ValueError('installation identity journal differs')
+        return
+    missing = []
+    current = path.parent
+    while not os.path.lexists(current):
+        missing.append(current)
+        current = current.parent
+    for item in (current, *current.parents):
+        info = item.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('unsafe installation identity ancestor')
+    for item in reversed(missing):
+        item.mkdir(mode=0o755)
+        item.chmod(0o755)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+    with os.fdopen(descriptor, 'w') as stream:
+        os.fchmod(stream.fileno(), 0o444)
+        stream.write(json.dumps(value, sort_keys=True) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def helper_constant(blob: bytes, name: str) -> str:
+    for node in ast.parse(blob).body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            return ast.literal_eval(node.value)
+    raise ValueError('fixed provision helper unavailable')
+
+
+GUARD_READY_SECONDS = 60
+
+
+@contextlib.contextmanager
+def installation_guard(config: dict, account: str, helper: bytes, broker: bytes):
+    script = helper_constant(helper, 'INSTALL_GUARD_SCRIPT')
+    command = ['/usr/bin/sudo', '--non-interactive', '-H', '-u', account, '/usr/bin/env', '-i', f'HOME=/Users/{account}', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', 'DEVELOPER_DIR=/Library/Developer/CommandLineTools', '/usr/bin/python3', '-I', '-c', script, config['root'], config['tartHome'], broker.decode(), json.dumps(config)]
+    guard = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True, close_fds=True)
+    try:
+        def expect(message):
+            if not select.select([guard.stdout], [], [], GUARD_READY_SECONDS)[0] or guard.stdout.readline(64) != message:
+                raise ValueError('native jobs are busy, fenced or unsafe; drain/reconcile before installation')
+        expect(b'classified\n')
+        guard.stdin.write(b'fence\n')
+        guard.stdin.flush()
+        expect(b'ready\n')
+        guard.stdin.write(b'start\n')
+        guard.stdin.flush()
+        # The installer inherits this write end too. If this root wrapper dies,
+        # EOF cannot release the run lock while its transaction is still alive.
+        rolled_back = False
+        try:
+            yield guard.stdin.fileno()
+        except InstallationRestored:
+            rolled_back = True
+        guard.stdin.write(b'abort-restored\n' if rolled_back else b'commit\n')
+        guard.stdin.flush()
+        guard.stdin.close()
+        if guard.wait(timeout=15) != 0:
+            raise ValueError('installation readback complete but admission fence remains')
+        if rolled_back:
+            raise InstallationRestored('installation failed; verified predecessor restored and installer fences removed')
+    finally:
+        if guard.stdin and not guard.stdin.closed:
+            guard.stdin.close()
+        try:
+            guard.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            # A surviving transaction or stalled IO must retain the lock/fence.
+            # Never kill its lock owner to make installation look complete.
+            print('native host installation guard still owns admission; host inspection required', file=sys.stderr)
+        guard.stdout.close()
+
+
+class InstallationRestored(ValueError):
+    pass
 
 
 def fail(message: str) -> int:
@@ -102,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--account", required=True)
     parser.add_argument("--tart-sha256", required=True)
     parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument("--predecessor-manifest-sha256", default='')
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--apply", action="store_true")
@@ -110,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
         return fail("invalid configured host account")
     if not HASH.fullmatch(args.tart_sha256) or not HASH.fullmatch(args.manifest_sha256) or not HASH.fullmatch(INSTALL_HOST_SHA256):
         return fail("installer pins are incomplete")
+    if args.predecessor_manifest_sha256 and not HASH.fullmatch(args.predecessor_manifest_sha256):
+        return fail('invalid predecessor manifest pin')
     if os.uname().sysname != "Darwin":
         return fail("host installation requires macOS")
     unsafe = untrusted_root_interpreter()
@@ -153,6 +312,15 @@ def main(argv: list[str] | None = None) -> int:
     if os.geteuid() != 0:
         return fail("--apply requires root privileges")
     try:
+        original_manifest = read_installed(MANIFEST_PATH)
+        verify_predecessor(payloads, args.predecessor_manifest_sha256)
+        config = json.loads(payloads['config.json'])
+        if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', config['hostId']) or config['profile'] not in ('legacy', 'registry-only'):
+            raise ValueError('invalid sealed broker identity/profile')
+        ensure_identity(config, args.account)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return fail(f'cannot validate installed predecessor: {error}')
+    try:
         scratch = root_scratch_directory()
     except OSError as error:
         return fail(f"cannot prepare private root scratch directory: {error}")
@@ -167,10 +335,17 @@ def main(argv: list[str] | None = None) -> int:
             target.write_bytes(contents)
             target.chmod(0o600)
         subprocess.run(['/usr/bin/ditto', '--rsrc', str(stage / 'tart.app'), str(root_stage / 'tart.app')], check=True)
-        result = subprocess.run(
-            ["/bin/bash", str(root_script), str(root_stage), args.tart_sha256, args.account],
-            check=False,
-        )
+        try:
+            with installation_guard(config, args.account, payloads['provision.py'], payloads['broker.py']) as guard_fd:
+                result = subprocess.run(["/bin/bash", str(root_script), str(root_stage), args.tart_sha256, args.account], pass_fds=(guard_fd,), check=False)
+                if result.returncode == 75:
+                    if read_installed(MANIFEST_PATH) != original_manifest:
+                        raise ValueError('rollback changed the predecessor manifest; admission remains fenced')
+                    verify_predecessor(payloads, args.predecessor_manifest_sha256)
+                    raise InstallationRestored()
+                result.check_returncode()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            return fail(f'host installation did not complete: {error}')
     return result.returncode
 
 

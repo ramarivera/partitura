@@ -58,6 +58,13 @@ class RemoteLoginTests(unittest.TestCase):
             module.admit('builder', True, self.runner(**options))
             self.assertFalse(any('edit' in command for command in self.commands))
 
+    def test_extended_keepalive_policy_does_not_broaden_remote_login_admission(self):
+        policy = POLICY + 'clientaliveinterval 15\nclientalivecountmax 3\n'
+        module.admit('builder', True, self.runner(policy=policy))
+        edits = [command for command in self.commands if 'edit' in command]
+        self.assertEqual(edits, [['/usr/sbin/dseditgroup', '-o', 'edit', '-a', 'builder', '-t', 'user', 'com.apple.access_ssh']])
+        self.assertFalse(any('systemsetup' in ' '.join(command) for command in self.commands))
+
     def test_rejects_account_injection(self):
         for account in ('root', '../builder', 'builder;id', ''):
             with self.assertRaises(ValueError):
