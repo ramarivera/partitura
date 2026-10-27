@@ -5,7 +5,7 @@ Subcommands (each runs with the identity provision-host.sh gives it):
   settings  operator: render pinned host settings and the desired manifest
   sshd      root: admit the build account to an existing sshd allowlist
   password  root: set the build account password from its saved credential
-  keychain  build account: verify or create its login keychain
+  keychain  build account: create its login keychain once
 """
 import argparse
 import errno
@@ -308,56 +308,40 @@ def set_password(account):
     return f'{account} password set from its saved credential'
 
 
-def keychain(mode):
+def keychain():
+    """Create the build account's login keychain from its saved credential.
+
+    There is no unlock check: on macOS 27 an unlock run through sudo -u from the
+    operator's session fails even for a correct keychain. The broker's first job
+    unlocks it in the build account's own SSH session.
+    """
     import ctypes as C
     home = Path(os.path.expanduser('~'))
     if os.getuid() == 0 or home != Path('/Users') / pwd.getpwuid(os.getuid()).pw_name:
         raise ValueError('run as the build account with sudo -H')
     path = home / KEYCHAIN
+    if os.path.lexists(path):
+        raise ValueError('keychain path still exists')
     secret = read_credential(home)
     S = C.CDLL('/System/Library/Frameworks/Security.framework/Security')
     ref = C.c_void_p
     S.SecKeychainCreate.argtypes = [C.c_char_p, C.c_uint32, C.c_void_p, C.c_ubyte, C.c_void_p, C.POINTER(ref)]
-    S.SecKeychainOpen.argtypes = [C.c_char_p, C.POINTER(ref)]
-    S.SecKeychainUnlock.argtypes = [ref, C.c_uint32, C.c_void_p, C.c_ubyte]
+    S.SecKeychainCreate.restype = C.c_int32
     S.SecKeychainLock.argtypes = [ref]
-    S.SecKeychainGetStatus.argtypes = [ref, C.POINTER(C.c_uint32)]
-    S.SecKeychainSetUserInteractionAllowed.argtypes = [C.c_ubyte]
-    for name in ('SecKeychainCreate', 'SecKeychainOpen', 'SecKeychainUnlock', 'SecKeychainLock',
-                 'SecKeychainGetStatus', 'SecKeychainSetUserInteractionAllowed'):
-        getattr(S, name).restype = C.c_int32
-    S.SecKeychainSetUserInteractionAllowed(0)
+    S.SecKeychainLock.restype = C.c_int32
     buffer = C.create_string_buffer(bytes(secret))
     secret[:] = b'\0' * len(secret)
-    status = C.c_uint32()
-
-    def unlocked(handle):
-        if S.SecKeychainGetStatus(handle, C.byref(status)):
-            raise ValueError('keychain status failed')
-        return bool(status.value & 1)
-
     handle = ref()
     try:
-        if mode == 'verify':  # 0: opens with the credential and is left locked; 3: it doesn't
-            if not os.path.lexists(path) or S.SecKeychainOpen(os.fsencode(path), C.byref(handle)):
-                return 3
-            if S.SecKeychainUnlock(handle, len(buffer) - 1, buffer, 1) or not unlocked(handle):
-                return 3
-            if S.SecKeychainLock(handle) or unlocked(handle):
-                raise ValueError('keychain lock failed')
-            return 0
-        # macOS refuses to create a keychain at a path this process already
-        # opened (-25296), so create and verify run as separate processes.
-        if os.path.lexists(path):
-            raise ValueError('keychain path still exists')
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         code = S.SecKeychainCreate(os.fsencode(path), len(buffer) - 1, buffer, 0, None, C.byref(handle))
         if code:
             raise ValueError(f'keychain create failed: {code}')
         S.SecKeychainLock(handle)
-        return 0
     finally:
         C.memset(buffer, 0, len(buffer))
+    print('build keychain created and locked')
+    return 0
 
 
 def main(argv=None):
@@ -372,14 +356,14 @@ def main(argv=None):
         sub.add_argument('--account', required=True)
         if name == 'sshd':
             sub.add_argument('--apply', action='store_true')
-    commands.add_parser('keychain').add_argument('mode', choices=('verify', 'create'))
+    commands.add_parser('keychain')
     args = parser.parse_args(argv)
     try:
         if args.command == 'settings':
             render_settings(args)
             return 0
         if args.command == 'keychain':
-            return keychain(args.mode)
+            return keychain()
         if not ACCOUNT.fullmatch(args.account) or args.account == 'root':
             raise ValueError('invalid build account')
         if args.command == 'sshd':

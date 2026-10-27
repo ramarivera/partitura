@@ -26,6 +26,7 @@ Usage: provision-host.sh --source-vm PATH --source-sha256 HASH --authorized-key 
 Steps, each skipped when already done: storage, account, base VM preparation
 and qualification, root install of the broker and SSH policy, SSH admission,
 build credential and password, build keychain, readback for the gateway.
+The first build proves the keychain unlocks; nothing earlier can (see step 8).
 EOF
 }
 
@@ -304,24 +305,24 @@ if ! sudo test -e "$ROOT/password-set"; then
 fi
 
 step "8 build keychain"
+# Create it once, with the saved credential. Don't verify the unlock here: on
+# macOS 27 an unlock attempted through sudo -u from the operator's session fails
+# even when the keychain and credential are right, while the broker's own SSH
+# session unlocks it. The first build is the proof; the broker returns
+# unlock-failed before cloning anything.
 kc=/Users/$account/Library/Keychains/login.keychain-db
 asbuild() { sudo -H -u "$account" "$@"; }
-# The build account can't traverse root's checkout; hand it the helper on stdin.
-kc_mode() { sudo cat "$RMB/provision.py" | asbuild "${PY[@]}" - keychain "$1"; }
-set +e; kc_mode verify; rc=$?; set -e
-if [ "$rc" = 3 ]; then
+if ! sudo test -e "$ROOT/keychain-created"; then
   if sudo test -e "$kc"; then
     old=$kc.pre-$(date -u +%Y%m%dT%H%M%SZ)
     asbuild cp -p "$kc" "$old" && asbuild security delete-keychain "$kc" || die "could not set aside the old keychain"
     echo "previous keychain kept at $old"
   fi
-  kc_mode create || die "keychain create failed"
-  set +e; kc_mode verify; rc=$?; set -e
+  # The build account can't traverse root's checkout; hand it the helper on stdin.
+  sudo cat "$RMB/provision.py" | asbuild "${PY[@]}" - keychain || die "keychain create failed"
+  sudo touch "$ROOT/keychain-created"
+  echo "build keychain created from the saved credential; the first build proves it unlocks"
 fi
-[ "$rc" = 0 ] || die "build keychain does not unlock with the saved credential"
-asbuild security default-keychain -s "$kc" && asbuild security login-keychain -s "$kc" \
-  && asbuild security list-keychains -d user -s "$kc" || die "could not select the build keychain"
-echo "build keychain verified and left locked"
 
 step "9 readback for the gateway"
 host_key=$(awk '{print $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)

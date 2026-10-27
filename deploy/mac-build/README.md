@@ -121,8 +121,11 @@ account there. It keeps the previous file outside `sshd_config.d`, because that
 directory's include would load a backup. It restores the file if `sshd -t`
 fails. The credential writer reads the new password; root then sets the account
 password from that saved credential over a private pseudo-terminal, so the
-secret never appears in a process argument or environment. Last, it creates and
-verifies the build keychain. The run ends by printing the base hash and the host
+secret never appears in a process argument or environment. Last, it creates the
+build keychain from that credential. It doesn't test the unlock: on macOS 27 an
+unlock run through `sudo -u` from the operator's session fails even when the
+keychain is right, while the broker's own SSH session unlocks it. The first
+build is the proof, and the broker stops with `unlock-failed` before cloning. The run ends by printing the base hash and the host
 key line for the gateway's `known_hosts`. Every step is skipped when its result
 already exists, so a rerun after fixing a reported cause continues where it
 stopped.
