@@ -57,7 +57,9 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     now: () => number = Date.now,
     supersede: (
       ids: readonly string[],
+      captured?: readonly string[],
     ) => Effect.Effect<void, BuilderRegistryError> = () => Effect.void,
+    captureSupersede?: (ids: readonly string[]) => readonly string[],
   ) {
     const scope = yield* Scope.Scope;
     const gate = yield* Semaphore.make(1);
@@ -271,6 +273,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     ) {
       const retired: Scope.Closeable[] = [];
       const obsolete: string[] = [];
+      let obsoleteOperations: readonly string[] | undefined;
       const cancelOld: Deferred.Deferred<void>[] = [];
       const retire = (id: string) => {
         const lease = leases.get(id);
@@ -299,6 +302,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
               })
               .map((old) => old.entry.id),
           );
+          obsoleteOperations = captureSupersede?.(obsolete);
           for (const id of obsolete) {
             const cancel = cancellations.get(id);
             if (cancel) cancelOld.push(cancel);
@@ -353,7 +357,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       );
       // Safety state is published before best-effort provider cleanup.
       if (obsolete.length)
-        yield* supersede(obsolete).pipe(
+        yield* supersede(obsolete, obsoleteOperations).pipe(
           Effect.catch((error) =>
             Effect.logWarning(
               "Native provider supersession could not be persisted",

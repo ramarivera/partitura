@@ -76,13 +76,12 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
           );
           return { id, job, maintenance };
         });
+        // Unknown markers belong to the verified physical host. builderId is observation provenance only.
         if (
           selected.some(({ job, maintenance }) =>
             job
               ? job.verifiedHostId !== hostId || job.builderId !== builderId
-              : !maintenance ||
-                maintenance.hostId !== hostId ||
-                maintenance.builderId !== builderId,
+              : !maintenance || maintenance.hostId !== hostId,
           )
         )
           return yield* Effect.fail(
@@ -93,7 +92,7 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
           current?.credential?.transport.hostId !== hostId &&
           !selected.some(
             ({ job, maintenance }) =>
-              (job?.builderId ?? maintenance?.builderId) === builderId,
+              job?.builderId === builderId || maintenance?.hostId === hostId,
           )
         )
           return yield* Effect.fail(
@@ -298,6 +297,10 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
                   ),
                 ];
               });
+              // Durable resolution comes first; remove quota-charged inputs just as automatic recovery does.
+              for (const { job } of selected)
+                if (job)
+                  yield* state.remove(`${state.jobPath(job)}/source.bundle`);
               return {
                 outcome:
                   action === "reconcile"

@@ -71,8 +71,11 @@ Reservation also marks the attempt running in that transaction. Disable, removal
 or revision changes supersede only work still pending. An already-charged read,
 including one whose helper is finishing initialization, proceeds and consumes its
 reserved budget. Its obsolete result cannot publish into the desired registry.
-This prevents charging an attempt that is then cancelled before its item get.
+This avoids charging an attempt and then cancelling it before the item read.
 Failed pending-work supersession is fenced in memory and retried before dispatch.
+On restart, persisted non-retained work stays held until a valid registry snapshot
+revalidates its builder, source and revision. Invalid or unreadable desired state
+cannot dispatch that work. Retained recovery refreshes remain independent.
 
 Agent attempts additionally have 5 source reads per rolling day per org. Explicit
 submissions share 10/min/org, and refresh-all is limited globally to once per 5 min.

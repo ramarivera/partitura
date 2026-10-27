@@ -126,6 +126,66 @@ export class NativeBuildFleet extends Context.Service<NativeBuildFleet>()(
             });
         return [...distinct.values()];
       };
+      const completions = new Set<string>();
+      const attachCompletion = Effect.fn("NativeBuildFleet.attachCompletion")(
+        function* (operationId: string) {
+          if (completions.has(operationId)) return;
+          completions.add(operationId);
+          yield* cache.wait(operationId).pipe(
+            Effect.andThen(
+              Effect.gen(function* () {
+                // Private work includes source identity, unlike sanitized public progress.
+                const operation = journal
+                  .snapshot()
+                  .operations.find((item) => item.id === operationId);
+                for (const work of operation?.sources ?? []) {
+                  if (work.status !== "succeeded") continue;
+                  const credential = cache.cached(work);
+                  if (!credential) continue;
+                  yield* transport.restore(work.source, [
+                    credential.privateKey,
+                    ...(credential.retiringPrivateKey
+                      ? [credential.retiringPrivateKey]
+                      : []),
+                  ]);
+                  for (const entry of registry.snapshot().desired?.builders ??
+                    [])
+                    if (
+                      sourceReference(entry.secretSource) === work.source &&
+                      entry.secretRevision === work.revision
+                    )
+                      yield* registry.installCredential(
+                        entry.id,
+                        work.revision,
+                        credential,
+                      );
+                }
+              }),
+            ),
+            Effect.catch((error) =>
+              Effect.logWarning("Native fleet refresh completion unavailable", {
+                operationId,
+                code: "code" in error ? error.code : error.reason,
+              }),
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                completions.delete(operationId);
+              }),
+            ),
+            Effect.interruptible,
+            Effect.forkIn(scope),
+          );
+        },
+      );
+      // Durable operations outlive the request and the gateway process that accepted them.
+      for (const operation of journal.snapshot().operations)
+        if (
+          operation.sources.some(
+            (work) => work.status === "pending" || work.status === "running",
+          )
+        )
+          yield* attachCompletion(operation.id);
       const refresh = Effect.fn("NativeBuildFleet.refresh")(function* (
         actor: FleetActor,
         input: unknown,
@@ -165,48 +225,7 @@ export class NativeBuildFleet extends Context.Service<NativeBuildFleet>()(
               ),
             ),
           );
-        // A new credential is installed only after this accepted operation completes.
-        // No registry-triggered extra read is made, and late revisions cannot publish.
-        yield* cache.wait(operationId).pipe(
-          Effect.flatMap((progress) =>
-            Effect.forEach(sources, (source) =>
-              Effect.gen(function* () {
-                const work = progress.sources.find(
-                  (work) =>
-                    work.builderId === source.builderId &&
-                    work.revision === source.revision,
-                );
-                if (work?.status !== "succeeded") return;
-                const credential = cache.cached(source);
-                if (!credential) return;
-                yield* transport.restore(source.source, [
-                  credential.privateKey,
-                  ...(credential.retiringPrivateKey
-                    ? [credential.retiringPrivateKey]
-                    : []),
-                ]);
-                for (const entry of registry.snapshot().desired?.builders ?? [])
-                  if (
-                    sourceReference(entry.secretSource) === source.source &&
-                    entry.secretRevision === source.revision
-                  )
-                    yield* registry.installCredential(
-                      entry.id,
-                      source.revision,
-                      credential,
-                    );
-              }),
-            ),
-          ),
-          Effect.catch((error) =>
-            Effect.logWarning("Native fleet refresh completion unavailable", {
-              operationId,
-              code: "code" in error ? error.code : error.reason,
-            }),
-          ),
-          Effect.interruptible,
-          Effect.forkIn(scope),
-        );
+        yield* attachCompletion(operationId);
         return { operationId };
       }, Effect.uninterruptible);
       const progress = Effect.fn("NativeBuildFleet.progress")(function* (

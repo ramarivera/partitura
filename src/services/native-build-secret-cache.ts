@@ -25,6 +25,7 @@ import {
 } from "./native-build-secret-models.js";
 import { NativeSecretError } from "./native-build-secret-protocol.js";
 import { NativeSecretSourceReader } from "./native-build-secret-reader.js";
+import { makeNativeSecretSupersession } from "./native-build-secret-supersession.js";
 
 export type SecretTrigger = "startup" | "registry" | "human" | "agent";
 export const sourceKey = (source: Pick<SecretSource, "source" | "revision">) =>
@@ -77,29 +78,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
       });
       const dispatch = yield* Semaphore.make(1);
       const cache = new Map<string, BuilderCredential>();
-      // Remember exactly the obsolete operations across journal EIO. A later
-      // explicit refresh for a disabled builder must not inherit this fence.
-      const obsolete = new Set<string>();
-      const obsoleteKey = (operation: SecretOperation, work: SecretWork) =>
-        `${operation.id}:${work.builderId}:${sourceKey(work)}`;
-      const flushObsolete = Effect.fn("NativeBuildSecretCache.flushObsolete")(
-        function* () {
-          if (!obsolete.size) return;
-          const selected = new Set(obsolete);
-          yield* journal.transaction((data, at) => {
-            for (const operation of data.operations)
-              for (const work of operation.sources)
-                if (
-                  selected.has(obsoleteKey(operation, work)) &&
-                  work.status === "pending"
-                ) {
-                  work.status = "superseded";
-                  work.completedAt = at;
-                }
-          }, now());
-          for (const key of selected) obsolete.delete(key);
-        },
-      );
+      const supersession = makeNativeSecretSupersession(journal, now);
       let cycleRecorded = false;
       // A crash after dispatch is ambiguous and already charged. Only startup may retry.
       yield* journal.transaction((data, at) => {
@@ -329,7 +308,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         () =>
           dispatch.withPermit(
             Effect.gen(function* () {
-              yield* flushObsolete();
+              yield* supersession.flush();
               const expired = new Map<
                 string,
                 { builderId: string; code: string; nextFit: number }
@@ -358,7 +337,11 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                     }
                 const candidates = data.operations.flatMap((operation) =>
                   operation.sources
-                    .filter((work) => work.status === "pending")
+                    .filter(
+                      (work) =>
+                        work.status === "pending" &&
+                        !supersession.held(operation, work),
+                    )
                     .map((work) => ({ operation, work })),
                 );
                 const queue = runnable(candidates);
@@ -395,7 +378,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                   .find((op) => op.id === operation.id)
                   ?.sources.find((candidate) => sourceKey(candidate) === key);
                 if (
-                  obsolete.has(obsoleteKey(operation, work)) &&
+                  supersession.blocked(operation, work) &&
                   selectedWork?.status !== "running"
                 )
                   throw NativeSecretError.new("provider-operation-superseded");
@@ -405,7 +388,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                     if (
                       sourceKey(candidate) !== key ||
                       (candidate.status === "pending" &&
-                        obsolete.has(obsoleteKey(op, candidate))) ||
+                        supersession.blocked(op, candidate)) ||
                       !(
                         candidate.status === "pending" ||
                         (reading &&
@@ -469,7 +452,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                               op.sources.some(
                                 (candidate) =>
                                   sourceKey(candidate) === key &&
-                                  !obsolete.has(obsoleteKey(op, candidate)) &&
+                                  !supersession.blocked(op, candidate) &&
                                   candidate.status === "pending",
                               ),
                           ),
@@ -585,17 +568,11 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         Effect.ensuring(notify()),
       );
       const supersede = Effect.fn("NativeBuildSecretCache.supersede")(
-        function* (builderIds: readonly string[]) {
-          const ids = new Set(builderIds);
-          for (const operation of journal.snapshot().operations)
-            for (const work of operation.sources)
-              if (
-                !work.retained &&
-                ids.has(work.builderId) &&
-                work.status === "pending"
-              )
-                obsolete.add(obsoleteKey(operation, work));
-          yield* flushObsolete();
+        function* (
+          builderIds: readonly string[],
+          captured?: readonly string[],
+        ) {
+          yield* supersession.supersede(builderIds, captured);
           yield* Queue.offer(wake, undefined);
           yield* notify();
         },
@@ -629,7 +606,11 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
               const pending = journal
                 .snapshot()
                 .operations.flatMap((operation) =>
-                  operation.sources.filter((work) => work.status === "pending"),
+                  operation.sources.filter(
+                    (work) =>
+                      work.status === "pending" &&
+                      !supersession.held(operation, work),
+                  ),
                 );
               const next = Math.min(
                 ...runnable(pending.map((work) => ({ work }))).map(
@@ -654,6 +635,14 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
           ),
         );
       return {
+        captureSupersede: supersession.capture,
+        revalidatePending: Effect.fn(
+          "NativeBuildSecretCache.revalidatePending",
+        )(function* (sources: readonly SecretSource[]) {
+          yield* supersession.revalidate(sources);
+          yield* Queue.offer(wake, undefined);
+          yield* notify();
+        }),
         accept,
         tick,
         wait,

@@ -43,16 +43,45 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
         provider,
         identity,
         Date.now,
-        (ids) =>
+        (ids, captured) =>
           Option.isSome(secretCache)
             ? secretCache.value
-                .supersede(ids)
+                .supersede(ids, captured)
                 .pipe(
                   Effect.mapError((error) =>
                     BuilderRegistryError.new(error.code),
                   ),
                 )
             : Effect.void,
+        Option.isSome(secretCache)
+          ? secretCache.value.captureSupersede
+          : undefined,
+      );
+      const revalidatePending = Effect.fn("BuilderRegistry.revalidatePending")(
+        function* () {
+          if (Option.isNone(secretCache)) return;
+          const desired = state.snapshot().desired;
+          if (!desired) return;
+          yield* secretCache.value
+            .revalidatePending(
+              desired.builders
+                .filter((entry) => entry.enabled)
+                .map((entry) => ({
+                  source: sourceReference(entry.secretSource),
+                  revision: entry.secretRevision,
+                  builderId: entry.id,
+                  retained: false,
+                })),
+            )
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning(
+                  "Native provider pending validation unavailable",
+                  { code: error.code },
+                ),
+              ),
+            );
+        },
       );
       const reloadGate = yield* Semaphore.make(1);
       const hints = yield* Queue.dropping<void>(1);
@@ -93,8 +122,10 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
               digest === nextDigest &&
               state.snapshot().error === undefined &&
               !capacityError
-            )
+            ) {
+              yield* revalidatePending();
               return;
+            }
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
             const blocked = new Set<string>();
             if (Option.isSome(secretCache)) {
@@ -132,6 +163,7 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
               state.snapshot().desired ? "registry" : "startup",
               blocked,
             );
+            yield* revalidatePending();
             digest = nextDigest;
           }).pipe(Effect.catch((cause) => state.fault(cause))),
         ),
