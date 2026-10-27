@@ -463,19 +463,21 @@ class BrokerTests(unittest.TestCase):
         self.assertFalse((self.root / self.job / 'artifacts.tar').exists())
         self.assertFalse((self.root / 'active-vm').exists())
 
-    def test_retention_refuses_symlinks_and_hardlinks_without_touching_targets(self):
+    def test_retention_skips_symlinks_and_hardlinks_without_touching_targets(self):
         artifact = self.retained_artifact('1'*32, 'succeeded', 3, 1)
         outside = self.root / 'outside'
         outside.write_bytes(b'keep')
         artifact.unlink()
         artifact.symlink_to(outside)
-        with self.assertRaisesRegex(ValueError, 'unsafe retained artifact'):
-            broker.prune_artifacts(self.root)
+        broker.prune_artifacts(self.root)
+        self.assertEqual(broker.housekeeping_counts(self.root)['artifacts'], 1)
+        self.assertTrue(artifact.is_symlink())
         self.assertEqual(outside.read_bytes(), b'keep')
         artifact.unlink()
         os.link(outside, artifact)
-        with self.assertRaisesRegex(ValueError, 'unsafe retained artifact'):
-            broker.prune_artifacts(self.root)
+        broker.prune_artifacts(self.root)
+        self.assertEqual(broker.housekeeping_counts(self.root)['artifacts'], 1)
+        self.assertEqual(artifact.stat().st_nlink, 2)
         self.assertEqual(outside.read_bytes(), b'keep')
 
     def test_failed_clone_still_attempts_cleanup(self):
@@ -1026,6 +1028,22 @@ class RegistryBrokerTests(unittest.TestCase):
         self.keychain.lock.assert_called_once()
         self.assertNotEqual(broker.admission_epoch(self.config), self.epoch)
 
+    def test_completed_inventory_pending_relock_is_not_rescanned_and_run_can_recover_during_backoff(self):
+        self.clone('b'*32)
+        with patch.object(broker, 'inventory_obligations', wraps=broker.inventory_obligations) as inventory:
+            self.assertEqual(self.maintenance(), 1)
+            self.assertEqual(inventory.call_count, 1)
+            self.assertFalse((self.root / 'inventory-required').exists())
+            previous = json.loads((self.root / 'maintenance.json').read_text())
+            self.assertTrue(previous['inventoryComplete'])
+            with patch.object(broker.time, 'time', return_value=previous['nextAt'] + 1):
+                self.assertEqual(self.maintenance(), 1)
+            self.assertEqual(inventory.call_count, 1)
+            self.assertEqual(self.invoke()[1]['code'], 'host-reconciled')
+            self.assertEqual(inventory.call_count, 1)
+        self.keychain.lock.assert_called_once()
+        self.assertEqual(self.wire('health')[1]['status'], 'ready')
+
     def test_daemon_build_mismatch_disables_relock_and_backoff_skips_until_due(self):
         self.config.update(daemonRelockQualified=True, daemonRelockMacOSBuild='25A1')
         self.clone()
@@ -1211,11 +1229,11 @@ class RegistryBrokerTests(unittest.TestCase):
         request = (self.request[0], 'b'*32, *self.request[2:7], broker.admission_epoch(self.config), 'f'*32, self.request[9])
         self.assertEqual(self.invoke(request)[0], 0)
 
-    def test_registry_history_gc_rotates_before_expiring_receipts_tombstones_and_attempts(self):
+    def test_registry_history_gc_preserves_epoch_when_expiring_receipts_tombstones_and_attempts(self):
         self.old_history(count=3, aged=True)
         original = broker.durable_remove
         def remove(path):
-            self.assertNotEqual(broker.admission_epoch(self.config), self.epoch)
+            self.assertEqual(broker.admission_epoch(self.config), self.epoch)
             original(path)
         with patch.object(broker, 'durable_remove', side_effect=remove):
             broker.prune_history(self.config)
@@ -1223,8 +1241,70 @@ class RegistryBrokerTests(unittest.TestCase):
             self.assertFalse((self.root / f'{index:032x}').exists())
             self.assertFalse((self.root / (f'{index:032x}' + '.cancel')).exists())
             self.assertFalse((self.root / ('attempt-' + f'{index + 3:032x}')).exists())
-        self.assertEqual(self.invoke()[1]['code'], 'stale-epoch')
         self.assertEqual(self.wire('status ' + self.job)[1]['kind'], 'unknown-job')
+        self.assertEqual(self.invoke()[0], 0)
+
+    def test_gc_backlog_keeps_health_epoch_valid_for_submissions(self):
+        self.old_history(count=100, aged=True)
+        broker.record_maintenance(self.root, 'fixture-boot')
+        epoch = self.wire('health')[1]['epoch']
+        for index in range(2):
+            broker.prune_history(self.config)
+            self.assertEqual(broker.admission_epoch(self.config), epoch)
+            request = (self.request[0], f'{10000 + index:032x}', *self.request[2:7], epoch, f'{20000 + index:032x}', self.request[9])
+            self.assertEqual(self.invoke(request)[0], 0)
+
+    def test_housekeeping_anomalies_stay_retained_and_counted_across_reconciliation(self):
+        self.old_history(count=1, aged=True)
+        directory = self.root / f'{1:032x}'
+        abandoned = directory / 'tmpab12cd34'
+        abandoned.write_bytes(b'keep crash debris')
+        outside = self.root / 'outside'
+        outside.write_bytes(b'keep linked output')
+        artifact = BrokerTests.retained_artifact(self, 'b'*32, 'succeeded', 3, 1)
+        artifact.unlink()
+        os.link(outside, artifact)
+        # An actual inventory fault still blocks until repaired and explicitly
+        # revalidated. Retained housekeeping anomalies must not re-block it.
+        malformed = self.root / 'vms' / 'partitura-job-operator'
+        malformed.mkdir()
+        self.assertEqual(self.maintenance(), 1)
+        self.assertTrue((self.root / 'maintenance-blocked').exists())
+        self.assertEqual(self.reconcile()[1]['kind'], 'cleanup-required')
+        malformed.rmdir()
+        self.assertEqual(self.reconcile()[0], 0)
+        for _ in range(2):
+            broker.durable_remove(self.root / 'history-gc.json')
+            with contextlib.redirect_stderr(io.StringIO()) as log:
+                self.assertEqual(self.maintenance(), 0)
+            self.assertIn('housekeeping-history-skipped: 1', log.getvalue())
+            self.assertIn('housekeeping-artifacts-skipped: 1', log.getvalue())
+            self.assertNotIn(str(directory), log.getvalue())
+            health = self.wire('health')[1]
+            self.assertEqual((health['status'], health['housekeepingSkippedEntries']), ('ready', dict(artifacts=1, history=1)))
+            self.assertFalse((self.root / 'maintenance-blocked').exists())
+            self.assertEqual(abandoned.read_bytes(), b'keep crash debris')
+            self.assertEqual(artifact.stat().st_nlink, 2)
+            self.assertEqual(self.reconcile()[0], 0)
+        self.assertEqual(outside.read_bytes(), b'keep linked output')
+
+    def test_transient_housekeeping_failure_retries_without_invalidating_inventory(self):
+        with patch.object(broker, 'prune_artifacts', side_effect=OSError('one-off IO')):
+            self.assertEqual(self.maintenance(), 1)
+        previous = json.loads((self.root / 'maintenance.json').read_text())
+        self.assertTrue(previous['inventoryComplete'])
+        self.assertFalse((self.root / 'maintenance-blocked').exists())
+        self.assertEqual(self.wire('health')[1]['status'], 'ready')
+        with patch.object(broker.time, 'time', return_value=previous['nextAt'] + 1):
+            self.assertEqual(self.maintenance(), 0)
+
+    def test_invalid_history_identity_is_retained_and_counted(self):
+        marker = self.root / ('attempt-' + 'f'*32)
+        broker.durable_write(marker, 'invalid identity\n')
+        os.utime(marker, (1, 1))
+        self.assertEqual(self.maintenance(), 0)
+        self.assertEqual(marker.read_text(), 'invalid identity\n')
+        self.assertEqual(self.wire('health')[1]['housekeepingSkippedEntries']['history'], 1)
 
     def test_history_gc_is_batched_and_preserves_live_obligations_and_artifact_leases(self):
         self.old_history(count=100, aged=True)
@@ -1241,12 +1321,14 @@ class RegistryBrokerTests(unittest.TestCase):
 
     def test_transient_first_inventory_failure_backs_off_and_retries_without_permanent_flag(self):
         with patch.object(broker, 'inventory_obligations', side_effect=OSError('one-off EIO')):
-            self.assertEqual(self.invoke()[1]['code'], 'cleanup-required')
+            self.assertEqual(self.invoke()[1]['code'], 'host-maintenance')
         self.assertFalse((self.root / 'maintenance-blocked').exists())
         previous = json.loads((self.root / 'maintenance.json').read_text())
         self.assertFalse(previous['inventoryComplete'])
         with patch.object(broker, 'inventory_obligations', side_effect=AssertionError('ignored backoff')):
             self.assertEqual(self.maintenance(), 1)
+            request = (self.request[0], 'b'*32, *self.request[2:])
+            self.assertEqual(self.invoke(request)[1]['code'], 'host-maintenance')
         with patch.object(broker.time, 'time', return_value=previous['nextAt'] + 1):
             self.assertEqual(self.maintenance(), 0)
         self.assertFalse((self.root / 'inventory-required').exists())
@@ -1282,7 +1364,7 @@ class RegistryBrokerTests(unittest.TestCase):
         with patch.object(broker, 'destroy_vm', side_effect=destroy):
             self.assertEqual(self.maintenance(), 1)
             with patch.object(broker, 'inventory_obligations', side_effect=AssertionError('ignored boot backoff')):
-                self.assertEqual(self.invoke()[1]['code'], 'cleanup-required')
+                self.assertEqual(self.invoke()[1]['code'], 'host-reconciled')
             for _ in range(5):
                 code, result = self.reconcile()
                 if code == 0:
@@ -1366,6 +1448,10 @@ class RegistryBrokerTests(unittest.TestCase):
         request = (*self.request[:7], broker.admission_epoch(self.config), *self.request[8:])
         self.assertEqual(self.invoke(request)[1]['code'], 'cancelled')
         self.assertEqual(self.wire('status ' + self.job)[1]['kind'], 'unknown-job')
+        expired = (*request[:9], int(time.time()) - 5)
+        self.assertEqual(self.invoke(expired)[1]['code'], 'cancelled')
+        status = self.wire('status ' + self.job)[1]
+        self.assertEqual((status['kind'], status['tombstonePresent']), ('unknown-job', True))
 
     def test_vm_era_crash_is_not_classified_as_receive_interrupted(self):
         directory = self.root / self.job

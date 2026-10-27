@@ -348,8 +348,10 @@ cancels its interrupted jobs during restart recovery.
 
 Before each new job, the host prunes terminal artifact archives older than seven
 days and the oldest archives to target at most 6 GiB of retained output before
-the next job adds at most 2 GiB. A time-bounded scan can defer pruning beyond
-this 8-GiB target; the sealed free-space floor still gates every build. Failed
+the next job adds at most 2 GiB. Scans restart at the directory's beginning with
+a ten-second budget and no resume cursor. Entries beyond that budget can remain
+unvisited indefinitely, so this 8-GiB target isn't guaranteed for large
+histories. The sealed free-space floor still gates every build. Failed
 jobs remove partial archives immediately. Retained receipts record
 `artifactExpired` when pruning removes their archive. Registry-only history has
 a separate thirty-day retention policy described below; legacy receipts persist
@@ -424,10 +426,10 @@ Main kinds are:
 
 | Kind | Fields and meaning |
 | --- | --- |
-| `health` | `brokerRevision`, `capabilities`, `profile`, `epoch`, `status`, `accepting`, `capacity`, disk byte counts and fixed `reasons`. Status is `ready`, `busy` or `blocked`; capacity is 0 or 1. Busy/blocked health exits zero. |
+| `health` | `brokerRevision`, `capabilities`, `profile`, `epoch`, `status`, `accepting`, `capacity`, disk byte counts, fixed `reasons` and `housekeepingSkippedEntries`. The latter contains `artifacts` and `history` counts from each category's last pass, zero before a pass or if diagnostics are unreadable. Status is `ready`, `busy` or `blocked`; capacity is 0 or 1. Busy/blocked health exits zero. |
 | `known` | Job identity and receipt fields. State is `receiving`, `running`, `succeeded`, `failed` or `cancelled`. Optional diagnostics and artifact fields are allowlisted. `artifactExpired` is a flag, never a state. |
-| `unknown-job` | `job`, `tombstonePresent`, `inconsistentDirectory`. No receipt exists. An inconsistent directory requires reconciliation. Invalid/unreadable state returns an error instead. |
-| `refused` | `job`, `commit`, `action`, `attempt`, `accepted: false`, fixed `code`. Exit 1. Includes `host-busy`, `stale-epoch`, `submission-expired`, `duplicate-job`, `duplicate-attempt`, `cancelled`, `legacy-profile`, `host-reconciled`, `cleanup-required` or `keychain-relock-pending`. |
+| `unknown-job` | `job`, `tombstonePresent`, `inconsistentDirectory`. No receipt exists. History may have expired after thirty days; this isn't proof the job never ran. An inconsistent directory requires reconciliation. Invalid/unreadable state returns an error instead. |
+| `refused` | `job`, `commit`, `action`, `attempt`, `accepted: false`, fixed `code`. Exit 1. Includes `host-busy`, `stale-epoch`, `submission-expired`, `duplicate-job`, `duplicate-attempt`, `cancelled`, `legacy-profile`, `host-reconciled`, `host-maintenance`, `cleanup-required` or `keychain-relock-pending`. `host-maintenance` means inventory is pending, in backoff or encountered transient IO; it doesn't establish a cleanup fault. |
 | `cancellation-requested` | `job`. A durable tombstone acknowledgement, never proof of cleanup. |
 | `busy` | Reconcile couldn't acquire the lock within two seconds. `job` and nullable safe `runner` heartbeat/stage evidence. The tombstone remains. |
 | `reconciled-terminal`, `reconciled-unknown` | `job`, newly persisted `epoch`, fresh `nonce`, `reconciledJobs`. Exclusive-lock inspection established cleanup. No unknown-job success receipt is fabricated. |
@@ -450,13 +452,15 @@ existing obligation marker and is a private fleet-admin diagnostic.
 
 `run-v2` waits at most five monotonic seconds for the exclusive lock without
 reading stdin. A timeout is identified `host-busy`, with no recovery, receipt or
-epoch change. Under the lock it checks epoch, expiry, tombstone and replay
+epoch change. Under the lock it checks epoch, tombstone, expiry and replay
 before recovery. Successful pre-input recovery rotates the epoch and returns
 `host-reconciled`; the incoming job never continues to receiving. Refusals
 record a small terminal receipt where storage and lock ownership permit, except
 stale epochs or existing tombstones, which must preserve an unknown recovery
 outcome. A valid refusal can still exist without a receipt when disk storage
-fails.
+fails. Inventory backoff prevents another scan, but known obligations can still
+be recovered under the lock from this SSH context. A completed inventory stays
+complete when the daemon leaves a pending keychain relock.
 
 On a clean host, artifact pruning precedes disk measurement using available-to-
 account `statvfs` bytes on the actual job and Tart roots. Each root needs the
@@ -500,10 +504,16 @@ through `SSH_ORIGINAL_COMMAND` and whenever SSH environment markers are present.
 A future root-owned LaunchDaemon can invoke it as the dedicated build account.
 The code inventories private receipt/owned-clone directories once per boot or
 broker revision. Boot identity uses `kern.bootsessionuuid`; revision is the
-sealed broker source SHA-256. Root history size never refuses a build. Each
+sealed broker source SHA-256. There's no entry-count admission limit. Each
 inventory scan has a ten-second budget and discovers at most 58 cleanup jobs,
 leaving room for existing markers in the 64-job recovery record. Incomplete
-inventories retain an admission fence and continue in bounded batches.
+inventories retain an admission fence and continue in bounded cleanup batches.
+There is no scan resume cursor. If history alone exceeds the ten-second budget,
+retries can revisit the same prefix forever, keeping health `inventory-pending`
+and refusing both registry and legacy builds. GC waits for complete inventory,
+so it cannot resolve that case. An approved host-admin archival procedure or a
+future resumable scan is required before a host reaches that scale. The
+threshold depends on the filesystem and hasn't been qualified on APFS.
 Subsequent idle minute passes read markers and return without taking the lock or
 scanning history, except when periodic history GC is due. If `run-v2` wins the
 boot race, it performs the same inventory under the lock before input. With an
@@ -512,7 +522,7 @@ obligation, maintenance tries the lock nonblocking and leaves live owners alone.
 Each cleanup pass has a 120-second deadline. Transient IO failures retry with
 exponential backoff from sixty seconds to fifteen minutes, including retries of
 the first boot inventory. Pending backoff or a maintenance block returns
-nonzero. Validated malformed, linked, foreign or unsafe objects set
+nonzero. Validated malformed, linked, foreign or unsafe inventory objects set
 `maintenance-blocked` with a fixed reason and require host-admin repair.
 Ordinary IO failures and large history never manufacture that operator-only
 flag.
@@ -529,13 +539,26 @@ slice; that gateway route isn't implemented here.
 
 Registry-only terminal receipts without retained artifacts or input, tombstones
 and attempt markers expire after thirty days. GC validates private state,
-protects current obligations and rotates the admission epoch durably before
-removing at most 64 entries per pass. It runs daily, or after a minute while a
-full batch remains. Scans are time bounded; skipped artifacts remain subject to
-the authoritative free-space check. Legacy commands have no epoch or expiry, so
+protects current obligations and removes at most 64 entries per pass without
+rotating the admission epoch. Delayed submissions are already expired because
+their admission window is at most 150 seconds, far shorter than retention.
+It runs daily, or after a minute while a full batch remains. Artifact pruning
+and history GC retain invalid individual entries, log fixed category/count
+diagnostics and publish the last pass's skipped-entry counts in health. They
+don't set `maintenance-blocked`. Whole-pass IO or validation failures retry with
+backoff without invalidating a completed inventory. Health counts only cover
+the visited prefix, not the whole directory. Scans are time bounded; skipped
+artifacts remain subject to the authoritative free-space check. Legacy commands
+have no epoch or expiry, so
 legacy receipts, tombstones and attempt identities remain until the approved
 registry-only cutover. Removing the lifetime entry cap lets an upgraded legacy
 host keep building without reopening old commands to replay.
+
+For jobs older than host retention, the gateway must preserve any terminal
+outcome it already knows. A previously unresolved job can become interrupted or
+unknown-on-broker only after reconciliation and fresh clean health with the
+matching epoch. `unknown-job` or `reconciled-unknown` alone never establishes
+success, permission to retry, or that the original command didn't execute.
 
 Daemon relock is unqualified by default. Such a pass can remove VM/input debris
 but retains `keychain-relock-pending` and the epoch if unlock might have

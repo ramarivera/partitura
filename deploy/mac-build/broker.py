@@ -439,26 +439,51 @@ def record(directory, **receipt):
     durable_write(directory / 'receipt.json', json.dumps(receipt) + '\n')
 
 
+def housekeeping_counts(root):
+    # Diagnostics are advisory. Corrupt/missing diagnostics never block recovery.
+    try:
+        value = json_state(root / 'housekeeping.json')
+        if value is not None and set(value) == {'artifacts', 'history'} and all(type(count) is int and 0 <= count <= 2**63 - 1 for count in value.values()):
+            return value
+    except (OSError, ValueError):
+        pass
+    return dict(artifacts=0, history=0)
+
+
+def record_housekeeping(root, category, skipped):
+    counts = housekeeping_counts(root)
+    counts[category] = skipped
+    durable_write(root / 'housekeeping.json', json.dumps(counts) + '\n')
+    if skipped:
+        print(f'housekeeping-{category}-skipped: {skipped}', file=sys.stderr)
+
+
 def prune_artifacts(root, now=None):
     """Caller holds runner.lock. Keep receipts and reserve space for the next job."""
     cutoff = (time.time() if now is None else now) - ARTIFACT_RETENTION_SECONDS
     candidates = []
+    skipped = 0
     deadline = time.monotonic() + HISTORY_PASS_SECONDS
     for directory in root.iterdir():
         if time.monotonic() >= deadline:
-            break  # History size never refuses a submission; disk checks still apply.
+            break  # Retain unvisited entries; disk checks still apply.
         if not re.fullmatch(JOB, directory.name) or directory.is_symlink() or not directory.is_dir():
             continue
-        receipt_path = directory / 'receipt.json'
-        artifact = directory / 'artifacts.tar'
-        if receipt_path.is_symlink() or not receipt_path.is_file() or not artifact.exists():
-            continue
-        receipt = json_state(receipt_path)
-        if receipt.get('state') not in ('succeeded', 'failed', 'cancelled'):
-            continue
-        info = artifact.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
-            raise ValueError('unsafe retained artifact')
+        try:
+            private_directory(directory)
+            receipt_path = directory / 'receipt.json'
+            artifact = directory / 'artifacts.tar'
+            if not os.path.lexists(receipt_path) or not os.path.lexists(artifact):
+                continue
+            receipt = json_state(receipt_path)
+            if receipt.get('state') not in TERMINAL:
+                continue
+            info = artifact.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise ValueError('unsafe retained artifact')
+        except ValueError:
+            skipped += 1
+            continue  # Keep unsafe retained output; it isn't a live obligation.
         candidates.append((info.st_mtime, artifact, info.st_size, receipt))
     retained = 0
     for modified, artifact, size, receipt in sorted(candidates, key=lambda item: item[0], reverse=True):
@@ -468,6 +493,7 @@ def prune_artifacts(root, now=None):
             record(artifact.parent, **receipt)
         else:
             retained += size
+    record_housekeeping(root, 'artifacts', skipped)
 
 
 def environment_for(config):
@@ -709,6 +735,7 @@ def registry_status(config, job):
 def health(config):
     root = Path(config['root'])
     fields = dict(brokerRevision=BROKER_REVISION, capabilities=['health', 'status', 'reconcile', 'run-v2'], profile=config['profile'], epoch=initialize_epoch(config), status='blocked', accepting=False, capacity=0, reasons=[], jobRootFreeBytes=None, tartRootFreeBytes=None, hostFloorBytes=config.get('minimumFreeBytes', DISK_FLOOR))
+    fields['housekeepingSkippedEntries'] = housekeeping_counts(root)
     jobs, runner = obligations(config)
     fresh = runner is not None and 0 <= time.time() - runner['heartbeat'] <= 60
     # Only a matching active-vm/unlock fence is normal for a current live runner.
@@ -1039,13 +1066,14 @@ def history_gc_due(root):
 
 
 def prune_history(config):
-    """Bounded registry history GC. The epoch fences expired submission IDs.
+    """Bounded registry history GC. Expiry fences delayed submission commands.
 
     Legacy commands have no epoch or expiry: their anti-replay receipts and
     tombstones remain until the approved registry-only cutover.
     """
     root = Path(config['root'])
     expired = []
+    skipped = 0
     if config.get('profile') == 'registry-only':
         protected, _ = obligations(config)
         cutoff = time.time() - HISTORY_RETENTION_SECONDS
@@ -1054,29 +1082,31 @@ def prune_history(config):
             if len(expired) >= 64 or time.monotonic() >= deadline:
                 break
             name = path.name
-            if re.fullmatch(JOB, name):
-                if name in protected or os.path.lexists(Path(config['tartHome']) / 'vms' / ('partitura-job-' + name)):
-                    continue
-                receipt = path / 'receipt.json'
-                if not receipt.exists() or receipt.lstat().st_mtime >= cutoff or os.path.lexists(path / 'artifacts.tar') or os.path.lexists(path / 'source.bundle'):
-                    continue
-                kind, value = registry_status(config, name)
-                if kind == 'known' and value['state'] in TERMINAL:
-                    files, _ = inspect_job_directory(path)
-                    expired.append((path, files))
-            elif re.fullmatch(rf'(?:{JOB}\.cancel|attempt-{JOB})', name):
-                text = read_state(path)
-                if path.lstat().st_mtime >= cutoff:
-                    continue
-                job = name[:32] if name.endswith('.cancel') else text.strip()
-                if not re.fullmatch(JOB, job):
-                    raise ValueError('invalid expired identity marker')
-                if job not in protected:
-                    expired.append((path, None))
+            try:
+                if re.fullmatch(JOB, name):
+                    if name in protected or os.path.lexists(Path(config['tartHome']) / 'vms' / ('partitura-job-' + name)):
+                        continue
+                    private_directory(path)
+                    receipt = path / 'receipt.json'
+                    if not os.path.lexists(receipt) or receipt.lstat().st_mtime >= cutoff or os.path.lexists(path / 'artifacts.tar') or os.path.lexists(path / 'source.bundle'):
+                        continue
+                    kind, value = registry_status(config, name)
+                    if kind == 'known' and value['state'] in TERMINAL:
+                        files, _ = inspect_job_directory(path)
+                        expired.append((path, files))
+                elif re.fullmatch(rf'(?:{JOB}\.cancel|attempt-{JOB})', name):
+                    text = read_state(path)
+                    if path.lstat().st_mtime >= cutoff:
+                        continue
+                    job = name[:32] if name.endswith('.cancel') else text.strip()
+                    if not re.fullmatch(JOB, job):
+                        raise ValueError('invalid expired identity marker')
+                    if job not in protected:
+                        expired.append((path, None))
+            except ValueError:
+                skipped += 1
+                continue  # Preserve invalid history for host-admin inspection.
         if expired:
-            # A delayed command from before GC cannot reuse an expired job or
-            # attempt, even when its tombstone/receipt is now gone.
-            durable_write(root / 'admission-epoch', uuid.uuid4().hex + '\n')
             for path, files in expired:
                 if files is None:
                     durable_remove(path)
@@ -1085,6 +1115,7 @@ def prune_history(config):
                         durable_remove(child)
                     path.rmdir()
                     sync_directory(root)
+    record_housekeeping(root, 'history', skipped)
     durable_write(root / 'history-gc.json', json.dumps(dict(nextAt=time.time() + (60 if len(expired) == 64 else 86400))) + '\n')
 
 
@@ -1118,12 +1149,9 @@ def local_maintenance(config):
                 except InventoryPending as pending:
                     jobs |= pending.jobs
             result, _ = reconcile_locked(config, jobs, daemon=True, deadline=deadline) if jobs else ('idle', [])
-            if complete and result in ('idle', 'reconciled'):
+            if complete:
                 durable_remove(root / 'inventory-required')
-                if gc_due and deadline - time.monotonic() >= HISTORY_PASS_SECONDS * 2:
-                    prune_artifacts(root)
-                    prune_history(config)
-            elif not complete:
+            else:
                 result = 'cleanup-required'
         except ValueError:
             durable_write(root / 'maintenance-blocked', 'inventory-invalid\n')
@@ -1133,7 +1161,17 @@ def local_maintenance(config):
             # IO failures are retryable. No operator-only flag is manufactured.
             result = 'cleanup-required'
             complete = False
-        failures = min(16, (previous or {}).get('failures', 0) + 1) if result in ('cleanup-required', 'keychain-relock-pending') else 0
+        # Housekeeping cannot create an operator-required inventory flag. A
+        # failed pass retries with backoff while the completed inventory stays
+        # valid; unsafe individual entries are retained and counted by pruning.
+        if complete and result in ('idle', 'reconciled') and gc_due and deadline - time.monotonic() >= HISTORY_PASS_SECONDS * 2:
+            try:
+                prune_artifacts(root)
+                prune_history(config)
+            except (OSError, ValueError):
+                print('housekeeping-pass-failed', file=sys.stderr)
+                result = 'host-maintenance'
+        failures = min(16, (previous or {}).get('failures', 0) + 1) if result in ('cleanup-required', 'keychain-relock-pending', 'host-maintenance') else 0
         record_maintenance(root, boot, failures, inventory_complete=complete)
         return 1 if failures else 0
 
@@ -1159,14 +1197,14 @@ def run_v2(config, request):
     with run_lock(config, 5) as acquired:
         if not acquired:
             return refuse(config, request, 'host-busy', persist=False)
-        # Epoch/expiry/replay precede any recovery that could rotate the epoch.
+        # Epoch/cancellation/expiry/replay precede recovery that rotates epoch.
         if request[7] != initialize_epoch(config):
             return refuse(config, request, 'stale-epoch', persist=False)
-        if not time.time() < request[9] <= time.time() + 150:
-            return refuse(config, request, 'submission-expired')
         root = Path(config['root'])
         if read_state(root / (request[1] + '.cancel')) is not None:
             return refuse(config, request, 'cancelled', persist=False)
+        if not time.time() < request[9] <= time.time() + 150:
+            return refuse(config, request, 'submission-expired')
         if os.path.lexists(root / request[1]):
             return refuse(config, request, 'duplicate-job', persist=False)
         if read_state(root / ('attempt-' + request[8])) is not None:
@@ -1180,31 +1218,32 @@ def run_v2(config, request):
         previous, inventory = maintenance_state(root, boot)
         inventory |= read_state(root / 'inventory-required') is not None
         if inventory and previous and previous['nextAt'] > time.time():
-            return refuse(config, request, 'cleanup-required')
+            # Retry known safety obligations from this SSH context without
+            # repeating inventory before its recorded retry time.
+            result, _ = reconcile_locked(config, jobs) if jobs else ('host-maintenance', [])
+            return refuse(config, request, 'host-reconciled' if result == 'reconciled' else result)
         if inventory:
             durable_write(root / 'inventory-required', 'inventory-pending\n')
             if len(jobs) > 6:
-                reconcile_locked(config, jobs)
+                result, _ = reconcile_locked(config, jobs)
                 record_maintenance(root, boot, inventory_complete=False)
-                return refuse(config, request, 'cleanup-required')
+                return refuse(config, request, 'host-maintenance' if result == 'reconciled' else result)
             try:
                 jobs |= inventory_obligations(config)
             except InventoryPending as pending:
-                if pending.jobs:
-                    reconcile_locked(config, pending.jobs)
+                result, _ = reconcile_locked(config, jobs | pending.jobs) if jobs or pending.jobs else ('host-maintenance', [])
                 record_maintenance(root, boot, min(16, (previous or {}).get('failures', 0) + 1), inventory_complete=False)
-                return refuse(config, request, 'cleanup-required')
+                return refuse(config, request, 'host-maintenance' if result == 'reconciled' else result)
             except ValueError:
                 durable_write(root / 'maintenance-blocked', 'inventory-invalid\n')
                 return refuse(config, request, 'cleanup-required')
             except OSError:
                 record_maintenance(root, boot, min(16, (previous or {}).get('failures', 0) + 1), inventory_complete=False)
-                return refuse(config, request, 'cleanup-required')
+                return refuse(config, request, 'host-maintenance')
+            durable_remove(root / 'inventory-required')
         if jobs:
             result, _ = reconcile_locked(config, jobs)
-            if result == 'reconciled' and inventory:
-                record_maintenance(root, boot)
-                durable_remove(root / 'inventory-required')
+            record_maintenance(root, boot, 0 if result == 'reconciled' else min(16, (previous or {}).get('failures', 0) + 1))
             return refuse(config, request, 'host-reconciled' if result == 'reconciled' else result)
         if inventory:
             record_maintenance(root, boot)
