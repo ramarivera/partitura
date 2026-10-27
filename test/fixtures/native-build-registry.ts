@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { Effect } from "effect";
 import { opaqueId } from "../../src/services/native-build-files.js";
 import {
   type NativeGeneration,
@@ -10,6 +11,7 @@ import {
   openNativeBuildState,
 } from "../../src/services/native-build-state.js";
 import { createNativeBuildTransport } from "../../src/services/native-build-transport.js";
+import { testAwait } from "./native-build-effects.js";
 
 export const fixtureHost = "11111111-1111-4111-8111-111111111111";
 export const fixturePayload = "opaque archive bytes";
@@ -33,6 +35,7 @@ import {createHash} from "node:crypto";
 const root=dirname(process.argv[1]);
 const plan=JSON.parse(readFileSync(join(root,"plan.json"),"utf8"));
 const args=process.argv.slice(2),command=args.at(-1), parts=command.split(" ");
+if(args.length!==4 || args[0]!=="-F" || args[2]!=="partitura-native" || !args[1].endsWith("/config") || typeof command!=="string") throw new Error("invalid-fixture-ssh-argv");
 const config=readFileSync(args[1],"utf8");
 appendFileSync(join(root,"trace.jsonl"),JSON.stringify({command,args,env:process.env,hostname:config.match(/HostName (.+)/)[1]})+"\\n");
 const hostId=plan.hostId, epoch=plan.epoch??"a".repeat(32);
@@ -41,8 +44,11 @@ if(plan.unavailable) process.exit(255);
 if(parts[0]==="health") {emit("health",{brokerRevision:"b".repeat(64),capabilities:["health","status","reconcile","run-v2"],profile:"registry-only",epoch,status:plan.healthBusy?"busy":"ready",accepting:!plan.healthBusy,capacity:plan.healthBusy?0:1,reasons:plan.healthBusy?["runner-active"]:[],jobRootFreeBytes:1e12,tartRootFreeBytes:1e12,hostFloorBytes:53687091200});}
 else if(parts[0]==="run-v2") {
  const identity={job:parts[1],commit:parts[2],action:parts[4],attempt:parts[8]};
- if(plan.busyRefusal) {emit("refused",{...identity,accepted:false,code:"host-busy"});process.exit(1);}
- await new Response(Bun.stdin.stream()).arrayBuffer();
+ if(plan.busyRefusal || plan.refusal) {emit("refused",{...identity,accepted:false,code:plan.refusal??"host-busy"});process.exit(1);}
+ const input=Buffer.from(await new Response(Bun.stdin.stream()).arrayBuffer());
+ if(input.length!==Number(parts[5])+Number(parts[6])) throw new Error("fixture-input-length");
+ if(plan.expectedSecret!==undefined && input.subarray(0,Number(parts[6])).toString()!==plan.expectedSecret) throw new Error("fixture-secret-order");
+ if(plan.expectedBundle!==undefined && input.subarray(Number(parts[6])).toString()!==plan.expectedBundle) throw new Error("fixture-bundle-order");
  const receipt={...identity,state:"succeeded",artifactBytes:Buffer.byteLength("${fixturePayload}"),artifactSha256:createHash("sha256").update("${fixturePayload}").digest("hex")};
  writeFileSync(join(root,parts[1]+".json"),JSON.stringify(receipt));
  if(plan.lostRun) process.exit(255);
@@ -58,11 +64,11 @@ else if(parts[0]==="reconcile") {
 } else if(parts[0]==="artifact") process.stdout.write(plan.corrupt?"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":"${fixturePayload}");
 `;
 
-export async function registryFixture(
+export const registryFixture = Effect.fn("Test.registryFixture")(function* (
   root: string,
   quotas: Partial<NativeStateOptions> = {},
 ) {
-  await chmod(root, 0o700);
+  yield* testAwait(chmod(root, 0o700));
   const keyPath = join(root, "dummy-key");
   const result = spawnSync("/usr/bin/ssh-keygen", [
     "-q",
@@ -74,8 +80,10 @@ export async function registryFixture(
     keyPath,
   ]);
   if (result.status !== 0) throw new Error("fixture-key-generation-failed");
-  const key = await readFile(keyPath, "utf8");
-  const publicKey = (await readFile(`${keyPath}.pub`, "utf8")).split(" ");
+  const key = yield* testAwait(readFile(keyPath, "utf8"));
+  const publicKey = (yield* testAwait(
+    readFile(`${keyPath}.pub`, "utf8"),
+  )).split(" ");
   const type = publicKey[0],
     base64 = publicKey[1];
   if (!type || !base64) throw new Error("invalid-fixture-key");
@@ -96,23 +104,29 @@ export async function registryFixture(
     filesystem: async () => ({ type: 0x01021994, bavail: 1e9, bsize: 4096 }),
     ...quotas,
   };
-  const state = await openNativeBuildState(options);
-  const generation = await state.addGeneration("primary", metadata, key);
+  const state = yield* testAwait(openNativeBuildState(options));
+  const generation = yield* testAwait(
+    state.addGeneration("primary", metadata, key),
+  );
   const executable = join(root, "ssh");
-  await writeFile(executable, `#!${process.execPath}\n${fakeSsh}`, {
-    mode: 0o700,
-  });
+  yield* testAwait(
+    writeFile(executable, `#!${process.execPath}\n${fakeSsh}`, {
+      mode: 0o700,
+    }),
+  );
   const planPath = join(root, "plan.json");
   const plan = async (value: Record<string, unknown>) =>
     writeFile(planPath, JSON.stringify({ hostId: fixtureHost, ...value }), {
       mode: 0o600,
     });
-  await plan({});
-  const transport = await createNativeBuildTransport(state, {
-    suffix: "example.test",
-    executable,
-  });
-  await transport.materialize(generation, key);
+  yield* testAwait(plan({}));
+  const transport = yield* testAwait(
+    createNativeBuildTransport(state, {
+      suffix: "example.test",
+      executable,
+    }),
+  );
+  yield* testAwait(transport.materialize(generation, key));
   return {
     root,
     state,
@@ -138,7 +152,7 @@ export async function registryFixture(
             },
         ),
   };
-}
+});
 
 export function registryJob(
   generation: NativeGeneration,

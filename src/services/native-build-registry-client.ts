@@ -1,14 +1,23 @@
-import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
-import { opaqueId, writeNativeStream } from "./native-build-files.js";
+import { Cause, Context, Effect, Fiber, Layer, Scope } from "effect";
+import { nativeGitBundle } from "./native-build-bundle.js";
+import {
+  NativeOperationError,
+  nativeFailureCode,
+  nativeIO,
+  nativeTry,
+} from "./native-build-errors.js";
+import { NativeBuildFiles, opaqueId } from "./native-build-files.js";
 import {
   applyNativeReceipt,
+  cleanNativeHealth,
   createNativeBuildRecovery,
   recoverNativeMetadata,
 } from "./native-build-recovery.js";
 import {
   type NativeBuildState,
+  NativeBuildStateService,
   type NativeRegistryJob,
   nativeLimits,
   newRecovery,
@@ -17,10 +26,11 @@ import {
 } from "./native-build-state.js";
 import {
   type NativeBrokerTransport,
+  NativeBuildTransport,
   publishNativeArtifact,
 } from "./native-build-transport.js";
-import { workerIdentityCommand } from "./worker-security.js";
 
+export { nativeGitBundle } from "./native-build-bundle.js";
 export interface RegistryBuildRequest {
   readonly organizationId: string;
   readonly sessionId: string;
@@ -33,113 +43,100 @@ export interface RegistryBuildRequest {
   /** Selected by the gateway, never model arguments. */
   readonly secretFiles?: Readonly<Record<string, string>>;
 }
-
-/** Local git executes as the workspace uid. Only the opaque bundle crosses
- * into gateway scratch; no worker-controlled destination is opened by root. */
-export async function* nativeGitBundle(
-  request: RegistryBuildRequest,
-  job: NativeRegistryJob,
-  signal: AbortSignal,
-): AsyncGenerator<Uint8Array> {
-  const ref = `refs/partitura/native-build/${job.jobId}`;
-  const run = (args: string[]) => {
-    const argv = workerIdentityCommand(
-      ["/usr/bin/git", "-C", request.workspacePath, ...args],
-      request.workerUid,
-    );
-    const executable = argv.shift();
-    if (!executable) throw new Error("native-bundle-command-missing");
-    const child = spawn(executable, argv, {
-      cwd: "/",
-      env: {
-        PATH: "/usr/bin:/bin",
-        GIT_CONFIG_GLOBAL: "/dev/null",
-        GIT_CONFIG_NOSYSTEM: "1",
-        GIT_TERMINAL_PROMPT: "0",
-      },
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const exited = new Promise<void>((resolve, reject) => {
-      child.once("error", () => reject(new Error("native-bundle-unavailable")));
-      child.once("close", (code) =>
-        code === 0 ? resolve() : reject(new Error("native-bundle-failed")),
-      );
-    });
-    return { child, exited };
-  };
-  const update = run(["update-ref", ref, request.commit]);
-  await update.exited;
-  try {
-    const { child, exited } = run(["bundle", "create", "-", ref]);
-    // Keep a rejection handler attached while consuming stdout.
-    void exited.catch(() => undefined);
-    const kill = () => {
-      child.kill("SIGKILL");
-    };
-    const timer = setTimeout(kill, 120_000);
-    signal.addEventListener("abort", kill, { once: true });
-    if (signal.aborted) kill();
-    try {
-      for await (const bytes of child.stdout) yield Buffer.from(bytes);
-      await exited;
-    } finally {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", kill);
-      kill();
-      await exited.catch(() => undefined);
-    }
-  } finally {
-    const cleanup = run(["update-ref", "-d", ref]);
-    await cleanup.exited;
-  }
+export interface NativeEngineOptions {
+  readonly now?: () => number;
+  readonly prepareBundle?: (
+    request: RegistryBuildRequest,
+    job: NativeRegistryJob,
+  ) => Effect.Effect<
+    AsyncIterable<Uint8Array>,
+    NativeOperationError,
+    Scope.Scope
+  >;
+  /** Future registry admission checks, immediately before dispatch. */
+  readonly canSubmit: (job: NativeRegistryJob) => boolean;
 }
 
-/** Slice 4 engine only. No conductor, config or production tool calls it. */
-export async function createRegistryNativeBuildClient(
+/** Internal engine only. Neither legacy production slot routes through here. */
+export const createRegistryNativeBuildClient = Effect.fn(
+  "RegistryNativeBuildClient.make",
+)(function* (
   state: NativeBuildState,
   transport: NativeBrokerTransport,
-  options: {
-    readonly now?: () => number;
-    readonly prepareBundle?: typeof nativeGitBundle;
-    /** Called under the state publication semaphore immediately before submitting.
-     * The future registry owns enabled/conflict/health/floor checks here. */
-    readonly canSubmit: (job: NativeRegistryJob) => boolean;
-  },
+  options: NativeEngineOptions,
 ) {
   const now = options.now ?? Date.now;
-  await recoverNativeMetadata(state, now());
+  const scope = yield* Scope.Scope;
+  const files = yield* NativeBuildFiles.make;
+  yield* recoverNativeMetadata(state, now());
   const recovery = createNativeBuildRecovery(state, transport, { now });
-  const active = new Map<
-    string,
-    { task: Promise<void>; abort: AbortController }
-  >();
+  const active = new Map<string, Fiber.Fiber<void, never>>();
+  const failures = new Map<string, NativeOperationError>();
   let closing = false;
-  const generationOf = (id: string) => {
-    const generation = state.snapshot().generations.find((g) => g.id === id);
-    if (!generation) throw new Error("native-generation-not-found");
-    return generation;
-  };
+  const generationOf = (id: string) =>
+    nativeTry(() => {
+      const generation = state.snapshot().generations.find((g) => g.id === id);
+      if (!generation)
+        throw NativeOperationError.new("native-generation-not-found");
+      return generation;
+    });
+  const recordFailure = (
+    id: string,
+    error: NativeOperationError,
+    interrupted: boolean,
+  ) =>
+    state.transaction((draft) => {
+      failures.set(id, error);
+      const current = draft.jobs.find((j) => j.jobId === id);
+      if (!current) throw NativeOperationError.new("native-job-not-found");
+      if (current.state === "starting") {
+        current.state = interrupted ? "interrupted" : "failed";
+        current.updatedAt = now();
+        current.failureCode = nativeFailureCode(error);
+      } else if (current.recovery.state === "not-required") {
+        current.recovery.state = "pending";
+        current.recovery.deadline = now() + 900_000;
+        current.recovery.nextAt = now();
+      }
+    });
+  const stop = Effect.fn("RegistryNativeBuildClient.stop")(function* () {
+    closing = true;
+    for (const fiber of [...active.values()]) yield* Fiber.interrupt(fiber);
+  });
+  yield* Effect.addFinalizer(() => stop());
   return {
     recovery,
-    start: async (request: RegistryBuildRequest) => {
-      if (closing) throw new Error("native-engine-closed");
-      const entries = Object.entries(request.secretFiles ?? {});
-      if (
-        entries.length > 16 ||
-        entries.some(
-          ([key, value]) =>
-            !/^[a-z][a-z0-9-]{0,63}$/u.test(key) || typeof value !== "string",
+    failure: (id: string) => failures.get(id),
+    start: Effect.fn("RegistryNativeBuildClient.start")(function* (
+      request: RegistryBuildRequest,
+    ) {
+      if (closing)
+        return yield* Effect.fail(
+          NativeOperationError.new("native-engine-closed"),
+        );
+      const secret = yield* nativeTry(() => {
+        const entries = Object.entries(request.secretFiles ?? {});
+        if (
+          entries.length > 16 ||
+          entries.some(
+            ([key, value]) =>
+              !/^[a-z][a-z0-9-]{0,63}$/u.test(key) || typeof value !== "string",
+          )
         )
-      )
-        throw new Error("invalid-native-secrets");
-      const secret = entries.length
-        ? Buffer.from(JSON.stringify(Object.fromEntries(entries)))
-        : Buffer.alloc(0);
-      if (secret.length > 65_536) throw new Error("native-secrets-too-large");
-      const generation = generationOf(request.generationId);
+          throw NativeOperationError.new("invalid-native-secrets");
+        const bytes = entries.length
+          ? Buffer.from(JSON.stringify(Object.fromEntries(entries)))
+          : Buffer.alloc(0);
+        if (bytes.length > 65_536)
+          throw NativeOperationError.new("native-secrets-too-large");
+        return bytes;
+      });
+      const generation = yield* generationOf(request.generationId);
       if (!transport.hasCredential(generation.id))
-        throw new Error("missing-credentials");
-      const health = await transport.envelope(generation, "health");
+        return yield* Effect.fail(
+          NativeOperationError.new("missing-credentials"),
+        );
+      const health = yield* transport.envelope(generation, "health");
       if (
         health.kind !== "health" ||
         health.hostId !== generation.transport.hostId ||
@@ -147,20 +144,21 @@ export async function createRegistryNativeBuildClient(
         health.status !== "ready" ||
         !health.epoch
       )
-        throw new Error("native-builder-unavailable");
-      const job = await state.transaction((draft) => {
+        return yield* Effect.fail(
+          NativeOperationError.new("native-builder-unavailable"),
+        );
+      const job = yield* state.transaction((draft) => {
         if (
           closing ||
           draft.jobs.some(
             (j) =>
-              (j.verifiedHostId === generation.transport.hostId &&
-                (!terminalNativeJob(j) || unresolvedRecovery(j))) ||
-              (j.organizationId === request.organizationId &&
-                j.sessionId === request.sessionId &&
-                (!terminalNativeJob(j) || unresolvedRecovery(j))),
+              (j.verifiedHostId === generation.transport.hostId ||
+                (j.organizationId === request.organizationId &&
+                  j.sessionId === request.sessionId)) &&
+              (!terminalNativeJob(j) || unresolvedRecovery(j)),
           )
         )
-          throw new Error("native-builder-reserved");
+          throw NativeOperationError.new("native-builder-reserved");
         const job: NativeRegistryJob = {
           version: 1,
           jobId: opaqueId(),
@@ -180,189 +178,233 @@ export async function createRegistryNativeBuildClient(
           createdAt: now(),
           updatedAt: now(),
         };
-        if (!options.canSubmit(job)) throw new Error("native-admission-closed");
+        if (!options.canSubmit(job))
+          throw NativeOperationError.new("native-admission-closed");
         draft.jobs.push(job);
         return job;
       });
-      const abort = new AbortController();
-      const task = (async () => {
-        const release = state.retainGeneration(generation.id);
-        let bundlePath: string | undefined;
-        try {
-          await state.prune();
-          const reservation = await state.reserve(
-            job,
-            "source.bundle",
-            nativeLimits.bundle,
+      const task = Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.acquireRelease(
+            nativeTry(() => [
+              state.retainGeneration(generation.id),
+              state.retainJob(job.jobId),
+            ]),
+            (releases) =>
+              Effect.sync(() => {
+                for (const release of releases) release();
+              }),
           );
-          bundlePath = reservation.path;
-          try {
-            const bytes = await writeNativeStream(
-              reservation.path,
-              (options.prepareBundle ?? nativeGitBundle)(
+          yield* state.prune();
+          const bundlePath = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const reservation = yield* Effect.acquireRelease(
+                state.reserve(job, "source.bundle", nativeLimits.bundle),
+                (reservation) => reservation.release().pipe(Effect.orDie),
+              );
+              const input = yield* (options.prepareBundle ?? nativeGitBundle)(
                 request,
                 job,
-                abort.signal,
-              ),
-              nativeLimits.bundle,
-              abort.signal,
-            );
-            if (!bytes) throw new Error("native-bundle-empty");
-            await reservation.commit();
-          } finally {
-            await reservation.release();
-          }
-          // This write is the dispatch boundary. A failed write prevents spawn.
-          const submitted = await state.transaction((draft) => {
+              );
+              const size = yield* files.stream(
+                reservation.path,
+                input,
+                nativeLimits.bundle,
+              );
+              if (!size)
+                return yield* Effect.fail(
+                  NativeOperationError.new("native-bundle-empty"),
+                );
+              yield* reservation.commit();
+              return reservation.path;
+            }),
+          );
+          yield* Effect.addFinalizer(() =>
+            state.remove(bundlePath).pipe(Effect.orDie, Effect.asVoid),
+          );
+          const submitted = yield* state.transaction((draft) => {
             const current = draft.jobs.find((j) => j.jobId === job.jobId);
             if (
               current?.state !== "starting" ||
-              abort.signal.aborted ||
+              closing ||
               !options.canSubmit(current)
             )
-              throw new Error("native-submission-closed");
+              throw NativeOperationError.new("native-submission-closed");
             current.state = "submitting";
             current.submissionExpiresAt = Math.floor(now() / 1000) + 120;
             current.updatedAt = now();
             return current;
           });
-          const file = await open(
-            bundlePath,
-            constants.O_RDONLY | constants.O_NOFOLLOW,
+          const file = yield* Effect.acquireRelease(
+            nativeIO(() =>
+              open(bundlePath, constants.O_RDONLY | constants.O_NOFOLLOW),
+            ),
+            (file) => nativeIO(() => file.close()).pipe(Effect.orDie),
           );
-          try {
-            const info = await file.stat();
-            const input = (async function* () {
-              if (secret.length) yield secret;
-              for await (const bytes of file.createReadStream({
-                autoClose: false,
-              }))
-                yield Buffer.from(bytes);
-            })();
-            const receipt = await transport.envelope(
+          const info = yield* nativeIO(() => file.stat());
+          const input = (async function* () {
+            if (secret.length) yield secret;
+            for await (const bytes of file.createReadStream({
+              autoClose: false,
+            }))
+              yield Buffer.from(bytes);
+          })();
+          const receipt = yield* transport.envelope(
+            generation,
+            `run-v2 ${job.jobId} ${job.commit} ${job.pullRequest} ${job.action} ${info.size} ${secret.length} ${job.epoch} ${job.attempt} ${submitted.submissionExpiresAt}`,
+            submitted,
+            { input, timeout: 3_600_000 },
+          );
+          let cleanTerminal = false;
+          if (receipt.kind === "known" && receipt.state === "succeeded") {
+            const finalHealth = yield* transport.envelope(
               generation,
-              `run-v2 ${job.jobId} ${job.commit} ${job.pullRequest} ${job.action} ${info.size} ${secret.length} ${job.epoch} ${job.attempt} ${submitted.submissionExpiresAt}`,
-              submitted,
-              { input, signal: abort.signal, timeout: 3_600_000 },
+              "health",
+              undefined,
+              { timeout: 30_000 },
             );
-            await state.transaction((draft) => {
-              const current = draft.jobs.find((j) => j.jobId === job.jobId);
-              if (!current) throw new Error("native-job-not-found");
-              if (
-                receipt.kind === "refused" &&
-                receipt.accepted === false &&
-                receipt.code === "host-busy"
-              ) {
-                current.state = "failed";
-                current.failureCode = "host-busy";
-              } else if (receipt.kind === "known")
-                applyNativeReceipt(current, receipt);
-              else if (
-                receipt.kind === "refused" &&
-                receipt.accepted === false
-              ) {
-                current.state = "failed";
-                current.failureCode = receipt.code ?? "refused";
-              } else throw new Error("invalid-native-run-response");
-              current.updatedAt = now();
-              // host-busy is the single receipt-free refusal which proves no
-              // input/dispatch. Other outcomes still need fenced cleanup proof.
-              if (
-                !(receipt.kind === "refused" && receipt.code === "host-busy")
-              ) {
-                current.recovery.state = "pending";
-                current.recovery.deadline = now() + 900_000;
-                current.recovery.nextAt = now();
-              }
-            });
-          } finally {
-            await file.close();
+            cleanTerminal =
+              finalHealth.hostId === job.verifiedHostId &&
+              finalHealth.epoch === job.epoch &&
+              cleanNativeHealth(finalHealth) === true;
           }
-        } catch {
-          await state.transaction((draft) => {
+          yield* state.transaction((draft) => {
             const current = draft.jobs.find((j) => j.jobId === job.jobId);
-            if (!current) throw new Error("native-job-not-found");
-            if (current.state === "starting") {
-              current.state = abort.signal.aborted ? "interrupted" : "failed";
-              current.updatedAt = now();
-            } else if (current.recovery.state === "not-required") {
+            if (!current)
+              throw NativeOperationError.new("native-job-not-found");
+            if (receipt.kind === "known") applyNativeReceipt(current, receipt);
+            else if (receipt.kind === "refused" && receipt.accepted === false) {
+              current.state = "failed";
+              current.failureCode = receipt.code ?? "refused";
+            } else
+              throw NativeOperationError.new("invalid-native-run-response");
+            current.updatedAt = now();
+            if (cleanTerminal) {
+              current.recovery.state = "resolved-terminal";
+              current.recovery.resolvedEpoch = job.epoch;
+            } else if (
+              !(receipt.kind === "refused" && receipt.code === "host-busy")
+            ) {
               current.recovery.state = "pending";
               current.recovery.deadline = now() + 900_000;
               current.recovery.nextAt = now();
             }
           });
-        } finally {
-          if (bundlePath)
-            await state.remove(bundlePath).catch((error: unknown) => {
-              if (
-                !(
-                  error instanceof Error && error.message === "native-file-busy"
-                )
-              )
-                throw error;
-            });
-          release();
-        }
-      })();
-      active.set(job.jobId, { task, abort });
-      void task.finally(() => active.delete(job.jobId)).catch(() => undefined);
+        }),
+      ).pipe(
+        Effect.catchCause((cause) => {
+          const interrupted = Cause.hasInterrupts(cause);
+          const error = NativeOperationError.new(
+            interrupted
+              ? "native-job-interrupted"
+              : "native-job-operation-failed",
+            cause,
+          );
+          return recordFailure(job.jobId, error, interrupted).pipe(
+            Effect.catch((writeError) =>
+              Effect.sync(() => {
+                failures.set(
+                  job.jobId,
+                  NativeOperationError.new("native-job-finalization-failed", {
+                    operation: error,
+                    persistence: writeError,
+                  }),
+                );
+              }),
+            ),
+          );
+        }),
+        Effect.ensuring(Effect.sync(() => active.delete(job.jobId))),
+      );
+      const fiber = yield* Effect.forkIn(task, scope);
+      active.set(job.jobId, fiber);
       return job;
-    },
-    status: (
+    }),
+    status: Effect.fn("RegistryNativeBuildClient.status")(
+      (organization: string, session: string, id: string, builder?: string) =>
+        nativeTry(() => state.owned(organization, session, id, builder)),
+    ),
+    artifact: Effect.fn("RegistryNativeBuildClient.artifact")(function* (
       organization: string,
       session: string,
       id: string,
       builder?: string,
-    ) => state.owned(organization, session, id, builder),
-    artifact: async (
-      organization: string,
-      session: string,
-      id: string,
-      builder?: string,
-    ) => {
-      const job = state.owned(organization, session, id, builder);
+    ) {
+      const job = yield* nativeTry(() =>
+        state.owned(organization, session, id, builder),
+      );
       if (
         !(
           job.state === "succeeded" ||
           (job.state === "failed" && job.failureCode === "workflow-failed")
         )
       )
-        throw new Error("native-artifact-unavailable");
-      return publishNativeArtifact(
+        return yield* Effect.fail(
+          NativeOperationError.new("native-artifact-unavailable"),
+        );
+      return yield* publishNativeArtifact(
         state,
         transport,
-        generationOf(job.generationId),
+        yield* generationOf(job.generationId),
         job,
       );
-    },
-    cancel: async (
+    }),
+    cancel: Effect.fn("RegistryNativeBuildClient.cancel")(function* (
       organization: string,
       session: string,
       id: string,
       builder?: string,
-    ) => {
-      state.owned(organization, session, id, builder);
-      const pending = active.get(id);
-      pending?.abort.abort();
-      await pending?.task;
-      await recovery.request(id);
-      await recovery.tick(id);
-    },
-    wait: async (id: string) => {
-      await active.get(id)?.task;
-    },
-    close: async () => {
-      closing = true;
-      for (const pending of active.values()) pending.abort.abort();
-      await Promise.all([...active.values()].map((pending) => pending.task));
-      for (const job of state
-        .snapshot()
-        .jobs.filter(
-          (job) => !terminalNativeJob(job) || unresolvedRecovery(job),
-        )) {
-        await recovery.request(job.jobId);
-        await recovery.tick(job.jobId);
-      }
-    },
+    ) {
+      yield* nativeTry(() => state.owned(organization, session, id, builder));
+      const fiber = active.get(id);
+      if (fiber) yield* Fiber.interrupt(fiber);
+      yield* recovery.request(id);
+      yield* recovery.tick(id);
+    }),
+    wait: Effect.fn("RegistryNativeBuildClient.wait")(function* (id: string) {
+      const fiber = active.get(id);
+      if (fiber) yield* Fiber.join(fiber);
+    }),
+    close: Effect.fn("RegistryNativeBuildClient.close")(function* () {
+      yield* stop();
+      // All jobs are attempted even if a recovery write fails.
+      const exits = yield* Effect.all(
+        state
+          .snapshot()
+          .jobs.filter(
+            (job) => !terminalNativeJob(job) || unresolvedRecovery(job),
+          )
+          .map((job) =>
+            Effect.exit(
+              recovery
+                .request(job.jobId)
+                .pipe(Effect.andThen(recovery.tick(job.jobId))),
+            ),
+          ),
+      );
+      const failed = exits.filter((exit) => exit._tag === "Failure");
+      if (failed.length)
+        return yield* Effect.fail(
+          NativeOperationError.new("native-engine-close-failed", failed),
+        );
+    }),
   };
+});
+export class NativeEngineConfig extends Context.Service<
+  NativeEngineConfig,
+  NativeEngineOptions
+>()("NativeEngineConfig") {}
+export class RegistryNativeBuildClient extends Context.Service<RegistryNativeBuildClient>()(
+  "RegistryNativeBuildClient",
+  {
+    make: Effect.gen(function* () {
+      return yield* createRegistryNativeBuildClient(
+        yield* NativeBuildStateService,
+        yield* NativeBuildTransport,
+        yield* NativeEngineConfig,
+      );
+    }),
+  },
+) {
+  static readonly layer = Layer.effect(this, this.make);
 }

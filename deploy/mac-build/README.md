@@ -861,36 +861,6 @@ the test compiler uses the global Xcode selection for its iOS SDK.
 
 ## Internal registry engine, slice 4
 
-The registry engine is source-only and isn't a production caller. Both legacy
-slots still use `createNativeBuildClient`. Registry loading, provider reads,
-scoped scheduling and conductor/tool assembly belong to later slices.
-
-`openNativeBuildState` takes exclusive kernel ownership of disjoint private
-state, scratch and tmpfs cache roots. Assembly must supply every legacy,
-file-secret and worker root in `otherRoots`. Keep `matching.key` with metadata
-backups. Losing it requires reconciliation, never silently creating a replacement.
-State and cache must never be shared between independent gateway instances.
-
-`createNativeBuildTransport` restores only exact current/retiring-key HMAC
-matches against saved public destinations. Keep a generation lease for every
-published admission candidate and dispose unpublished credentials after their
-job and transfer references expire. Close the engine before closing state;
-state close unlinks its credential material and releases its ownership lock.
-The diagnostic classifier recognizes only the tested OpenSSH 9.2p1 vocabulary;
-other versions remain generic transport failures. Qualify the target image's
-OpenSSH diagnostics before enabling auth-denial classification in deployment.
-
-The offline `importLegacyNativeSlot` library takes explicit slot roots,
-transport scalars, a protected key path and exact pins or narrow known_hosts.
-Its `resolveOwner` adapter must read the existing durable run repository for
-the session's organization. Legacy records don't contain a PR number, so the
-adapter must also supply an explicitly verified PR number. It never invents
-one, parses SSH config, contacts a host or starts a build. Unknown ownership
-refuses the entire slot and preserves the originals for operator repair.
-Import is deliberately a library operation until the offline operator assembly
-can supply that durable lookup. It has no standalone CLI accepting owner claims.
-
-Only run import after separately approved native drain/quiescence, backups,
-tmpfs/swap/mount/UID qualification and cutover planning. No production records
-were imported by this slice. Actual host identity, clock skew, disk floors,
-keychain behavior and build acceptance still need approved host verification.
+See [the internal engine and offline import contract](registry-engine.md) for
+Effect scope ownership, recovery, credential restoration and resumable imports.
+Production legacy slot callers remain unchanged.
