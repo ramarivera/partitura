@@ -598,10 +598,11 @@ class RegistryBrokerTests(unittest.TestCase):
 
     def test_keychain_settings_require_unlock_and_policy_is_opt_in_before_clone(self):
         from types import SimpleNamespace
-        state = dict(lockOnSleep=False, useLockInterval=False, lockInterval=7200)
+        state = dict(lockOnSleep=False, lockInterval=2147483647)
         locked = [True]
         def copy(ref, pointer):
             if locked[0]: return -25308  # securityd makeUnlocked(false).
+            # Real CopySettings never writes useLockInterval.
             for key, value in state.items(): setattr(pointer._obj, key, value)
             return 0
         def update(ref, pointer):
@@ -612,7 +613,7 @@ class RegistryBrokerTests(unittest.TestCase):
         chain.ref = broker.C.c_void_p(1)
         chain.security = SimpleNamespace(SecKeychainCopySettings=copy, SecKeychainSetSettings=update)
         chain.check = RealLoginKeychain.check
-        policy = dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)
+        policy = dict(lockOnSleep=True, lockInterval=300)
         with self.assertRaisesRegex(broker.KeychainError, 'policy-read:-25308'):
             chain.apply_policy(policy, self.root / 'keychain-policy.json')
         self.keychain.unlock.side_effect = lambda: locked.__setitem__(0, False)
@@ -629,7 +630,7 @@ class RegistryBrokerTests(unittest.TestCase):
         with patch.object(broker, 'owned', side_effect=owned):
             code, receipt = self.invoke()
         self.assertEqual(code, 0)
-        self.assertEqual(receipt['keychainPolicy']['before']['lockInterval'], 7200)
+        self.assertEqual(receipt['keychainPolicy']['before']['lockInterval'], 2147483647)
         self.assertEqual(receipt['keychainPolicy']['actual'], policy)
         self.assertEqual(receipt['preRelockState'], 'unlocked')
         self.assertTrue(locked[0])
@@ -637,13 +638,42 @@ class RegistryBrokerTests(unittest.TestCase):
         with patch.object(broker, 'LoginKeychain', side_effect=AssertionError('health accessed keychain')):
             self.assertEqual(self.wire('health')[1]['keychainPolicy']['lastReadback']['actual'], policy)
 
+    def test_first_policy_snapshot_survives_policy_changes_revert_and_no_timeout(self):
+        from types import SimpleNamespace
+        original = dict(lockOnSleep=False, lockInterval=2147483647)
+        state = dict(original)
+        def copy(ref, pointer):
+            pointer._obj.lockOnSleep = state['lockOnSleep']
+            pointer._obj.lockInterval = state['lockInterval']
+            # useLockInterval is deliberately untouched, matching Apple source.
+            return 0
+        def update(ref, pointer):
+            state.update(lockOnSleep=bool(pointer._obj.lockOnSleep), lockInterval=pointer._obj.lockInterval)
+            return 0
+        chain = RealLoginKeychain.__new__(RealLoginKeychain)
+        chain.ref = broker.C.c_void_p(1)
+        chain.security = SimpleNamespace(SecKeychainCopySettings=copy, SecKeychainSetSettings=update)
+        evidence = self.root / 'keychain-policy.json'
+        for policy in (dict(lockOnSleep=True, lockInterval=300), dict(lockOnSleep=True, lockInterval=600), original):
+            result = chain.apply_policy(policy, evidence)
+            self.assertEqual(result, dict(before=original, requested=policy, actual=policy))
+            self.assertEqual(state, policy)
+            self.assertEqual(broker.policy_evidence(self.root)['before'], original)
+        self.assertEqual(chain.settings()['lockInterval'], 2147483647)
+        # Invalid evidence mustn't silently reset the original snapshot.
+        evidence.write_text('{broken')
+        with self.assertRaisesRegex(broker.KeychainError, '^policy-evidence$'):
+            chain.apply_policy(dict(lockOnSleep=True, lockInterval=300), evidence)
+        self.assertEqual(evidence.read_text(), '{broken')
+        self.assertEqual(state, original)
+
     def test_policy_readback_mismatch_keeps_prior_evidence_and_pre_relock_state_detects_autolock(self):
         from types import SimpleNamespace
         chain = RealLoginKeychain.__new__(RealLoginKeychain)
         chain.ref = broker.C.c_void_p(1)
-        before = dict(lockOnSleep=False, useLockInterval=False, lockInterval=7200)
+        before = dict(lockOnSleep=False, lockInterval=7200)
         chain.security = SimpleNamespace(SecKeychainSetSettings=lambda *args: 0)
-        policy = dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)
+        policy = dict(lockOnSleep=True, lockInterval=600)
         with patch.object(chain, 'settings', return_value=before):
             with self.assertRaisesRegex(broker.KeychainError, '^policy-readback$'):
                 chain.apply_policy(policy, self.root / 'keychain-policy.json')
@@ -657,7 +687,7 @@ class RegistryBrokerTests(unittest.TestCase):
         self.keychain.lock.assert_called_once()
 
     def test_keychain_policy_mismatch_fails_before_clone_and_legacy_default_preserves_settings(self):
-        self.config['keychainPolicy'] = dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)
+        self.config['keychainPolicy'] = dict(lockOnSleep=True, lockInterval=600)
         self.keychain.apply_policy.side_effect = broker.KeychainError('policy-readback')
         code, receipt = self.invoke()
         self.assertEqual((code, receipt['stage'], receipt['failureCode']), (1, 'keychain-policy', 'keychain-policy-unavailable'))
@@ -768,11 +798,11 @@ class RegistryBrokerTests(unittest.TestCase):
                 path.write_text(json.dumps(value))
                 with self.assertRaisesRegex(ValueError, 'configuration|identity|qualification'):
                     broker.load_config()
-            for policy in (None, dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)):
+            for policy in (None, dict(lockOnSleep=True, lockInterval=300), dict(lockOnSleep=False, lockInterval=2147483647), dict(lockOnSleep=True, lockInterval=0)):
                 value = dict(config, keychainPolicy=policy)
                 path.write_text(json.dumps(value))
                 self.assertEqual(broker.load_config(), value)
-            for policy in ('preserve', {}, dict(lockOnSleep=1, useLockInterval=True, lockInterval=600), dict(lockOnSleep=True, useLockInterval=True, lockInterval=True), dict(lockOnSleep=True, useLockInterval=True, lockInterval=-1)):
+            for policy in ('preserve', {}, dict(lockOnSleep=1, lockInterval=600), dict(lockOnSleep=True, lockInterval=True), dict(lockOnSleep=True, lockInterval=-1), dict(lockOnSleep=True, lockInterval=2147483648), dict(lockOnSleep=True, useLockInterval=False, lockInterval=300), dict(lockOnSleep=False, useLockInterval=True, lockInterval=2147483647)):
                 path.write_text(json.dumps(dict(config, keychainPolicy=policy)))
                 with self.assertRaisesRegex(ValueError, 'invalid keychain policy'):
                     broker.load_config()

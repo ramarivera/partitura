@@ -248,7 +248,7 @@ def validate_settings(settings: object) -> dict:
             raise NativeHostError('invalid broker policy fields')
         policy.update(raw)
     value = policy['keychain_policy']
-    if value is not None and (not isinstance(value, dict) or set(value) != {'lockOnSleep', 'useLockInterval', 'lockInterval'} or type(value['lockOnSleep']) is not bool or type(value['useLockInterval']) is not bool or type(value['lockInterval']) is not int or not 0 <= value['lockInterval'] <= 2**32 - 1):
+    if value is not None and (not isinstance(value, dict) or set(value) != {'lockOnSleep', 'lockInterval'} or type(value['lockOnSleep']) is not bool or type(value['lockInterval']) is not int or not 0 <= value['lockInterval'] <= 2**31 - 1):
         raise NativeHostError('invalid broker keychain_policy')
     if not isinstance(policy["host_id"], str) or policy["host_id"] and not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", policy["host_id"]):
         raise NativeHostError("broker.host_id must be a canonical UUID")

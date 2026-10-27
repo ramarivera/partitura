@@ -209,7 +209,40 @@ class CredentialTests(unittest.TestCase):
 
 
 class RenderSettingsTests(unittest.TestCase):
+    def setUp(self):
+        # Rendering imports host_setup afresh. Intercept each imported module,
+        # including staging/resolve below, so real Mac installed state is never read.
+        self.installed = None
+        self.identity = None
+        original = importlib.util.spec_from_file_location
+        def isolated_spec(name, path, *args, **kwargs):
+            spec = original(name, path, *args, **kwargs)
+            if Path(path) == ROOT / 'deploy/mac-build/host_setup.py':
+                execute = spec.loader.exec_module
+                def load(hs):
+                    execute(hs)
+                    def read(path):
+                        if path == hs.ROOT_CONFIG: return self.installed
+                        if path == hs.ROOT_IDENTITY: return self.identity
+                        raise AssertionError('unexpected installed state read')
+                    hs.read_root_json = read
+                spec.loader.exec_module = load
+            return spec
+        isolated = patch.object(importlib.util, 'spec_from_file_location', side_effect=isolated_spec)
+        isolated.start()
+        self.addCleanup(isolated.stop)
+        probe = subprocess.run(['/usr/bin/git', '-C', str(ROOT), 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+        if probe.returncode or Path(probe.stdout.strip()).resolve() != ROOT:
+            self.skipTest('render/stage parity requires the Partitura git checkout for pinned source bytes')
+
+    def test_legacy_upgrade_reuses_cached_host_id_until_identity_is_persisted(self):
+        self.installed = dict(profile='legacy')
+        self.render_and_stage()
+
     def test_renders_a_fresh_install_that_host_setup_accepts(self):
+        self.render_and_stage()
+
+    def render_and_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             tart = base / 'tart.app/Contents/MacOS/tart'
@@ -230,6 +263,10 @@ class RenderSettingsTests(unittest.TestCase):
                     '--authorized-key', 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWUSojwlYbZc7ccQiCYdtCdTKTqvYQJZ/MvepiDMGSh k',
                     '--runtime-root', '/Users/partitura-build/dev/agentic-scratchpads/partitura/native-build',
                     '--tart-home', '/Volumes/B/tart', '--out', str(out)]
+            legacy_upgrade = self.installed is not None
+            if legacy_upgrade:
+                # Supply the old eleven fields, never a persisted host UUID.
+                self.installed = dict(tart='/Library/Partitura/NativeBuild/tart.app/Contents/MacOS/tart', tartSha256=hashlib.sha256(b'tart').hexdigest(), base='partitura-native-macos-base-test', root=argv[argv.index('--runtime-root') + 1], tartHome='/Volumes/B/tart', guestRunnerSha256='a'*64, qualifierSha256='b'*64, guestUser='partitura', guestHome='/Users/partitura', keychainPath='/Users/partitura-build/Library/Keychains/login.keychain-db', keychainCredentialPath='/Users/partitura-build/.partitura-native-login.password')
             with contextlib.redirect_stdout(io.StringIO()) as printed:
                 self.assertEqual(module.main(argv), 0)
             self.assertIn('manifest_sha256=', printed.getvalue())
@@ -307,7 +344,7 @@ class KeychainPolicyTests(unittest.TestCase):
             command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))]
             # A verified rollback hasn't unlocked anything. Preserve old job
             # evidence and release the installer's new fences for the old broker.
-            result = subprocess.run(command, input=b'abort-restored\n', capture_output=True, timeout=5)
+            result = subprocess.run(command, input=b'fence\nstart\nabort-restored\n', capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(b'legacy job receipts require broker SSH recovery', result.stderr)
             self.assertFalse((runtime / 'cleanup-required').exists())
@@ -316,7 +353,7 @@ class KeychainPolicyTests(unittest.TestCase):
             self.assertEqual(json.loads((old / 'receipt.json').read_text())['state'], 'running')
             # An unexpected legacy file fails validation before any fence write.
             (old / 'unexpected').touch()
-            refused = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            refused = subprocess.run(command, input=b'fence\nstart\ncommit\n', capture_output=True, timeout=5)
             self.assertNotEqual(refused.returncode, 0)
             self.assertFalse((runtime / 'cleanup-required').exists())
             (old / 'unexpected').unlink()
@@ -324,7 +361,7 @@ class KeychainPolicyTests(unittest.TestCase):
             token = 'f'*32
             (runtime / 'maintenance-blocked').write_text('installation-incomplete ' + token + '\n')
             (runtime / 'cleanup-required').write_text('b'*32 + '\n')
-            refused = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            refused = subprocess.run(command, input=b'fence\nstart\ncommit\n', capture_output=True, timeout=5)
             self.assertNotEqual(refused.returncode, 0)
             self.assertEqual((runtime / 'cleanup-required').read_text(), 'b'*32 + '\n')
 
@@ -360,7 +397,12 @@ sudo() {
             child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 self.assertTrue(select.select([child.stdout], [], [], 5)[0])
+                self.assertEqual(child.stdout.readline(), b'classified\n')
+                self.assertFalse((runtime / 'cleanup-required').exists())
+                child.stdin.write(b'fence\n'); child.stdin.flush()
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0])
                 self.assertEqual(child.stdout.readline(), b'ready\n')
+                child.stdin.write(b'start\n'); child.stdin.flush()
                 self.assertRegex((runtime / 'maintenance-blocked').read_text(), r'^installation-incomplete [a-f0-9]{32}\n$')
                 with (runtime / 'runner.lock').open('rb') as lock:
                     with self.assertRaises(BlockingIOError):
@@ -387,16 +429,16 @@ sudo() {
                     child.kill()
                 child.communicate(timeout=5)
             self.assertTrue((runtime / 'cleanup-required').exists())
-            refused_abort = subprocess.run(command, input=b'abort-restored\n', capture_output=True, timeout=5)
+            refused_abort = subprocess.run(command, input=b'fence\nstart\nabort-restored\n', capture_output=True, timeout=5)
             self.assertNotEqual(refused_abort.returncode, 0)
             self.assertTrue((runtime / 'cleanup-required').exists())
-            retry = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            retry = subprocess.run(command, input=b'fence\nstart\ncommit\n', capture_output=True, timeout=5)
             self.assertEqual(retry.returncode, 0, retry.stderr)
             self.assertFalse((runtime / 'cleanup-required').exists())
             self.assertFalse((runtime / 'maintenance-blocked').exists())
             self.assertRegex((runtime / 'admission-epoch').read_text(), r'^[a-f0-9]{32}\n$')
             self.assertTrue((runtime / 'inventory-required').exists())
-            refused = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            refused = subprocess.run(command, input=b'fence\nstart\ncommit\n', capture_output=True, timeout=5)
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn(b'drain and reconcile', refused.stderr)
 

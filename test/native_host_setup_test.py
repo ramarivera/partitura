@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import socket
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import subprocess
@@ -51,6 +52,64 @@ class NativeHostSetupTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'identity journal differs'):
                     launcher.ensure_identity(config, 'other-account')
                 self.assertEqual(journal.read_bytes(), first)
+
+    def test_guard_timeout_before_classification_or_start_never_strands_new_fences(self):
+        import fcntl
+        loader = importlib.util.spec_from_file_location('guard_timeout', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        original_helper = (ROOT / 'deploy/mac-build/provision.py').read_text()
+        broker = (ROOT / 'deploy/mac-build/broker.py').read_bytes()
+        real_popen, real_select = subprocess.Popen, launcher.select.select
+        for phase, line in ((1, "print('classified', flush=True)"), (2, "print('ready', flush=True)")):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+                root = Path(directory)
+                runtime, tart = root / 'runtime', root / 'tart'
+                runtime.mkdir(mode=0o700)
+                (tart / 'vms').mkdir(parents=True)
+                helper = original_helper.replace(line, "__import__('time').sleep(0.2); " + line).encode()
+                def fake_sudo(args, **kwargs):
+                    start = args.index('-c')
+                    return real_popen([sys.executable, '-I', *args[start:]], **kwargs)
+                calls = []
+                def timed(read, write, error, timeout):
+                    calls.append(timeout)
+                    return real_select(read, write, error, 0.03 if len(calls) == phase else 3)
+                with patch.object(launcher.subprocess, 'Popen', side_effect=fake_sudo), patch.object(launcher.select, 'select', side_effect=timed):
+                    with self.assertRaisesRegex(ValueError, 'busy, fenced or unsafe'):
+                        with launcher.installation_guard(dict(root=str(runtime), tartHome=str(tart)), 'builder', helper, broker):
+                            self.fail('transaction must not start after a guard timeout')
+                self.assertEqual(len(calls), phase)
+                for marker in ('cleanup-required', 'maintenance-blocked', 'inventory-required'):
+                    self.assertFalse((runtime / marker).exists(), marker)
+                with (runtime / 'runner.lock').open('rb') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_guard_late_ready_on_closed_stdout_releases_only_new_fences(self):
+        loader = importlib.util.spec_from_file_location('guard_closed_pipe', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        helper = (ROOT / 'deploy/mac-build/provision.py').read_text().replace("print('ready', flush=True)", "__import__('time').sleep(0.2); print('ready', flush=True)")
+        script = launcher.helper_constant(helper.encode(), 'INSTALL_GUARD_SCRIPT')
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            runtime, tart = Path(directory) / 'runtime', Path(directory) / 'tart'
+            runtime.mkdir(mode=0o700)
+            (tart / 'vms').mkdir(parents=True)
+            child = subprocess.Popen([sys.executable, '-I', '-c', script, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(launcher.select.select([child.stdout], [], [], 3)[0])
+                self.assertEqual(child.stdout.readline(), b'classified\n')
+                child.stdin.write(b'fence\n'); child.stdin.flush()
+                child.stdout.close()
+                child.stdout = None
+                _, error = child.communicate(timeout=3)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn(b'BrokenPipeError', error)
+                self.assertFalse((runtime / 'maintenance-blocked').exists())
+                self.assertFalse((runtime / 'cleanup-required').exists())
+            finally:
+                if child.poll() is None: child.kill()
+                child.communicate(timeout=3)
 
     def test_root_apply_checks_exact_predecessor_and_every_payload(self):
         loader = importlib.util.spec_from_file_location('native_predecessor', ROOT / 'deploy/mac-build/native_host.py')

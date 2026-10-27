@@ -146,7 +146,7 @@ class KeychainError(Exception):
 
 
 def validate_keychain_policy(value):
-    if value is not None and (not isinstance(value, dict) or set(value) != {'lockOnSleep', 'useLockInterval', 'lockInterval'} or type(value['lockOnSleep']) is not bool or type(value['useLockInterval']) is not bool or type(value['lockInterval']) is not int or not 0 <= value['lockInterval'] <= 2**32 - 1):
+    if value is not None and (not isinstance(value, dict) or set(value) != {'lockOnSleep', 'lockInterval'} or type(value['lockOnSleep']) is not bool or type(value['lockInterval']) is not int or not 0 <= value['lockInterval'] <= 2**31 - 1):
         raise ValueError('invalid keychain policy')
     return value
 
@@ -231,7 +231,7 @@ class LoginKeychain:
     def settings(self):
         current = KeychainSettings(1, 0, 0, 0)
         self.check(self.security.SecKeychainCopySettings(self.ref, C.byref(current)), 'policy-read')
-        return dict(lockOnSleep=bool(current.lockOnSleep), useLockInterval=bool(current.useLockInterval), lockInterval=current.lockInterval)
+        return validate_keychain_policy(dict(lockOnSleep=bool(current.lockOnSleep), lockInterval=current.lockInterval))
 
     def apply_policy(self, policy, evidence_path):
         validate_keychain_policy(policy)
@@ -239,11 +239,15 @@ class LoginKeychain:
         # run_job's SSH session may call this, immediately after unlock.
         before = self.settings()
         previous = policy_evidence(evidence_path.parent)
-        if previous and previous['requested'] == policy:
-            before = previous['before']  # Preserve the original revert snapshot.
+        if os.path.lexists(evidence_path) and previous is None:
+            raise KeychainError('policy-evidence')
+        if previous:
+            before = previous['before']  # Keep the first snapshot across policy changes and revert.
         evidence = dict(before=before, requested=policy, actual=None)
         durable_write(evidence_path, json.dumps(evidence) + '\n')
-        desired = KeychainSettings(1, policy['lockOnSleep'], policy['useLockInterval'], policy['lockInterval'])
+        # useLockInterval is retained only for ABI layout: Set ignores it and Copy
+        # leaves it untouched. INT_MAX is security(1)'s no-timeout sentinel.
+        desired = KeychainSettings(1, policy['lockOnSleep'], 0, policy['lockInterval'])
         self.check(self.security.SecKeychainSetSettings(self.ref, C.byref(desired)), 'policy-set')
         actual = self.settings()
         if actual != policy:

@@ -1,5 +1,7 @@
 """Focused checks for the opt-in macOS native-build host setup."""
 import base64
+import contextlib
+import io
 import importlib.util
 import json
 import hashlib
@@ -145,9 +147,20 @@ class PartituraNativeHostTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.NativeHostError, 'exactly one'):
             MODULE.validate_settings(config)
 
+    def test_keychain_policy_accepts_only_roundtrippable_settings_before_staging(self):
+        base = self.enabled_settings()
+        base['broker'] = dict(host_id='12345678-1234-1234-1234-123456789abc', protocol=2, profile='legacy', minimum_free_bytes=MODULE.MINIMUM_FREE_BYTES, daemon_relock_qualified=False, daemon_relock_macos_build='')
+        for value in (None, dict(lockOnSleep=True, lockInterval=300), dict(lockOnSleep=False, lockInterval=2147483647)):
+            config = dict(base, broker=dict(base['broker'], keychain_policy=value))
+            normalized = MODULE.validate_settings(config)
+            self.assertEqual(MODULE.make_broker_config(normalized)['keychainPolicy'], value)
+        for value in (dict(lockOnSleep=True, useLockInterval=False, lockInterval=300), dict(lockOnSleep=False, useLockInterval=True, lockInterval=2147483647), dict(lockOnSleep=True, lockInterval=True), dict(lockOnSleep=True, lockInterval=2147483648)):
+            with self.subTest(value=value), self.assertRaisesRegex(MODULE.NativeHostError, 'invalid broker keychain_policy'):
+                MODULE.validate_settings(dict(base, broker=dict(base['broker'], keychain_policy=value)))
+
     def test_legacy_settings_preserve_installed_identity_profile_and_floor(self):
         config = MODULE.validate_settings(self.enabled_settings())
-        installed = dict(MODULE.make_broker_config(config), hostId='12345678-1234-1234-1234-123456789abc', profile='registry-only', minimumFreeBytes=60 * 1024**3, daemonRelockQualified=True, daemonRelockMacOSBuild='27A123', keychainPolicy=dict(lockOnSleep=True, useLockInterval=True, lockInterval=600))
+        installed = dict(MODULE.make_broker_config(config), hostId='12345678-1234-1234-1234-123456789abc', profile='registry-only', minimumFreeBytes=60 * 1024**3, daemonRelockQualified=True, daemonRelockMacOSBuild='27A123', keychainPolicy=dict(lockOnSleep=True, lockInterval=600))
         def read(path):
             return installed if path == MODULE.ROOT_CONFIG else None
         with patch.object(MODULE, 'read_root_json', side_effect=read):
@@ -581,7 +594,10 @@ class PartituraNativeHostTest(unittest.TestCase):
                 with self.subTest(failure=failure, was_loaded=was_loaded):
                     self.exercise_install_rollback(failure, was_loaded)
 
-    def exercise_install_rollback(self, failure, was_loaded):
+    def test_restored_payload_drift_keeps_installer_fences_in_real_main(self):
+        self.exercise_install_rollback('sshd', False, corrupt_restored=True)
+
+    def exercise_install_rollback(self, failure, was_loaded, corrupt_restored=False):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -796,44 +812,75 @@ elif name not in ("codesign", "chown", "plutil"):
                 installer = installer.replace(old_path, new_path)
 
             def run_installer():
-                # Exercise the real wrapper/guard protocol as well as the real
-                # transaction. The restored predecessor must be unfenced even
-                # when securityd would reject every sudo-context settings call.
+                # Drive the actual root wrapper's exit-75 branch, including its
+                # real predecessor verifier, guard protocol and fence release.
                 loader = importlib.util.spec_from_file_location('rollback_launcher', ROOT / 'deploy/mac-build/native_host.py')
                 launcher = importlib.util.module_from_spec(loader)
                 loader.loader.exec_module(launcher)
                 runtime, tart = Path(directory) / 'runtime', Path(directory) / 'runtime-tart'
                 runtime.mkdir(mode=0o700, exist_ok=True)
                 (tart / 'vms').mkdir(parents=True, exist_ok=True)
-                guard_config = dict(root=str(runtime), tartHome=str(tart))
-                popen = subprocess.Popen
+                guard_config = dict(root=str(runtime), tartHome=str(tart), hostId='12345678-1234-1234-1234-123456789abc', profile='legacy')
+                payloads = {'config.json': json.dumps(guard_config).encode(), 'provision.py': (ROOT / 'deploy/mac-build/provision.py').read_bytes(), 'broker.py': (ROOT / 'deploy/mac-build/broker.py').read_bytes()}
+                stage.chmod(0o700)
+                script = stage / 'install-host.sh'
+                if script.exists(): script.chmod(0o600)
+                script.write_text(installer)
+                script.chmod(0o500)
+                popen, run = subprocess.Popen, subprocess.run
+                result = None
                 def fake_sudo(args, **kwargs):
                     if args[0] == '/usr/bin/sudo':
                         start = args.index('-c')
                         return popen([sys.executable, '-I', *args[start:]], **kwargs)
                     return popen(args, **kwargs)
-                result = None
-                try:
-                    with patch.object(launcher.subprocess, 'Popen', side_effect=fake_sudo):
-                        with launcher.installation_guard(guard_config, config['account'], (ROOT / 'deploy/mac-build/provision.py').read_bytes(), (ROOT / 'deploy/mac-build/broker.py').read_bytes()):
-                            result = subprocess.run(
-                                ["/bin/bash", "-euo", "pipefail", "-c", installer, "--", str(stage), tart_sha256, config["account"]],
-                                capture_output=True, text=True, check=False,
-                            )
-                            if result.returncode == 75:
-                                self.assertEqual(manifest_path.read_bytes(), old_manifest)
-                                for path, (contents, mode) in old_contents.items():
-                                    self.assertEqual((path.read_bytes(), stat.S_IMODE(path.stat().st_mode)), (contents, mode))
-                                raise launcher.InstallationRestored()
-                            result.check_returncode()
-                except launcher.InstallationRestored:
-                    pass
-                self.assertFalse((runtime / 'cleanup-required').exists())
-                self.assertFalse((runtime / 'maintenance-blocked').exists())
+                def transaction(args, **kwargs):
+                    nonlocal result
+                    if args[0] == '/usr/bin/ditto':
+                        shutil.copytree(args[-2], args[-1])
+                        return subprocess.CompletedProcess(args, 0)
+                    self.assertEqual(args[0], '/bin/bash')
+                    # Run the actual transaction against the fixture payloads;
+                    # its platform commands are the shims above.
+                    result = run(['/bin/bash', '-euo', 'pipefail', '-c', installer, '--', str(stage), tart_sha256, config['account']], capture_output=True, text=True, pass_fds=kwargs['pass_fds'])
+                    if result.returncode == 75 and corrupt_restored:
+                        target = next(iter(old_contents))
+                        target.write_bytes(b'rollback payload drift')
+                    return result
+                actual_lstat, actual_fstat = Path.lstat, os.fstat
+                def root_metadata(info):
+                    values = list(info)
+                    values[4] = 0
+                    return os.stat_result(values)
+                targets = {str(path): path.name for path in old_contents}
+                argv = ['--stage', str(stage), '--account', config['account'], '--tart-sha256', tart_sha256, '--manifest-sha256', 'a'*64, '--apply']
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(launcher.subprocess, 'Popen', side_effect=fake_sudo))
+                    stack.enter_context(patch.object(launcher.subprocess, 'run', side_effect=transaction))
+                    stack.enter_context(patch.object(launcher.os, 'uname', return_value=SimpleNamespace(sysname='Darwin')))
+                    stack.enter_context(patch.object(launcher.os, 'geteuid', return_value=0))
+                    stack.enter_context(patch.object(Path, 'lstat', lambda path: root_metadata(actual_lstat(path))))
+                    stack.enter_context(patch.object(launcher.os, 'fstat', lambda fd: root_metadata(actual_fstat(fd))))
+                    stack.enter_context(patch.object(launcher, 'untrusted_root_interpreter', return_value=None))
+                    stack.enter_context(patch.object(launcher, 'root_scratch_directory', return_value=Path(directory)))
+                    stack.enter_context(patch.object(launcher, 'verified_payloads', return_value=payloads))
+                    stack.enter_context(patch.object(launcher, 'ensure_identity'))
+                    stack.enter_context(patch.object(launcher, 'INSTALL_HOST_SHA256', hashlib.sha256(script.read_bytes()).hexdigest()))
+                    stack.enter_context(patch.object(launcher, 'MANIFEST_PATH', manifest_path))
+                    stack.enter_context(patch.object(launcher, 'STAGED_FILES', targets))
+                    stack.enter_context(patch.object(launcher, 'TART_TARGET', str(installed_executable)))
+                    stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    code = launcher.main(argv)
+                self.assertIsNotNone(result)
+                self.assertEqual(code, 0 if result.returncode == 0 else 1)
+                self.assertEqual((runtime / 'cleanup-required').exists(), corrupt_restored)
+                self.assertEqual((runtime / 'maintenance-blocked').exists(), corrupt_restored)
                 return result
 
             failed_update = run_installer()
             self.assertEqual(failed_update.returncode, 75, failed_update.stdout + failed_update.stderr)
+            if corrupt_restored:
+                return # The real verifier rejected drift and retained both fences.
             self.assertEqual(installed_executable.read_bytes(), old_tart)
             self.assertEqual(daemon_state.exists(), was_loaded)
             self.assertEqual(policy_state.read_text(), "old")

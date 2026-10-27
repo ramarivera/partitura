@@ -223,22 +223,36 @@ Password initialization uses root-private stable state under
 The sealed `broker.keychain_policy` defaults to `null`, meaning leave settings
 unchanged, including on legacy upgrades. No automatic-lock interval reaches a
 production host through the default installer. An explicit policy is an object
-with `lockOnSleep` and `useLockInterval` booleans and a `lockInterval` in seconds.
+with a `lockOnSleep` boolean and integer `lockInterval` in seconds, from 0 through
+2147483647. The latter value is the explicit no-idle-timeout sentinel; zero means
+an immediate timeout, not never. Lock-on-sleep remains independent. For example,
+`{"lockOnSleep":false,"lockInterval":2147483647}` disables both automatic causes.
+`useLockInterval` isn't accepted: Apple's API ignores it on write and doesn't
+return it on read, so its value can't express whether a timeout is enabled.
+See the pinned Apple [API implementation](https://github.com/apple-oss-distributions/Security/blob/Security-61901.0.87.0.1/OSX/libsecurity_keychain/lib/SecKeychain.cpp#L152)
+and [security tool's no-timeout mapping](https://github.com/apple-oss-distributions/Security/blob/Security-61901.0.87.0.1/SecurityTool/macOS/keychain_set_settings.c#L184).
+Contradictory old three-field policies are rejected during settings/config validation.
 For an approved qualification update, `--keychain-policy` accepts that JSON, for
-example `'{"lockOnSleep":true,"useLockInterval":true,"lockInterval":300}'`.
+example `'{"lockOnSleep":true,"lockInterval":300}'`.
 Choose and qualify the interval on an isolated or backup host before approving it
 for a primary. The broker applies it inside its SSH session immediately after
 unlock, reads it back before cloning, and fails with `keychain-policy-unavailable`
 if that fails or differs. Legacy receipts keep the existing `unlock` /
-`unlock-failed` diagnostic so the live gateway can decode them. It saves the prior settings before mutation in private
+`unlock-failed` diagnostic so the live gateway can decode them. It saves the
+prior settings before mutation in private
 `keychain-policy.json`. Receipts/status carry successful prior/requested/readback
 values and `preRelockState`; health exposes cached evidence without a keychain
-API call. The first prior snapshot persists across repeated applications of the
-same requested policy. An interval is defense in depth and never clears a fence.
+API call. The first prior snapshot is retained for this host across every policy
+change, revert and preserve cycle; later requests never replace it. Capture that
+original two-field object before changing policy. Unreadable or invalid saved
+evidence stops policy changes instead of replacing the original snapshot. An
+interval is defense in depth and never clears a fence.
 
-To revert, quiesce the host, take the recorded prior object and approve a
+To revert, quiesce the host, take the original `before` object and approve a
 policy-only update with `--keychain-policy` set to those exact values. An approved
-SSH build must show the restored readback. Then approve a second policy-only
+SSH build must show those exact two fields in its restored readback. A prior
+interval of 2147483647 must be restored verbatim, never replaced with zero. Then
+approve a second policy-only
 update with `--keychain-policy preserve` to stop managing settings. `preserve`
 alone doesn't undo a policy already applied. These policy values aren't secrets;
 passwords still never enter argv or env. Daemon relock qualification is separate.
@@ -289,6 +303,10 @@ recovered by the new broker in an authenticated SSH session before accepting
 legacy input, including when the unqualified daemon has left a pending relock.
 Unknown or unsafe objects stop installation before it creates any fence.
 
+The guard first reports classification without changing admission. The root
+wrapper then authorizes fencing and acknowledges readiness before starting the
+transaction. A classification timeout creates no fences; a timeout before start
+removes only this invocation's new fences and preserves prior incomplete state.
 The guard writes matching random tokens into `cleanup-required` and
 `maintenance-blocked` before replacing anything. The transaction inherits its
 pipe so loss of the wrapper cannot release `runner.lock` during replacement.

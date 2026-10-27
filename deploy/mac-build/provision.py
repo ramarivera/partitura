@@ -154,11 +154,32 @@ def write(name, value):
         stream.flush()
         os.fsync(stream.fileno())
     sync()
-if not resume:
-    write('maintenance-blocked', 'installation-incomplete ' + token + '\n')
-if 'cleanup-required' not in existing:
-    write('cleanup-required', token + '\n')
-print('ready', flush=True)
+# Classification never mutates admission. A timed-out wrapper closes stdin
+# without authorizing fences, even if inventory finishes much later.
+print('classified', flush=True)
+if sys.stdin.readline() != 'fence\n':
+    raise SystemExit('installation not authorized; admission unchanged')
+started = False
+try:
+    if not resume:
+        write('maintenance-blocked', 'installation-incomplete ' + token + '\n')
+    if 'cleanup-required' not in existing:
+        write('cleanup-required', token + '\n')
+    print('ready', flush=True)
+    if sys.stdin.readline() != 'start\n':
+        raise SystemExit('installation not started; prior admission restored')
+    started = True
+finally:
+    # Includes a late BrokenPipeError after the root wrapper has timed out and
+    # closed stdout. No transaction was started, so only our new fences may go.
+    if not started and not resume:
+        owned = {'maintenance-blocked': 'installation-incomplete ' + token + '\n', 'cleanup-required': token + '\n'}
+        present = {name for name in owned if os.path.lexists(root / name)}
+        if all(marker(name) == owned[name] for name in present):
+            for name in ('cleanup-required', 'maintenance-blocked'):
+                if name in present:
+                    (root / name).unlink()
+                    sync()
 command = sys.stdin.readline()
 if command not in ('commit\n', 'abort-restored\n'):
     raise SystemExit('installation incomplete; admission remains fenced')
@@ -201,7 +222,7 @@ def render_settings(args):
     installed = hs.read_root_json(hs.ROOT_CONFIG) or {}
     identity = hs.read_root_json(hs.ROOT_IDENTITY) or {}
     cached = {}
-    if not installed and not identity and (out / 'settings.json').exists():
+    if not installed.get('hostId') and not identity.get('hostId') and (out / 'settings.json').exists():
         cached = json.loads((out / 'settings.json').read_text()).get('broker', {})
     host_id = args.host_id or identity.get('hostId') or installed.get('hostId') or cached.get('host_id') or str(uuid.uuid4())
     old = dict(host_id=host_id, protocol=2, profile=installed.get('profile', 'legacy'), minimum_free_bytes=installed.get('minimumFreeBytes', hs.MINIMUM_FREE_BYTES), daemon_relock_qualified=installed.get('daemonRelockQualified', False), daemon_relock_macos_build=installed.get('daemonRelockMacOSBuild', ''), keychain_policy=installed.get('keychainPolicy'))
@@ -512,7 +533,7 @@ def main(argv=None):
     render.add_argument('--host-id')
     render.add_argument('--profile', choices=('legacy', 'registry-only'))
     render.add_argument('--minimum-free-bytes', type=int)
-    render.add_argument('--keychain-policy', help='preserve, or explicit JSON lockOnSleep/useLockInterval/lockInterval settings')
+    render.add_argument('--keychain-policy', help='preserve, or explicit JSON lockOnSleep/lockInterval settings')
     qualification = render.add_mutually_exclusive_group()
     qualification.add_argument('--daemon-relock-qualified', action='store_true', default=None)
     qualification.add_argument('--daemon-relock-unqualified', action='store_false', dest='daemon_relock_qualified')
