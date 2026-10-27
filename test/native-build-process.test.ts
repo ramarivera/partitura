@@ -29,13 +29,19 @@ it.live("finish kills descendants after the group leader has closed", () =>
       expect(pid).toBeGreaterThan(0);
       process.kill(pid, 0);
       yield* nativeIO(() => owner.finish());
-      // Linux may briefly retain the orphan as a zombie until init reaps it.
-      const alive = yield* nativeIO(() =>
+      // SIGKILL is delivered asynchronously, and Linux may briefly retain the
+      // orphan as a zombie until init reaps it, so poll within a bound.
+      const isAlive = nativeIO(() =>
         readFile(`/proc/${pid}/stat`, "utf8"),
       ).pipe(
         Effect.map((value) => !value.includes(") Z ")),
         Effect.catch(() => Effect.succeed(false)),
       );
+      let alive = yield* isAlive;
+      for (let attempt = 0; alive && attempt < 100; attempt++) {
+        yield* Effect.sleep("20 millis");
+        alive = yield* isAlive;
+      }
       expect(alive).toBe(false);
     }),
   ).pipe(Effect.provide(NativeBuildProcesses.layer)),
