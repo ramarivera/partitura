@@ -27,6 +27,7 @@ export class NativeSecretBudget extends Context.Service<NativeSecretBudget>()(
             org: string,
             now: number,
             eligible?: (data: SecretJournalData) => boolean,
+            onReserved?: (data: SecretJournalData, at: number) => void,
           ) =>
             journal
               .transaction((data, at) => {
@@ -59,6 +60,7 @@ export class NativeSecretBudget extends Context.Service<NativeSecretBudget>()(
                     "provider-budget-exhausted",
                     at + day,
                   );
+                onReserved?.(data, at);
                 data.charges.push({ at, bucket, units, org });
                 data.cooldowns[source] = at + 60000;
                 if (bucket === "agent") data.agentAttempts.push({ at, org });
@@ -91,7 +93,9 @@ export class NativeSecretBudget extends Context.Service<NativeSecretBudget>()(
         ),
         capacity: Effect.fn("NativeSecretBudget.capacity")(
           (sources: number, pendingUnits: number, now: number) =>
-            journal.transaction((data, at) => {
+            Effect.sync(() => {
+              const data = journal.snapshot();
+              const at = Math.max(data.highWater, Math.floor(now));
               const cost = sources === 0 ? 0 : 8 + 4 * sources;
               const [dailyLimit, hourlyLimit] = budgetLimits(
                 daily,
@@ -125,7 +129,7 @@ export class NativeSecretBudget extends Context.Service<NativeSecretBudget>()(
                     ? null
                     : Math.floor(remaining(hour, hourlyLimit) / cost),
               };
-            }, now),
+            }),
         ),
       };
     }),

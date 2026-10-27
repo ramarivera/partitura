@@ -98,22 +98,16 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
             const blocked = new Set<string>();
             if (Option.isSome(secretCache)) {
-              const capacity = yield* secretCache.value
-                .capacity(
-                  snapshot.builders
-                    .filter((entry) => entry.enabled)
-                    .map((entry) => ({
-                      source: sourceReference(entry.secretSource),
-                      revision: entry.secretRevision,
-                      builderId: entry.id,
-                      retained: false,
-                    })),
-                )
-                .pipe(
-                  Effect.mapError((error) =>
-                    BuilderRegistryError.new(error.code),
-                  ),
-                );
+              const capacity = yield* secretCache.value.capacity(
+                snapshot.builders
+                  .filter((entry) => entry.enabled)
+                  .map((entry) => ({
+                    source: sourceReference(entry.secretSource),
+                    revision: entry.secretRevision,
+                    builderId: entry.id,
+                    retained: false,
+                  })),
+              );
               if (!capacity.sufficient) {
                 capacityError = "budget-capacity";
                 const previous = state.snapshot();

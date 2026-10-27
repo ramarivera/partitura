@@ -113,7 +113,11 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       }
     };
     const worker = Effect.fn("BuilderRegistry.resolve")(function* (id: string) {
+      let initial = true;
       for (;;) {
+        // Let a burst of accepted revisions replace pending work before another read.
+        if (!initial) yield* Effect.yieldNow;
+        initial = false;
         const work = pending.get(id);
         if (!work) return;
         pending.delete(id);
@@ -265,6 +269,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       blocked: ReadonlySet<string> = new Set(),
     ) {
       const retired: Scope.Closeable[] = [];
+      const obsolete: string[] = [];
+      const cancelOld: Deferred.Deferred<void>[] = [];
       const retire = (id: string) => {
         const lease = leases.get(id);
         if (lease) {
@@ -278,21 +284,23 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           error = undefined;
           const key = `${registrySemanticKey(snapshot)}:${[...blocked].sort().join(",")}`;
           if (key === semantic) return false;
-          const obsolete = [...entries.values()]
-            .filter((old) => {
-              const next = snapshot.builders.find(
-                (entry) => entry.id === old.entry.id,
-              );
-              return (
-                !next?.enabled ||
-                credentialRevision(next) !== credentialRevision(old.entry)
-              );
-            })
-            .map((old) => old.entry.id);
-          if (obsolete.length) yield* supersede(obsolete);
+          obsolete.push(
+            ...[...entries.values()]
+              .filter((old) => {
+                const next = snapshot.builders.find(
+                  (entry) => entry.id === old.entry.id,
+                );
+                return (
+                  !next ||
+                  (old.entry.enabled && !next.enabled) ||
+                  credentialRevision(next) !== credentialRevision(old.entry)
+                );
+              })
+              .map((old) => old.entry.id),
+          );
           for (const id of obsolete) {
             const cancel = cancellations.get(id);
-            if (cancel) yield* Deferred.succeed(cancel, undefined);
+            if (cancel) cancelOld.push(cancel);
           }
           desired = structuredClone(snapshot);
           semantic = key;
@@ -342,6 +350,18 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           return true;
         }),
       );
+      // Safety state is published before best-effort provider cleanup.
+      if (obsolete.length)
+        yield* supersede(obsolete).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning(
+              "Native provider supersession could not be persisted",
+              { code: error.code },
+            ),
+          ),
+        );
+      for (const cancel of cancelOld)
+        yield* Deferred.succeed(cancel, undefined);
       yield* Effect.forEach(retired, (lease) => Scope.close(lease, Exit.void));
       yield* launch();
       return changed;
