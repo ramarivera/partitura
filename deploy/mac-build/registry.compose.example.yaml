@@ -1,0 +1,34 @@
+# Example only. Requires the approved drain/import/profile cutover in registry-cutover.md.
+# Overlay the existing gateway service, preserving its worker capabilities/network.
+# Paths/volume sizes and permissions need deployment qualification before use.
+services:
+  gateway:
+    environment:
+      NATIVE_BUILD_REGISTRY_FILE: /run/partitura-builders/registry.json
+      NATIVE_BUILD_STATE_ROOT: /app/data/native-build-registry
+      NATIVE_BUILD_REGISTRY_SCRATCH_ROOT: /app/native-build-registry-scratch
+      NATIVE_BUILD_CACHE_ROOT: /run/partitura-native
+      NATIVE_BUILD_ALLOWED_HOST_SUFFIX: xalda-procyon.ts.net
+      NATIVE_BUILD_FILE_SECRET_ROOT: /run/partitura-builder-records
+      NATIVE_BUILD_OP_QUALIFIED: "false"
+      NATIVE_BUILD_OP_DAILY_BUDGET: "400"
+      NATIVE_BUILD_OP_HOURLY_BUDGET: "200"
+      NATIVE_BUILD_REGISTRY_SCRATCH_BYTES_PER_BUILDER: "8589934592"
+      NATIVE_BUILD_REGISTRY_SCRATCH_BYTES_TOTAL: "34359738368"
+    ulimits:
+      core: 0
+    tmpfs:
+      - /run/partitura-native:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=0,gid=0
+    volumes:
+      # Stable DIRECTORY bind mounts; root owns directory 0700 and files 0600/0400.
+      - /srv/partitura/builders:/run/partitura-builders:ro
+      - /srv/partitura/builder-records:/run/partitura-builder-records:ro
+      # Pre-provision roots 0700. Size bulk storage with at least a 2-GiB margin.
+      - native-registry-state:/app/data/native-build-registry
+      - native-registry-scratch:/app/native-build-registry-scratch
+      # Keep both original legacy mounts until separately approved rollback expiry.
+      # For qualified 1Password, separately mount a 0400 token inside a 0700 directory
+      # and set NATIVE_BUILD_OP_TOKEN_FILE / NATIVE_BUILD_OP_VAULT_ID. No inline token.
+volumes:
+  native-registry-state:
+  native-registry-scratch:

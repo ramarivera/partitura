@@ -730,7 +730,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
 /** Copy verified opaque bytes through the worker uid. The gateway never opens
  * a worker-controlled destination or extracts an archive from the guest. */
 export async function deliverNativeArtifact(
-  client: Awaited<ReturnType<typeof createNativeBuildClient>>,
+  client: Pick<Awaited<ReturnType<typeof createNativeBuildClient>>, "artifact">,
   request: {
     readonly sessionId: string;
     readonly job: string;

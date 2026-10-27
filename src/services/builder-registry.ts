@@ -22,12 +22,17 @@ import { makeBuilderRegistryState } from "./builder-registry-state.js";
 import { BuilderSecretProvider } from "./builder-secret-provider.js";
 import { BuilderRegistryConfig } from "./config-native-build.js";
 import { NativeBuildSecretCache } from "./native-build-secret-cache.js";
+import {
+  NativeBuildStateService,
+  unresolvedRecovery,
+} from "./native-build-state.js";
+import { NativeBuildTransport } from "./native-build-transport.js";
 
 export * from "./builder-registry-schema.js";
 export type { BuilderAdmission } from "./builder-registry-state.js";
 
 /** Local file polling supplies correctness. Watch events only reduce latency.
- * This layer is deliberately absent from GatewayServicesLive until slice 8. */
+ * Registry mode assembles this layer before tool and ingress consumers. */
 export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
   "BuilderRegistry",
   {
@@ -36,6 +41,7 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
       const files = yield* BuilderRegistryFiles;
       const provider = yield* BuilderSecretProvider;
       const secretCache = yield* Effect.serviceOption(NativeBuildSecretCache);
+      const nativeState = yield* Effect.serviceOption(NativeBuildStateService);
       let capacityError: string | undefined;
       const identity = yield* BuilderRegistryIdentity;
       const scope = yield* Scope.Scope;
@@ -57,6 +63,14 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
           ? secretCache.value.captureSupersede
           : undefined,
       );
+      const transport = yield* Effect.serviceOption(NativeBuildTransport);
+      if (Option.isSome(transport))
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            transport.value.observeAuthentication(state.needsRefresh),
+          ),
+          (unsubscribe) => Effect.sync(unsubscribe),
+        );
       const revalidatePending = Effect.fn("BuilderRegistry.revalidatePending")(
         function* () {
           if (Option.isNone(secretCache)) return;
@@ -129,16 +143,30 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
             const blocked = new Set<string>();
             if (Option.isSome(secretCache)) {
-              const capacity = yield* secretCache.value.capacity(
-                snapshot.builders
-                  .filter((entry) => entry.enabled)
-                  .map((entry) => ({
-                    source: sourceReference(entry.secretSource),
-                    revision: entry.secretRevision,
-                    builderId: entry.id,
-                    retained: false,
-                  })),
-              );
+              const needed = snapshot.builders
+                .filter((entry) => entry.enabled)
+                .map((entry) => ({
+                  source: sourceReference(entry.secretSource),
+                  revision: entry.secretRevision,
+                  builderId: entry.id,
+                  retained: false,
+                }));
+              if (Option.isSome(nativeState)) {
+                const saved = nativeState.value.snapshot();
+                for (const job of saved.jobs.filter(unresolvedRecovery)) {
+                  const generation = saved.generations.find(
+                    (generation) => generation.id === job.generationId,
+                  );
+                  if (generation)
+                    needed.push({
+                      source: generation.transport.source,
+                      revision: 0,
+                      builderId: job.builderId,
+                      retained: true,
+                    });
+                }
+              }
+              const capacity = yield* secretCache.value.capacity(needed);
               if (!capacity.sufficient) {
                 capacityError = "budget-capacity";
                 const previous = state.snapshot();

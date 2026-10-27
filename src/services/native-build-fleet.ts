@@ -35,7 +35,7 @@ import {
 const fixedCode = (code: string | undefined) =>
   code !== undefined && /^[a-z][a-z0-9-]{0,63}$/u.test(code) ? code : undefined;
 /** Shared authority and operation boundary for browser controls and per-run tools.
- * Deliberately not assembled in the conductor until slice 8. */
+ * Registry mode assembles one shared instance for browser and per-run tools. */
 export class NativeBuildFleet extends Context.Service<NativeBuildFleet>()(
   "NativeBuildFleet",
   {

@@ -551,6 +551,13 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       );
     });
     return {
+      needsRefresh: (id: string, generationId: string) => {
+        const current = entries.get(id);
+        if (current?.identity?.generation.id === generationId) {
+          current.error = "needs-refresh";
+          current.retryAt = 0;
+        }
+      },
       // Private control-plane access. HTTP and tools must project sanitized fields.
       current: (id: string) => {
         const current = entries.get(id);

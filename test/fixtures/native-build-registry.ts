@@ -39,12 +39,13 @@ if(args.length!==4 || args[0]!=="-F" || args[2]!=="partitura-native" || !args[1]
 const config=readFileSync(args[1],"utf8");
 appendFileSync(join(root,"trace.jsonl"),JSON.stringify({command,args,env:process.env,hostname:config.match(/HostName (.+)/)[1]})+"\\n");
 const epochFile=join(root,"epoch");
-const hostId=plan.hostId;
+const hostId=plan.hosts?.[config.match(/HostName (.+)/)[1]]??plan.hostId;
 let epoch=plan.epoch??(existsSync(epochFile)?readFileSync(epochFile,"utf8"):"a".repeat(32));
 const emit=(kind,fields={})=>console.log(JSON.stringify({protocolVersion:2,hostId,kind,...fields}));
 if(plan.unavailable) process.exit(255);
 if(parts[0]==="health") {emit("health",{brokerRevision:"b".repeat(64),capabilities:["health","status","reconcile","run-v2"],profile:"registry-only",epoch,status:plan.healthBusy?"busy":"ready",accepting:!plan.healthBusy,capacity:plan.healthBusy?0:1,reasons:plan.healthBusy?["runner-active"]:[],jobRootFreeBytes:1e12,tartRootFreeBytes:1e12,hostFloorBytes:53687091200});}
 else if(parts[0]==="run-v2") {
+ if(plan.runBarrier) {writeFileSync(join(root,"run-entered"),"yes");while(!existsSync(plan.runBarrier)) await Bun.sleep(5);}
  const identity={job:parts[1],commit:parts[2],action:parts[4],attempt:parts[8]};
  if(plan.busyRefusal || plan.refusal) {emit("refused",{...identity,accepted:false,code:plan.refusal??"host-busy"});process.exit(1);}
  const input=Buffer.from(await new Response(Bun.stdin.stream()).arrayBuffer());

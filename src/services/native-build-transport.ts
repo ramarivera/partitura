@@ -72,6 +72,9 @@ export const createNativeBuildTransport = Effect.fn(
 )(function* (state: NativeBuildState, options: NativeTransportOptions) {
   const files = yield* NativeBuildFiles;
   const processes = yield* NativeBuildProcesses;
+  const authentication = new Set<
+    (builder: string, generation: string) => void
+  >();
   const materialized = new Set<string>();
   const missing = new Set<string>();
   const failed = new Set<string>();
@@ -367,8 +370,11 @@ export const createNativeBuildTransport = Effect.fn(
               Buffer.concat(diagnostic).toString(),
               truncated,
             );
-            if (reason === "needs-refresh")
+            if (reason === "needs-refresh") {
               options.needsRefresh?.(generation.builderId);
+              for (const notify of authentication)
+                notify(generation.builderId, generation.id);
+            }
             return yield* Effect.fail(
               NativeTransportError.new(reason, exited.error),
             );
@@ -417,6 +423,14 @@ export const createNativeBuildTransport = Effect.fn(
     return value;
   });
   return {
+    observeAuthentication: (
+      notify: (builder: string, generation: string) => void,
+    ) => {
+      authentication.add(notify);
+      return () => {
+        authentication.delete(notify);
+      };
+    },
     materialize,
     restore: Effect.fn("NativeBuildTransport.restore")(function* (
       source: string,

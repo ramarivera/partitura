@@ -19,11 +19,17 @@ import {
   deliverNativeArtifact,
 } from "./native-build-client.js";
 import type { NativeBuildFleet } from "./native-build-fleet.js";
+import type { NativeBuildJobs } from "./native-build-jobs.js";
 import {
   callNativeRefresh,
   nativeBuildRefreshTool,
   nativeRefreshAdvertised,
 } from "./native-build-refresh-tool.js";
+import { callRegistryNativeTool } from "./native-build-tool.js";
+import {
+  legacyNativeBuildTools,
+  registryNativeBuildTools,
+} from "./native-build-tool-definitions.js";
 import type {
   RpcHostToolCall,
   RpcHostToolDefinition,
@@ -45,6 +51,7 @@ export const makeLinearHostToolsForRun = ({
   config,
   owner,
   nativeFleet,
+  nativeJobs,
   withSessionMutationGate,
   runRepo,
   workspaceRepo,
@@ -59,6 +66,7 @@ export const makeLinearHostToolsForRun = ({
 }: {
   owner: string;
   nativeFleet?: NativeBuildFleet["Service"];
+  nativeJobs?: NativeBuildJobs["Service"];
   deviceBackup: ReturnType<typeof makeT3DeviceBackup> | undefined;
   config: GatewayConfig["Service"];
   withSessionMutationGate: <A, E, R>(
@@ -163,80 +171,11 @@ export const makeLinearHostToolsForRun = ({
       config.t3DeviceBackup?.organizationHosts[run.organizationId] === undefined
         ? []
         : [t3DeviceBackupTool]),
-      ...(config.nativeBuild === undefined
-        ? []
-        : ([
-            {
-              name: "native_build_start",
-              label: "Native build: start",
-              description:
-                "Run the repository's .partitura/native-build.sh action in an isolated macOS VM for this commit and pull request. Select primary or the separately configured backup builder explicitly. No automatic failover. Use the same builder for later status, artifact and cancel calls.",
-              parameters: {
-                type: "object",
-                additionalProperties: false,
-                required: ["commit", "pullRequest", "action"],
-                properties: {
-                  builder: { type: "string", enum: ["primary", "backup"] },
-                  commit: {
-                    type: "string",
-                    pattern: "^[a-f0-9]{40}$",
-                  },
-                  pullRequest: {
-                    type: "integer",
-                    minimum: 1,
-                    maximum: 99999999,
-                  },
-                  action: {
-                    type: "string",
-                    pattern: "^[a-z][a-z0-9-]{0,63}$",
-                  },
-                },
-              },
-            },
-            {
-              name: "native_build_status",
-              label: "Native build: status",
-              description: "Read a native build job owned by this session.",
-              parameters: {
-                type: "object",
-                additionalProperties: false,
-                required: ["job"],
-                properties: {
-                  builder: { type: "string", enum: ["primary", "backup"] },
-                  job: { type: "string", pattern: "^[a-f0-9]{32}$" },
-                },
-              },
-            },
-            {
-              name: "native_build_artifact",
-              label: "Native build: deliver artifact",
-              description:
-                "Copy a verified native build archive into this session workspace. After a workflow-failed job, the archive holds the repository build log (build.log, last 1 MiB) and guest runner stderr (runner.log).",
-              parameters: {
-                type: "object",
-                additionalProperties: false,
-                required: ["job"],
-                properties: {
-                  builder: { type: "string", enum: ["primary", "backup"] },
-                  job: { type: "string", pattern: "^[a-f0-9]{32}$" },
-                },
-              },
-            },
-            {
-              name: "native_build_cancel",
-              label: "Native build: cancel",
-              description: "Cancel a native build job owned by this session.",
-              parameters: {
-                type: "object",
-                additionalProperties: false,
-                required: ["job"],
-                properties: {
-                  builder: { type: "string", enum: ["primary", "backup"] },
-                  job: { type: "string", pattern: "^[a-f0-9]{32}$" },
-                },
-              },
-            },
-          ] satisfies ReadonlyArray<RpcHostToolDefinition>)),
+      ...(config.nativeBuildRegistry?.registryFile
+        ? registryNativeBuildTools
+        : config.nativeBuild === undefined
+          ? []
+          : legacyNativeBuildTools),
     ];
 
     const handler = (request: RpcHostToolCall) =>
@@ -355,6 +294,25 @@ export const makeLinearHostToolsForRun = ({
             ),
           );
         }
+        if (
+          request.toolName.startsWith("native_build_") &&
+          config.nativeBuildRegistry?.registryFile
+        )
+          return yield* callRegistryNativeTool(
+            {
+              config,
+              owner,
+              jobs: nativeJobs,
+              runRepo,
+              withSessionMutationGate,
+              repositoryAgeIdentity,
+              sandboxed: sandboxHandles.has(run.sessionId),
+              workspacePath,
+              workerUid,
+            },
+            run,
+            request,
+          );
         if (request.toolName.startsWith("native_build_")) {
           if (config.nativeBuild === undefined)
             return fail("Native build tools are disabled");

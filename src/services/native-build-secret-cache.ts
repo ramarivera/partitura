@@ -81,28 +81,37 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
       const supersession = makeNativeSecretSupersession(journal, now);
       let cycleRecorded = false;
       // A crash after dispatch is ambiguous and already charged. Only startup may retry.
-      yield* journal.transaction((data, at) => {
-        for (const operation of data.operations)
-          for (const work of operation.sources)
-            if (work.status === "running") {
-              work.status =
-                operation.kind === "startup" &&
-                work.attempts < 8 &&
-                work.deadline > at
-                  ? "pending"
-                  : "failed";
-              work.code = "provider-unavailable";
-              work.nextFit = Math.max(at, data.cooldowns[work.source] ?? 0);
-              if (operation.kind === "startup" && work.status === "failed")
-                data.startupStops[sourceKey(work)] = {
-                  code: work.code,
-                  createdAt: work.createdAt,
-                  deadline: work.deadline,
-                  attempts: work.attempts,
-                  nextFit: work.nextFit,
-                };
-            }
-      }, now());
+      yield* journal
+        .transaction((data, at) => {
+          for (const operation of data.operations)
+            for (const work of operation.sources)
+              if (work.status === "running") {
+                work.status =
+                  operation.kind === "startup" &&
+                  work.attempts < 8 &&
+                  work.deadline > at
+                    ? "pending"
+                    : "failed";
+                work.code = "provider-unavailable";
+                work.nextFit = Math.max(at, data.cooldowns[work.source] ?? 0);
+                if (operation.kind === "startup" && work.status === "failed")
+                  data.startupStops[sourceKey(work)] = {
+                    code: work.code,
+                    createdAt: work.createdAt,
+                    deadline: work.deadline,
+                    attempts: work.attempts,
+                    nextFit: work.nextFit,
+                  };
+              }
+        }, now())
+        .pipe(
+          Effect.catch((error) =>
+            Effect.logWarning(
+              "Native provider journal unavailable at startup",
+              { code: error.code },
+            ),
+          ),
+        );
       const progress = (id: string) => {
         const snapshot = journal.snapshot();
         const operation = snapshot.operations.find((item) => item.id === id);

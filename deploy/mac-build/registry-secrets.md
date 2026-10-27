@@ -1,9 +1,9 @@
 # Registry credential provider and operator tools
 
-Slice 6 supplies the isolated provider and its internal operation service. The
-conductor doesn't assemble it, production starts still use the legacy clients,
-and no fleet item has been read or written to qualify this implementation.
-Fleet HTTP/UI and agent controls belong to slice 7; assembly belongs to slice 8.
+The conductor assembles the isolated provider and operation service in registry
+mode only. Legacy mode keeps its original clients and starts no SDK helper.
+No fleet item has been read or written to qualify this implementation. See
+[the cutover and rollback runbook](registry-cutover.md) before enabling registry mode.
 
 ## Qualification and packaging
 

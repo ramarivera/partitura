@@ -409,3 +409,38 @@ Save the script, image digest, build log and JSON receipt under
 `~/dev/agentic-scratchpads/ohmypi-symphony/uid-isolation/`. Use dummy credentials
 only. Unit tests cover allocation and filesystem syscall contracts; the real
 Docker probe establishes the uid access boundary without running a model turn.
+
+## Native builder registry boundary
+
+`NATIVE_BUILD_REGISTRY_FILE` is a static admission-mode switch. Unset preserves
+legacy primary/backup behavior without registry mounts, native state ownership or
+an SDK helper. Set enables the registry boundary even if desired contents fail
+validation; failure never activates legacy fallback. The shared native owner
+validates metadata and rebuilds local accounting/quarantines before tool and HTTP
+consumers are constructed. Remote health, provider resolution and recovery run in
+scoped fibers, so invalid registry contents or offline Macs do not block Linear
+ingress. Corrupt native ownership fails startup rather than discarding obligations.
+
+Registry tools enforce live durable run org/session/lease and cancellation gates.
+Starts admit once and serialize the durable submitting transition with registry
+publication. No post-admission retry, hidden Mac fallback or build-triggered secret
+read exists. Status/artifact/cancel resolve the original immutable owned generation;
+optional builder asserts its binding. Ordinary workers get logical IDs and coarse
+availability plus their own receipts. Gateway-admin fleet details/actions retain
+the browser session, org grant, Origin and CSRF checks described in
+[registry-controls.md](../deploy/mac-build/registry-controls.md).
+
+Keep registry state, bulk scratch, tmpfs credentials, file records and both legacy
+roots disjoint from worker roots. Gateway-only directories are 0700; secret mounts
+are never worker mounts. Artifact bytes follow the existing worker UID delivery
+path and are never extracted by the gateway. Live 1Password stays disabled until
+separate dummy-vault and request-cost qualification. Missing provider accounting
+closes provider dispatch without minting a fresh allowance. A restart holds
+persisted non-retained operations until valid desired state revalidates their exact
+builder/source/revision; retained recovery refreshes reattach completion handling.
+
+The [cutover and rollback runbook](../deploy/mac-build/registry-cutover.md) separates
+code acceptance from approved mounts/image deployment, provider provisioning,
+legacy drain/import, each sealed host-profile change and smoke build. No merge
+authorizes those operations. Preserve original legacy records for deliberate
+rollback; never feed registry metadata to an older decoder or run two state owners.

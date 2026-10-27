@@ -1,9 +1,9 @@
 # Registry fleet controls
 
-Slice 7 adds the control-plane service and its browser and per-run adapters.
-Production does not assemble `NativeBuildFleet` yet. Until the slice 8 assembly,
-authorized fleet requests return `503 fleet-disabled`, refresh isn't advertised
-to workers, and both legacy build clients keep their existing routing.
+Registry mode assembles the shared fleet service and its browser/per-run adapters.
+Legacy mode omits it: authorized fleet requests return `503 fleet-disabled`, refresh
+isn't advertised to workers, and both legacy clients keep their original routing.
+See [the cutover and rollback runbook](registry-cutover.md) before enabling it.
 
 ## Browser administration
 
@@ -79,12 +79,11 @@ lists. Metadata bounds are 512 recent audits and 256 maintenance/retired-host
 entries; retired host IDs are never evicted to make room. Capacity exhaustion
 refuses the action.
 
-## Assembly and approval still required
+## Assembly and deployment approval
 
-Slice 8 must provide one shared registry, state, transport, provider journal and
-cache to the fleet service, admin and session authority. Periodic cached-health
-scheduling and production registry build selection belong to that assembly.
-Legacy-only startup must continue to omit these layers.
+Slice 8 provides one shared registry, state, transport, provider journal and cache
+to the fleet service, admin and session authority. Cached admission health skips
+reserved hosts and reads no provider items. Legacy startup omits these layers.
 
 Saved generation metadata on main has a source binding but no secret revision.
 A retained source absent from desired state uses revision 0 for its explicit

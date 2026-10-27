@@ -35,6 +35,7 @@ import { GitHubApp } from "./github-app.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { McpOAuth, removeMcpAgentDb } from "./mcp-oauth.js";
 import { NativeBuildFleet } from "./native-build-fleet.js";
+import { NativeBuildJobs } from "./native-build-jobs.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import type { RpcEvent, RpcWorkerHandle } from "./rpc-worker.js";
@@ -187,7 +188,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         openSandboxRelay,
         provisionSandbox,
         destroySandbox,
-        cancelSessionNativeBuilds,
+        cancelSessionNativeBuilds: cancelLegacyNativeBuilds,
       } = makeWorkerResources({
         config,
         sandboxMode,
@@ -195,6 +196,23 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         sandboxRelays,
         stopSandboxRelays,
       });
+      const nativeJobs = yield* Effect.serviceOption(NativeBuildJobs);
+      const cancelSessionNativeBuilds = (sessionId: SessionId) =>
+        Effect.gen(function* () {
+          if (Option.isSome(nativeJobs)) {
+            const run = yield* runRepo.get(sessionId);
+            if (Option.isSome(run))
+              yield* nativeJobs.value.cancelSession(
+                run.value.organizationId,
+                sessionId,
+              );
+          } else if (!config.nativeBuildRegistry?.registryFile)
+            yield* cancelLegacyNativeBuilds(sessionId);
+        }).pipe(
+          Effect.catch(() =>
+            Effect.logWarning("Native session cancellation unavailable"),
+          ),
+        );
       const mcpOAuth = yield* McpOAuth;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
       const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
@@ -464,6 +482,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const nativeFleet = yield* Effect.serviceOption(NativeBuildFleet);
       const linearHostToolsForRun = makeLinearHostToolsForRun({
         owner,
+        ...(Option.isSome(nativeJobs) ? { nativeJobs: nativeJobs.value } : {}),
         ...(Option.isSome(nativeFleet)
           ? { nativeFleet: nativeFleet.value }
           : {}),
