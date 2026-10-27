@@ -18,6 +18,7 @@ it.live("broker maintenance diagnostics decode and keep recovery blocked", () =>
         "runner-owner-missing",
         "runner-owner-unavailable",
         "runner-owner-alive",
+        "runner-owner-ambiguous",
         "keychain-relock-pending",
         "cleanup-required",
       ]) {

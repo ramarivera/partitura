@@ -71,7 +71,7 @@ def record_housekeeping(root, category, skipped):
         print(f'housekeeping-{category}-skipped: {skipped}', file=sys.stderr)
 
 
-def prune_artifacts(root, now=None):
+def prune_artifacts(root, now=None, protected_jobs=()):
     """Caller holds runner.lock. Keep receipts and reserve space for the next job."""
     cutoff = (time.time() if now is None else now) - api.ARTIFACT_RETENTION_SECONDS
     candidates = []
@@ -80,7 +80,7 @@ def prune_artifacts(root, now=None):
     for directory in root.iterdir():
         if time.monotonic() >= deadline:
             break  # Retain unvisited entries; disk checks still apply.
-        if not re.fullmatch(api.JOB, directory.name) or directory.is_symlink() or not directory.is_dir():
+        if directory.name in protected_jobs or not re.fullmatch(api.JOB, directory.name) or directory.is_symlink() or not directory.is_dir():
             continue
         try:
             api.private_directory(directory)

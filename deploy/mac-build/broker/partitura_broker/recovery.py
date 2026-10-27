@@ -305,7 +305,7 @@ def history_gc_due(root):
     return value['nextAt'] <= now or value['nextAt'] > now + 86400
 
 
-def prune_history(config):
+def prune_history(config, protected_jobs=()):
     """Bounded registry history GC. Expiry fences delayed submission commands.
 
     Legacy commands have no epoch or expiry: their anti-replay receipts and
@@ -316,6 +316,7 @@ def prune_history(config):
     skipped = 0
     if config.get('profile') == 'registry-only':
         protected, _ = api.obligations(config)
+        protected |= set(protected_jobs)
         cutoff = time.time() - api.HISTORY_RETENTION_SECONDS
         deadline = time.monotonic() + api.HISTORY_PASS_SECONDS
         for path in root.iterdir():
@@ -359,6 +360,23 @@ def prune_history(config):
     api.durable_write(root / 'history-gc.json', json.dumps(dict(nextAt=time.time() + (60 if len(expired) == 64 else 86400))) + '\n')
 
 
+def resource_jobs(config, jobs, runner):
+    """Under runner.lock, distinguish inert input debris from execution resources."""
+    root = Path(config['root'])
+    live = {job for name in api.FENCES if (job := api.fence_job(root / name))}
+    recovery = api.json_state(root / 'recovery.json')
+    if recovery:
+        live.update(recovery['jobs'])  # obligations() already validated this record.
+    if runner and runner['stage'] not in ('receiving', 'capacity'):
+        live.add(runner['job'])
+    for job in jobs:
+        kind, receipt = api.registry_status(config, job)
+        _, unlock = api.inspect_job_directory(root / job)
+        if unlock or (kind == 'known' and receipt['state'] == 'running') or api.verify_owned_clone(config, job):
+            live.add(job)
+    return live
+
+
 def local_maintenance(config):
     deadline = time.monotonic() + 120
     root = Path(config['root'])
@@ -372,21 +390,22 @@ def local_maintenance(config):
     inventory |= api.read_state(root / 'inventory-required') is not None
     if previous and time.time() < previous['nextAt']:
         return 0  # A scheduled backoff wait completed normally.
-    if api.fence_job(root / 'keychain-relock-pending') and not api.daemon_relock_qualified(config):
-        api.durable_write(root / 'maintenance-reason', 'keychain-relock-pending\n')
-        return 0  # Only SSH or a newly qualified daemon can finish this step.
     gc_due = api.history_gc_due(root)
     if not inventory and not jobs and not gc_due:
-        api.durable_remove(root / 'maintenance-reason')
-        return 0
+        if api.read_state(root / 'maintenance-reason') is None:
+            return 0
     with api.run_lock(config, 0) as acquired:
         if not acquired:
             return 0  # A live owner is responsible for its own obligations.
-        jobs, runner = api.obligations(config)
-        reason = api.owner_block_reason(runner, boot)
-        if reason:
-            api.durable_write(root / 'maintenance-reason', reason + '\n')
+        # SSH reconciliation may have completed while we were acquiring the lock.
+        previous, inventory = api.maintenance_state(root, boot)
+        inventory |= api.read_state(root / 'inventory-required') is not None
+        if api.read_state(root / 'maintenance-blocked') is not None:
             return 0
+        if api.fence_job(root / 'keychain-relock-pending') and not api.daemon_relock_qualified(config):
+            api.durable_write(root / 'maintenance-reason', 'keychain-relock-pending\n')
+            return 0  # Only SSH or a newly qualified daemon can finish this step.
+        jobs, runner = api.obligations(config)
         complete = not inventory
         reason = None
         try:
@@ -397,12 +416,29 @@ def local_maintenance(config):
                     complete = True
                 except api.InventoryPending as pending:
                     jobs |= pending.jobs
-            # The automatic route needs birth evidence for every cleanup job.
-            # Older markerless debris remains recoverable by explicit reconcile.
-            if jobs and (runner is None or jobs != {runner['job']}):
+            # Only execution resources need owner proof. A receipt-less empty
+            # directory or partial input cannot be in use with runner.lock free.
+            live = resource_jobs(config, jobs, runner)
+            if live and runner is not None and live - {runner['job']}:
+                reason = 'runner-owner-ambiguous'
+            elif live and runner is None:
+                reason = 'runner-owner-missing'
+            elif live:
+                reason = api.owner_block_reason(runner, boot)
+            if reason:
                 api.durable_write(root / 'inventory-required', 'inventory-pending\n')
-                api.durable_write(root / 'maintenance-reason', 'runner-owner-missing\n')
-                api.record_maintenance(root, boot, inventory_complete=False)
+                api.durable_write(root / 'maintenance-reason', reason + '\n')
+                failures = min(16, (previous or {}).get('failures', 0) + 1)
+                api.record_maintenance(root, boot, failures, inventory_complete=False)
+                # Retention can proceed for unrelated terminal history. Protect
+                # every discovered job. An incomplete scan cannot establish the
+                # full protected set, so leave retention for a completed scan.
+                if complete and gc_due and deadline - time.monotonic() >= api.HISTORY_PASS_SECONDS * 2:
+                    try:
+                        api.prune_artifacts(root, protected_jobs=jobs)
+                        api.prune_history(config, protected_jobs=jobs)
+                    except (OSError, ValueError):
+                        print('housekeeping-pass-failed', file=sys.stderr)
                 return 0
             result, _ = api.reconcile_locked(config, jobs, daemon=True, deadline=deadline) if jobs else ('idle', [])
             if complete:

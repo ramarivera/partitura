@@ -5,6 +5,12 @@ from partitura_broker.state import process_start as real_process_start
 
 
 class MaintenanceTrialTests(RegistryFixture, unittest.TestCase):
+    def retry_maintenance(self):
+        state = broker.json_state(self.root / 'maintenance.json')
+        now = max(time.time(), state['nextAt'] + 1) if state else time.time()
+        with patch.object(broker.time, 'time', return_value=now):
+            return self.maintenance()
+
     def crashed_job(self):
         directory = self.root / self.job
         directory.mkdir()
@@ -84,7 +90,7 @@ class MaintenanceTrialTests(RegistryFixture, unittest.TestCase):
         self.assertIn('runner-owner-alive', self.wire('health')[1]['reasons'])
         self.assertFalse((self.root / 'trace').exists())
         with patch.object(broker, 'process_start', return_value='Mon Oct 26 12:00:00 2026'):
-            self.assertEqual(self.maintenance(), 0)
+            self.assertEqual(self.retry_maintenance(), 0)
         self.assertFalse(clone.exists())
         self.assertIn('keychain-relock-pending', self.wire('health')[1]['reasons'])
 
@@ -93,12 +99,12 @@ class MaintenanceTrialTests(RegistryFixture, unittest.TestCase):
         marker = json.loads((self.root / 'runner.json').read_text())
         for failure in (ValueError('ps unavailable'), OSError('ps unavailable')):
             with patch.object(broker, 'process_start', side_effect=failure):
-                self.assertEqual(self.maintenance(), 0)
+                self.assertEqual(self.retry_maintenance(), 0)
             self.assertIn('runner-owner-unavailable', self.wire('health')[1]['reasons'])
             self.assertTrue(clone.exists())
         del marker['owner']
         broker.durable_write(self.root / 'runner.json', json.dumps(marker) + '\n')
-        self.assertEqual(self.maintenance(), 0)
+        self.assertEqual(self.retry_maintenance(), 0)
         self.assertIn('runner-owner-missing', self.wire('health')[1]['reasons'])
         self.assertTrue(clone.exists())
         self.assertFalse((self.root / 'trace').exists())
@@ -119,11 +125,11 @@ class MaintenanceTrialTests(RegistryFixture, unittest.TestCase):
         for owner in ({'pid': 12345}, 'invalid', dict(pid=True, start='x', boot='previous-boot'), dict(pid=12345, start='x', boot='fixture-boot')):
             marker['owner'] = owner
             broker.durable_write(self.root / 'runner.json', json.dumps(marker) + '\n')
-            self.assertEqual(self.maintenance(), 0)
+            self.assertEqual(self.retry_maintenance(), 0)
             self.assertIn('runner-owner-unavailable', self.wire('health')[1]['reasons'])
             self.assertTrue(clone.exists())
         (self.root / 'runner.json').unlink()
-        self.assertEqual(self.maintenance(), 0)
+        self.assertEqual(self.retry_maintenance(), 0)
         self.assertIn('runner-owner-missing', self.wire('health')[1]['reasons'])
         self.assertTrue(clone.exists())
         self.assertFalse((self.root / 'trace').exists())
