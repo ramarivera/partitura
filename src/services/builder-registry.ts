@@ -23,10 +23,7 @@ import { BuilderSecretProvider } from "./builder-secret-provider.js";
 import { BuilderRegistryConfig } from "./config-native-build.js";
 import { NativeBuildSecretCache } from "./native-build-secret-cache.js";
 import { neededNativeSources } from "./native-build-source-inventory.js";
-import {
-  NativeBuildStateService,
-  unresolvedRecovery,
-} from "./native-build-state.js";
+import { NativeBuildStateService } from "./native-build-state.js";
 import { NativeBuildTransport } from "./native-build-transport.js";
 
 export * from "./builder-registry-schema.js";
@@ -162,30 +159,12 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
             const blocked = new Set<string>();
             if (Option.isSome(secretCache)) {
-              const needed = snapshot.builders
-                .filter((entry) => entry.enabled)
-                .map((entry) => ({
-                  source: sourceReference(entry.secretSource),
-                  revision: entry.secretRevision,
-                  builderId: entry.id,
-                  retained: false,
-                }));
-              if (Option.isSome(nativeState)) {
-                const saved = nativeState.value.snapshot();
-                for (const job of saved.jobs.filter(unresolvedRecovery)) {
-                  const generation = saved.generations.find(
-                    (generation) => generation.id === job.generationId,
-                  );
-                  if (generation)
-                    needed.push({
-                      source: generation.transport.source,
-                      revision: 0,
-                      builderId: job.builderId,
-                      retained: true,
-                    });
-                }
-              }
-              const capacity = yield* secretCache.value.capacity(needed);
+              const capacity = yield* secretCache.value.capacity(
+                neededNativeSources(
+                  snapshot,
+                  Option.getOrUndefined(nativeState),
+                ),
+              );
               if (!capacity.sufficient) {
                 capacityError = "budget-capacity";
                 const previous = state.snapshot();

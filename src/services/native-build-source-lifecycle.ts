@@ -24,7 +24,8 @@ export const retainedStartup = Effect.gen(function* () {
   const sweep = Effect.fn("NativeBuildSources.sweep")(function* () {
     const view = registry.snapshot();
     if (!view.desired || view.error) return;
-    yield* cache.retainNeeded(neededNativeSources(view.desired, state));
+    const inventory = neededNativeSources(view.desired, state);
+    yield* cache.retainNeeded(inventory);
     const enabled = new Set(
       view.desired.builders
         .filter(
@@ -35,24 +36,10 @@ export const retainedStartup = Effect.gen(function* () {
         )
         .map((entry) => sourceReference(entry.secretSource)),
     );
-    const sources = new Map<
-      string,
-      { source: string; builderId: string; revision: number; retained: boolean }
-    >();
     const snapshot = state.snapshot();
-    for (const job of snapshot.jobs.filter(unresolvedRecovery)) {
-      const generation = snapshot.generations.find(
-        (entry) => entry.id === job.generationId,
-      );
-      if (generation && !enabled.has(generation.transport.source))
-        sources.set(generation.transport.source, {
-          source: generation.transport.source,
-          builderId: job.builderId,
-          revision: 0,
-          retained: true,
-        });
-    }
-    for (const source of sources.values()) {
+    for (const source of inventory.filter(
+      (source) => source.retained && !enabled.has(source.source),
+    )) {
       const key = `${source.source}:${snapshot.jobs
         .filter(unresolvedRecovery)
         .filter(

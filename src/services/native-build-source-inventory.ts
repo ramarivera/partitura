@@ -8,7 +8,9 @@ import {
   unresolvedRecovery,
 } from "./native-build-state.js";
 
-/** Full desired + unresolved recovery inventory. Never call with an invalid desired snapshot. */
+/** Full desired + unresolved recovery inventory. Never call with an invalid desired snapshot.
+ * Retained sources share an enabled entry's revision, or use revision 0 when none covers them.
+ * Disabled entries never select a recovery revision, even when their source still matches. */
 export const neededNativeSources = (
   desired: BuilderRegistrySnapshot,
   state?: NativeBuildState,
@@ -29,6 +31,7 @@ export const neededNativeSources = (
     if (!generation) continue;
     const current = desired.builders.find(
       (entry) =>
+        entry.enabled &&
         sourceReference(entry.secretSource) === generation.transport.source,
     );
     sources.push({

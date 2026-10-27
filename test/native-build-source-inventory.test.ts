@@ -62,6 +62,9 @@ it.live(
         });
         yield* testAwait(writeFile(f.settings.registryFile ?? "", "{invalid"));
         yield* live.registry.reload();
+        // Exercise the periodic sweep, not just the invalid reload path.
+        yield* Effect.sleep(1100);
+        expect(live.registry.snapshot().error).toBeDefined();
         expect(Object.keys(live.journal.snapshot().successes)).toHaveLength(
           320,
         );

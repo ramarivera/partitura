@@ -23,6 +23,7 @@ import {
   hour,
   type SecretSource,
 } from "./native-build-secret-models.js";
+import { neededNativeSources } from "./native-build-source-inventory.js";
 import {
   NativeBuildStateService,
   unresolvedRecovery,
@@ -86,36 +87,25 @@ export class NativeBuildFleet extends Context.Service<NativeBuildFleet>()(
           );
       });
       const inventory = (all: boolean, id?: string): SecretSource[] => {
-        const desired = registry.snapshot().desired?.builders ?? [];
-        const selected: SecretSource[] = desired
-          .filter((entry) => (all ? entry.enabled : entry.id === id))
-          .map((entry) => ({
-            builderId: entry.id,
-            revision: entry.secretRevision,
-            source: sourceReference(entry.secretSource),
-            retained: false,
-          }));
-        if (all)
-          for (const job of state.snapshot().jobs.filter(unresolvedRecovery)) {
-            const generation = state
-              .snapshot()
-              .generations.find(
-                (generation) => generation.id === job.generationId,
-              );
-            if (!generation) continue;
-            const entry = desired.find(
-              (entry) =>
-                entry.id === job.builderId &&
-                sourceReference(entry.secretSource) ===
-                  generation.transport.source,
-            );
-            selected.push({
-              builderId: job.builderId,
-              revision: entry?.secretRevision ?? 0,
-              source: generation.transport.source,
-              retained: true,
-            });
-          }
+        const desired = registry.snapshot().desired;
+        const selected: SecretSource[] = all
+          ? neededNativeSources(
+              desired ?? {
+                version: 1,
+                defaultBuilder: null,
+                selection: { fallback: "none", fallbackBuilders: [] },
+                builders: [],
+              },
+              state,
+            )
+          : (desired?.builders ?? [])
+              .filter((entry) => entry.id === id)
+              .map((entry) => ({
+                builderId: entry.id,
+                revision: entry.secretRevision,
+                source: sourceReference(entry.secretSource),
+                retained: false,
+              }));
         const distinct = new Map<string, SecretSource>();
         for (const source of selected)
           if (!distinct.has(source.source)) distinct.set(source.source, source);
