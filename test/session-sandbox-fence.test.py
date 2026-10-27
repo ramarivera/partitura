@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-SOURCE = Path(__file__).resolve().parents[1] / "deploy/session-sandbox/broker.py"
-sys.path.insert(0, str(SOURCE.parent))
+SANDBOX_DIR = Path(__file__).resolve().parents[1] / "deploy/session-sandbox"
+sys.path.insert(0, str(SANDBOX_DIR))
 from sandbox_broker import core as broker
 
 
@@ -118,7 +118,7 @@ class DockerMutationFenceTests(unittest.TestCase):
                 self.assertEqual(stops, [])
                 # Reload the actual broker code to prove ownership is on disk,
                 # independent of the original request/module's memory.
-                fresh_spec = importlib.util.spec_from_file_location("sandbox_broker.restarted_core", SOURCE.parent / "sandbox_broker/core.py")
+                fresh_spec = importlib.util.spec_from_file_location("sandbox_broker.restarted_core", SANDBOX_DIR / "sandbox_broker/core.py")
                 fresh = importlib.util.module_from_spec(fresh_spec)
                 fresh_spec.loader.exec_module(fresh)
                 with patch.object(fresh, "_settle_docker_operation", side_effect=lambda session, timeout=60: real_settle(session, timeout=0)), patch.object(fresh, "_workspace", return_value=Path("/host/session")):

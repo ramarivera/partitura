@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-SOURCE = Path(__file__).resolve().parents[1] / "deploy/session-sandbox/broker.py"
-sys.path.insert(0, str(SOURCE.parent))
+SANDBOX_DIR = Path(__file__).resolve().parents[1] / "deploy/session-sandbox"
+sys.path.insert(0, str(SANDBOX_DIR))
 from sandbox_broker import core as broker
 
 

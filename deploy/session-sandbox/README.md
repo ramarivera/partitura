@@ -19,6 +19,14 @@ install -m 0644 deploy/session-sandbox/firecracker.py /opt/partitura-sandbox/fir
 The build uses sorted zip entries with fixed timestamps and permissions. It
 doesn't include Python bytecode or require packages outside the standard library.
 
+There is deliberately no `deploy/session-sandbox/broker.py` source shim, an
+exception to the file-size rule's "keep the original module path" clause. An
+installer that copies only that path would install a shim without the
+`sandbox_broker/` package beside it, and every request would then fail at
+import time. Without the file, such an installer fails while staging instead.
+Installers must build the broker with `build-broker.py` from the pinned commit
+and pin the built file's SHA-256.
+
 ## Firecracker guest
 
 The generic x86_64 Linux guest starts from the digest-pinned worker image built
