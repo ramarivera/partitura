@@ -289,6 +289,14 @@ export function decodeBrokerEnvelope(
       ["disk-preflight", "disk-post-transfer"].includes(String(value.stage))
     )
       invalid();
+    // Persisted as Text (1-256 chars); reject before it reaches storage.
+    if (
+      value.failureCode !== undefined &&
+      (typeof value.failureCode !== "string" ||
+        value.failureCode.length < 1 ||
+        value.failureCode.length > 256)
+    )
+      invalid();
   }
   if (
     value.kind === "unknown-job" &&

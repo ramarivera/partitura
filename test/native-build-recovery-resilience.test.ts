@@ -7,6 +7,7 @@ import {
   NativeOperationError,
   nativeIO,
 } from "../src/services/native-build-errors.js";
+import { decodeBrokerEnvelope } from "../src/services/native-build-protocol.js";
 import {
   createNativeBuildRecovery,
   recoverNativeMetadata,
@@ -393,4 +394,50 @@ it.live(
         expect(current.recovery.returnEligible).toBe(true);
       }),
     ),
+);
+
+it.live("a fractional broker heartbeat keeps the busy schedule", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fixture = yield* registryFixture(path("fractional-heartbeat"));
+      const time = 1_000_000;
+      const job = registryJob(fixture.generation, {
+        state: "submitting",
+        submissionExpiresAt: 1,
+      });
+      yield* fixture.state.transaction((draft) => {
+        draft.jobs.push(job);
+      });
+      yield* recoverNativeMetadata(fixture.state, time);
+      // broker.py reports time.time(), a float of epoch seconds.
+      const broker = memoryBroker(() => time + 0.4567);
+      broker.settings.busy = true;
+      yield* createNativeBuildRecovery(fixture.state, broker.transport, {
+        now: () => time,
+      }).tick(job.jobId);
+      const current = fixture.state.owned("org-a", "session-a", job.jobId);
+      expect(current.recovery.lastReason).toBe("busy");
+      expect(current.recovery.attempts).toBe(0);
+      expect(Number.isInteger(current.recovery.heartbeat)).toBe(true);
+    }),
+  ),
+);
+
+it.live("a known receipt with an unstorable failureCode is rejected", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fixture = yield* registryFixture(path("failure-code"));
+      const job = registryJob(fixture.generation);
+      const known = (failureCode: unknown) =>
+        `${JSON.stringify({ protocolVersion: 2, hostId: fixture.metadata.hostId, kind: "known", job: job.jobId, commit: job.commit, action: job.action, attempt: job.attempt, state: "failed", failureCode })}\n`;
+      expect(
+        decodeBrokerEnvelope(known("workflow-failed"), fixture.generation, job)
+          .failureCode,
+      ).toBe("workflow-failed");
+      for (const failureCode of ["x".repeat(257), "", 7])
+        expect(() =>
+          decodeBrokerEnvelope(known(failureCode), fixture.generation, job),
+        ).toThrow();
+    }),
+  ),
 );

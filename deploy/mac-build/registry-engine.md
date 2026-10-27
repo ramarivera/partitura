@@ -4,8 +4,10 @@ The engine is source-only. Both production legacy slots still use
 `createNativeBuildClient`. Registry loading, provider reads, scheduling and
 conductor/tool assembly belong to later slices. Never expose the engine's
 internal `status` record directly to agent tools. Its host identity, generation,
-epoch, attempt and recovery details need the coarse projection specified in
-section 7 before production wiring.
+epoch, attempt and recovery details need a coarse projection before production
+wiring: ordinary agents see only a logical builder ID with available or
+unavailable, plus their own jobs. Host IDs, source IDs, disk, busy and health
+detail, credential paths and other orgs' jobs require gateway-admin authority.
 
 The modules expose Effect 4 services with named methods and layers. Assembly
 provides `NativeStateConfig`, `NativeTransportConfig` and `NativeEngineConfig`,

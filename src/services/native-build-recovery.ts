@@ -182,7 +182,9 @@ export function createNativeBuildRecovery(
             recovery.heartbeat =
               reconciled.runner?.heartbeat === undefined
                 ? null
-                : reconciled.runner.heartbeat * 1000;
+                : // The broker reports epoch seconds as a float; storage keeps
+                  // integer milliseconds.
+                  Math.floor(reconciled.runner.heartbeat * 1000);
             const fresh =
               recovery.heartbeat !== null &&
               now() - recovery.heartbeat >= 0 &&
