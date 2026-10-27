@@ -364,6 +364,124 @@ until reconciliation. Raw boot logs stay private. `status` can classify a retain
 boot log for an older failed job without changing the stored receipt or booting a
 VM. Installing this diagnostic support doesn't repair host security state.
 
+### Registry protocol, source only
+
+The registry broker code adds the following exact commands. They aren't enabled
+on an installed Mac by this PR. Installation and profile changes require separate
+host rollout approval. The existing primary/backup gateway continues to use
+`run`, `status`, `artifact` and `cancel` with their original response shapes under
+the legacy profile. Disk failures use the compatible diagnostics described above.
+
+```text
+health
+status <job32hex>
+cancel <job32hex>
+reconcile <job32hex>
+run-v2 <job32hex> <commit40hex> <pr> <action> <bundleBytes> <secretBytes> <epoch32hex> <attempt32hex> <expiresUnixSeconds>
+artifact <job32hex>
+```
+
+Commands use single ASCII spaces, with no trailing whitespace, shell quoting or
+evaluation. The maximum command length is 512 characters. PR numbers are positive
+decimal integers of at most eight digits; actions match
+`[a-z][a-z0-9-]{0,63}`. Bundle length is 1 through 1 GiB. `secretBytes` is mandatory
+in `run-v2`, 0 through 65536, and precedes the bundle on stdin. IDs and epoch are
+lowercase hex. Expiry is a positive decimal Unix timestamp in whole seconds,
+strictly after the current time and at most 120 seconds ahead. The broker checks
+it after any lock wait and again before input. Accepted jobs retain their full
+execution timeout. Installed qualification must verify clock skew within thirty
+seconds. Each gateway job has one attempt ID; neither a repeated job nor an
+attempt reused for another job executes again.
+
+The original eleven-key installed configuration remains valid and implies
+legacy mode. The extended sealed configuration adds all four fields together:
+`hostId`, a canonical lowercase UUID; `profile`, either `legacy` or
+`registry-only`; `daemonRelockQualified`, a boolean defaulting to false during
+rollout; and `daemonRelockMacOSBuild`, the qualifying build string or an empty
+string while unqualified. An incomplete extension is invalid. Registry-only mode
+refuses legacy `run`; legacy mode refuses `run-v2`. Health and reconciliation
+require an installed host identity. Legacy status/cancel shapes remain unchanged
+even with an identity installed. The installer in this tree still emits the
+original configuration. It doesn't install these new fields or maintenance.
+
+Registry JSON is a closed, newline-terminated envelope of at most 4096 UTF-8
+bytes, including `protocolVersion: 2`, installed `hostId` and a fixed `kind`.
+Unknown exceptions produce a fixed `broker-state-unavailable` error, never raw
+host exception details. Artifact responses remain opaque bytes. Main kinds are:
+
+| Kind | Fields and meaning |
+| --- | --- |
+| `health` | `brokerRevision`, `capabilities`, `profile`, `epoch`, `status`, `accepting`, `capacity`, disk byte counts and fixed `reasons`. Status is `ready`, `busy` or `blocked`; capacity is 0 or 1. Busy/blocked health exits zero. |
+| `known` | Job identity and receipt fields. State is `receiving`, `running`, `succeeded`, `failed` or `cancelled`. Optional diagnostics and artifact fields are allowlisted. `artifactExpired` is a flag, never a state. |
+| `unknown-job` | `job`, `tombstonePresent`, `inconsistentDirectory`. No receipt exists. An inconsistent directory requires reconciliation. Invalid/unreadable state returns an error instead. |
+| `refused` | `job`, `commit`, `action`, `attempt`, `accepted: false`, fixed `code`. Exit 1. Includes `host-busy`, `stale-epoch`, `submission-expired`, `duplicate-job`, `duplicate-attempt`, `cancelled`, `legacy-profile`, `host-reconciled`, `cleanup-required` or `keychain-relock-pending`. |
+| `cancellation-requested` | `job`. A durable tombstone acknowledgement, never proof of cleanup. |
+| `busy` | Reconcile couldn't acquire the lock within two seconds. `job` and nullable safe `runner` heartbeat/stage evidence. The tombstone remains. |
+| `reconciled-terminal`, `reconciled-unknown` | `job`, newly persisted `epoch`, fresh `nonce`, `reconciledJobs`. Exclusive-lock inspection established cleanup. No unknown-job success receipt is fabricated. |
+| `cleanup-required`, `keychain-relock-pending` | `job`. Cleanup remains fenced; exit 1. |
+| `error` | Fixed `code`. Never treat this as unknown-job or cleanup evidence. |
+
+Health reads atomic runner/fence markers without opening or acquiring
+`runner.lock`, pruning artifacts, scanning history or accessing any keychain API.
+A fresh matching runner is busy; a heartbeat older than sixty seconds is
+uncertain and blocks admission. A separate cleanup fence wins over busy. Busy
+health skips global VM inventory and disk eligibility checks. Idle health checks
+installed inputs, writable roots, capacity and disk. Disk fields are null while
+those measurements are skipped. `maintenanceJobId`, when present, comes from an
+existing obligation marker and is a private fleet-admin diagnostic.
+
+`run-v2` waits at most five monotonic seconds for the exclusive lock without
+reading stdin. A timeout is identified `host-busy`, with no recovery, receipt or
+epoch change. Under the lock it checks epoch, expiry, tombstone and replay before
+recovery. Successful pre-input recovery rotates the epoch and returns
+`host-reconciled`; the incoming job never continues to receiving. Refusals record
+a small terminal receipt where storage and lock ownership permit. A valid refusal
+can still exist without a receipt when disk storage fails.
+
+On a clean host, artifact pruning precedes disk measurement using available-to-
+account `statvfs` bytes on the actual job and Tart roots. Each root needs 50 GiB;
+the job root additionally needs bundle plus secret input headroom before receiving.
+Free bytes from shared APFS storage are never added together. The broker records
+receiving state and a runner marker before reading bytes. Both input streams
+check cancellation at least once per second, with thirty-second secret and
+600-second bundle deadlines. Closed input and termination use the cleanup path.
+After transfer, it checks the 50-GiB floor again and checks capacity before
+persisting unlock-attempt/active-VM fences and accessing any keychain API. Disk
+failures report `host-disk-space-unavailable` with `disk-preflight` or
+`disk-post-transfer`. Recovery operations remain available below the build floor.
+
+Registry cancel only writes/fsyncs its tombstone. Reconcile takes the exclusive
+lock, inspects exact `partitura-job-<job32hex>` clones and bounded private state,
+removes abandoned input, terminalizes interrupted receiving/running receipts,
+and preserves terminal execution outcomes. It never deletes general/operator
+VMs. Reconciliation can also clean other abandoned broker jobs, reported in
+`reconciledJobs`. It durably records the whole cleanup set before deleting
+anything. If unlock might have happened, success requires keychain lock plus
+locked-state readback. That recovery API call runs in an owned child with a
+deadline. Epoch rotation precedes durable fence removal. Failed validation,
+deletion, readback or state writes retain the safety fence.
+
+The fixed local invocation is `broker.py local-maintenance`. It is rejected
+through `SSH_ORIGINAL_COMMAND` and whenever SSH environment markers are present.
+A future root-owned LaunchDaemon can invoke it as the dedicated build account.
+The code inventories private receipt/owned-clone directories once per boot or
+broker revision, capped at 1024 entries per directory and 64 cleanup jobs.
+Subsequent idle minute passes read markers and return without taking the lock or
+scanning history. If `run-v2` wins the boot/migration race, it performs that same
+bounded inventory under the lock before input, reconciling and refusing the
+incoming job if debris exists. With an obligation, maintenance tries the lock nonblocking and leaves
+live owners alone. A cleanup pass has a 120-second deadline and retries failures
+with exponential backoff from sixty seconds to fifteen minutes. Malformed,
+linked, foreign or oversized inventories block admission for host-admin repair.
+
+Daemon relock is unqualified by default. Such a pass can remove VM/input debris
+but retains `keychain-relock-pending` and the epoch if unlock might have happened.
+A later authenticated SSH reconcile or pre-input `run-v2` recovery completes
+relock/readback. Even a sealed qualification becomes ineffective after a macOS
+build change. These fake-only tests don't qualify Security.framework behavior,
+cross-session relock, power-loss cleanup, sshd keepalives or a LaunchDaemon.
+Installing and qualifying those remains a separate approved rollout.
+
 ## Acceptance
 
 On recent macOS hosts, creating the dedicated Unix account and installing a
