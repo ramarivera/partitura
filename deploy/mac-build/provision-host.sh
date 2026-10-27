@@ -322,6 +322,7 @@ if ! sudo test -e "$ROOT/keychain-created"; then
   sudo cat "$RMB/provision.py" | asbuild "${PY[@]}" - keychain || die "keychain create failed"
   sudo touch "$ROOT/keychain-created"
   echo "build keychain created from the saved credential; the first build proves it unlocks"
+  echo "if that build stops with unlock-failed: sudo rm $ROOT/keychain-created, then rerun with --apply"
 fi
 
 step "9 readback for the gateway"

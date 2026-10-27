@@ -125,7 +125,10 @@ secret never appears in a process argument or environment. Last, it creates the
 build keychain from that credential. It doesn't test the unlock: on macOS 27 an
 unlock run through `sudo -u` from the operator's session fails even when the
 keychain is right, while the broker's own SSH session unlocks it. The first
-build is the proof, and the broker stops with `unlock-failed` before cloning. The run ends by printing the base hash and the host
+build is the proof, and the broker stops with `unlock-failed` before cloning.
+To recreate the keychain after that, delete the `keychain-created` marker the
+run printed (`sudo rm <inputs>/keychain-created`) and rerun with `--apply`; it
+keeps the old keychain beside the new one. The run ends by printing the base hash and the host
 key line for the gateway's `known_hosts`. Every step is skipped when its result
 already exists, so a rerun after fixing a reported cause continues where it
 stopped.
