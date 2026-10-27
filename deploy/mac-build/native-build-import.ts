@@ -110,12 +110,13 @@ export const importLegacyNativeSlot = Effect.fn(
     return yield* Effect.fail(
       NativeOperationError.new("invalid-native-import"),
     );
+  // The legacy root is normally also an excluded root from state assembly.
+  // Dedupe that list only: equality with a registry-owned root must still refuse.
   yield* files.disjointRoots([
-    input.scratchRoot,
     state.options.stateRoot,
     state.options.scratchRoot,
     state.options.cacheRoot,
-    ...(state.options.otherRoots ?? []),
+    ...new Set([input.scratchRoot, ...(state.options.otherRoots ?? [])]),
   ]);
   const key = (yield* files.file(
     input.privateKeyPath,

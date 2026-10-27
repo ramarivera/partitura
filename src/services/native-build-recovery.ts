@@ -68,10 +68,15 @@ export function createNativeBuildRecovery(
       if (!job) throw NativeOperationError.new("native-job-not-found");
       mutate(job);
     });
-  const hold = (id: string, reason: NativeRecovery["lastReason"]) =>
+  const hold = (
+    id: string,
+    reason: NativeRecovery["lastReason"],
+    observation?: NativeRecovery["observation"],
+  ) =>
     update(id, (job) => {
       job.recovery.state = "operator-required";
       job.recovery.lastReason = reason;
+      if (observation !== undefined) job.recovery.observation = observation;
       job.recovery.returnEligible = [
         "unavailable",
         "busy",
@@ -277,12 +282,23 @@ export function createNativeBuildRecovery(
             }),
         );
         if (!transport.hasCredential(generation.id)) {
-          if (transport.credentialState?.(generation.id) === "pending")
+          if (
+            job.recovery.state === "operator-required" &&
+            job.recovery.lastReason === "missing-credentials"
+          )
+            return;
+          const credentialState = transport.credentialState?.(generation.id);
+          if (credentialState === "pending")
             yield* update(id, (current) => {
               current.recovery.observation = "credentials-pending";
               current.recovery.nextAt = now() + 5_000;
             });
-          else yield* hold(id, "missing-credentials");
+          else
+            yield* hold(
+              id,
+              "missing-credentials",
+              credentialState === "failed" ? "credentials-failed" : undefined,
+            );
           return;
         }
         if (job.recovery.state === "operator-required") {

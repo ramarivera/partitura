@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
-import { Cause, Context, Effect, Fiber, Layer, Scope } from "effect";
+import { Cause, Context, Effect, Fiber, Layer, Option, Scope } from "effect";
 import { nativeGitBundle } from "./native-build-bundle.js";
 import {
   NativeOperationError,
@@ -11,7 +11,6 @@ import {
 import { NativeBuildFiles, opaqueId } from "./native-build-files.js";
 import {
   applyNativeReceipt,
-  cleanNativeHealth,
   createNativeBuildRecovery,
   recoverNativeMetadata,
 } from "./native-build-recovery.js";
@@ -27,6 +26,7 @@ import {
 import {
   type NativeBrokerTransport,
   NativeBuildTransport,
+  NativeTransportError,
   publishNativeArtifact,
 } from "./native-build-transport.js";
 
@@ -83,22 +83,48 @@ export const createRegistryNativeBuildClient = Effect.fn(
   const recordFailure = (
     id: string,
     error: NativeOperationError,
-    interrupted: boolean,
+    interrupted = false,
   ) =>
-    state.transaction((draft) => {
-      failures.set(id, error);
-      const current = draft.jobs.find((j) => j.jobId === id);
-      if (!current) throw NativeOperationError.new("native-job-not-found");
-      if (current.state === "starting") {
-        current.state = interrupted ? "interrupted" : "failed";
-        current.updatedAt = now();
-        current.failureCode = nativeFailureCode(error);
-      } else if (current.recovery.state === "not-required") {
-        current.recovery.state = "pending";
-        current.recovery.deadline = now() + 900_000;
-        current.recovery.nextAt = now();
-      }
-    });
+    state
+      .transaction((draft) => {
+        failures.set(id, error);
+        const current = draft.jobs.find((j) => j.jobId === id);
+        if (!current) throw NativeOperationError.new("native-job-not-found");
+        if (current.state === "starting") {
+          current.state = interrupted ? "interrupted" : "failed";
+          current.updatedAt = now();
+          current.failureCode = nativeFailureCode(error);
+        } else if (current.recovery.state === "not-required") {
+          current.recovery.state = "pending";
+          current.recovery.deadline = now() + 900_000;
+          current.recovery.nextAt = now();
+        }
+      })
+      .pipe(
+        Effect.andThen(
+          Effect.logWarning("native.job_failed").pipe(
+            // Causes stay private: only fixed reasons and opaque identity are logged.
+            Effect.annotateLogs({ jobId: id, reason: error.reason }),
+          ),
+        ),
+        Effect.catch((writeError) =>
+          Effect.sync(() => {
+            failures.set(
+              id,
+              NativeOperationError.new("native-job-finalization-failed", {
+                operation: error,
+                persistence: writeError,
+              }),
+            );
+          }).pipe(
+            Effect.andThen(
+              Effect.logError("native.job_finalization_failed").pipe(
+                Effect.annotateLogs({ jobId: id, reason: error.reason }),
+              ),
+            ),
+          ),
+        ),
+      );
   const stop = Effect.fn("RegistryNativeBuildClient.stop")(function* () {
     closing = true;
     for (const fiber of [...active.values()]) yield* Fiber.interrupt(fiber);
@@ -255,19 +281,8 @@ export const createRegistryNativeBuildClient = Effect.fn(
             submitted,
             { input, timeout: 3_600_000 },
           );
-          let cleanTerminal = false;
-          if (receipt.kind === "known" && receipt.state === "succeeded") {
-            const finalHealth = yield* transport.envelope(
-              generation,
-              "health",
-              undefined,
-              { timeout: 30_000 },
-            );
-            cleanTerminal =
-              finalHealth.hostId === job.verifiedHostId &&
-              finalHealth.epoch === job.epoch &&
-              cleanNativeHealth(finalHealth) === true;
-          }
+          // Preserve execution evidence before any cleanup or health IO. A
+          // terminal receipt never releases quarantine without fenced recovery.
           yield* state.transaction((draft) => {
             const current = draft.jobs.find((j) => j.jobId === job.jobId);
             if (!current)
@@ -279,41 +294,35 @@ export const createRegistryNativeBuildClient = Effect.fn(
             } else
               throw NativeOperationError.new("invalid-native-run-response");
             current.updatedAt = now();
-            if (cleanTerminal) {
-              current.recovery.state = "resolved-terminal";
-              current.recovery.resolvedEpoch = job.epoch;
-            } else if (
-              !(receipt.kind === "refused" && receipt.code === "host-busy")
-            ) {
+            if (!(receipt.kind === "refused" && receipt.code === "host-busy")) {
               current.recovery.state = "pending";
               current.recovery.deadline = now() + 900_000;
               current.recovery.nextAt = now();
             }
           });
+          if (!(receipt.kind === "refused" && receipt.code === "host-busy"))
+            yield* recovery.tick(job.jobId);
         }),
       ).pipe(
         Effect.catchCause((cause) => {
-          const interrupted = Cause.hasInterrupts(cause);
+          const failure = Cause.findErrorOption(cause);
           const error = NativeOperationError.new(
-            interrupted
-              ? "native-job-interrupted"
+            Option.isSome(failure) &&
+              (failure.value instanceof NativeOperationError ||
+                failure.value instanceof NativeTransportError)
+              ? failure.value.reason
               : "native-job-operation-failed",
             cause,
           );
-          return recordFailure(job.jobId, error, interrupted).pipe(
-            Effect.catch((writeError) =>
-              Effect.sync(() => {
-                failures.set(
-                  job.jobId,
-                  NativeOperationError.new("native-job-finalization-failed", {
-                    operation: error,
-                    persistence: writeError,
-                  }),
-                );
-              }),
-            ),
-          );
+          return recordFailure(job.jobId, error);
         }),
+        Effect.onInterrupt(() =>
+          recordFailure(
+            job.jobId,
+            NativeOperationError.new("native-job-interrupted"),
+            true,
+          ),
+        ),
         Effect.ensuring(Effect.sync(() => active.delete(job.jobId))),
       );
       const fiber = yield* Effect.forkIn(task, scope);

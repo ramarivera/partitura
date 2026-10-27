@@ -75,6 +75,7 @@ export const Recovery = Schema.Struct({
       "needs-refresh",
       "host-key-mismatch",
       "credentials-pending",
+      "credentials-failed",
     ]),
   ),
   resolvedEpoch: Schema.NullOr(Id),

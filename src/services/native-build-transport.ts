@@ -57,7 +57,7 @@ export interface NativeBrokerTransport {
     signal?: AbortSignal,
   ): Effect.Effect<void, NativeOperationError | NativeTransportError>;
   hasCredential(id: string): boolean;
-  credentialState?(id: string): "pending" | "available" | "missing";
+  credentialState?(id: string): "pending" | "available" | "missing" | "failed";
 }
 export interface NativeTransportOptions {
   readonly suffix: string;
@@ -73,6 +73,7 @@ export const createNativeBuildTransport = Effect.fn(
   const processes = yield* NativeBuildProcesses.make;
   const materialized = new Set<string>();
   const missing = new Set<string>();
+  const failed = new Set<string>();
   const loading = new Map<
     string,
     Deferred.Deferred<void, NativeOperationError>
@@ -102,6 +103,7 @@ export const createNativeBuildTransport = Effect.fn(
       () => {
         materialized.delete(id);
         missing.delete(id);
+        failed.delete(id);
       },
     ]);
   };
@@ -158,6 +160,7 @@ export const createNativeBuildTransport = Effect.fn(
         yield* files.write(join(directory, "config"), rendered.config, 0o400);
         materialized.add(generation.id);
         missing.delete(generation.id);
+        failed.delete(generation.id);
       }),
     );
     yield* operation;
@@ -314,10 +317,9 @@ export const createNativeBuildTransport = Effect.fn(
                   owner.completion,
                   drain,
                 ]);
-              if (!downloaded.ok) throw downloaded.error;
               if (!diagnosticResult.ok) throw diagnosticResult.error;
-              if (output) await output.sync();
-              return { uploaded, exited };
+              if (output && downloaded.ok) await output.sync();
+              return { uploaded, downloaded, exited };
             })(),
           );
           // Registered after the process owner, so interruption kills/reaps, drains
@@ -341,7 +343,20 @@ export const createNativeBuildTransport = Effect.fn(
             return yield* Effect.fail(
               NativeTransportError.new("unavailable", result.error),
             );
-          const { uploaded, exited } = result.value;
+          const { uploaded, downloaded, exited } = result.value;
+          if (!downloaded.ok)
+            return yield* Effect.fail(
+              NativeTransportError.new(
+                downloaded.error instanceof NativeOperationError &&
+                  downloaded.error.reason === "native-transfer-exceeds-limit" &&
+                  exited.error === undefined &&
+                  (exited.code === 0 || exited.code === 1) &&
+                  !settings.signal?.aborted
+                  ? "protocol-mismatch"
+                  : "unavailable",
+                downloaded.error,
+              ),
+            );
           if (
             exited.error !== undefined ||
             (exited.code !== 0 && exited.code !== 1) ||
@@ -421,6 +436,7 @@ export const createNativeBuildTransport = Effect.fn(
             generation.equalityTag,
         );
         if (!key) {
+          failed.delete(generation.id);
           missing.add(generation.id);
           continue;
         }
@@ -428,6 +444,7 @@ export const createNativeBuildTransport = Effect.fn(
           Effect.catch((error) =>
             Effect.sync(() => {
               failures.push({ generationId: generation.id, error });
+              failed.add(generation.id);
             }),
           ),
         );
@@ -435,12 +452,16 @@ export const createNativeBuildTransport = Effect.fn(
       return { failures };
     }),
     hasCredential: (id: string) => materialized.has(id),
-    credentialState: (id: string): "pending" | "available" | "missing" =>
+    credentialState: (
+      id: string,
+    ): "pending" | "available" | "missing" | "failed" =>
       materialized.has(id)
         ? "available"
-        : missing.has(id)
-          ? "missing"
-          : "pending",
+        : failed.has(id)
+          ? "failed"
+          : missing.has(id)
+            ? "missing"
+            : "pending",
     envelope,
     artifact: Effect.fn("NativeBuildTransport.artifact")(function* (
       generation: NativeGeneration,

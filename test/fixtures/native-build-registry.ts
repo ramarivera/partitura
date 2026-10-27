@@ -29,7 +29,7 @@ export async function fixturePrivateKey(path: string) {
   return readFile(path, "utf8");
 }
 const fakeSsh = `
-import {readFileSync,writeFileSync,appendFileSync} from "node:fs";
+import {readFileSync,writeFileSync,appendFileSync,existsSync} from "node:fs";
 import {join,dirname} from "node:path";
 import {createHash} from "node:crypto";
 const root=dirname(process.argv[1]);
@@ -38,7 +38,9 @@ const args=process.argv.slice(2),command=args.at(-1), parts=command.split(" ");
 if(args.length!==4 || args[0]!=="-F" || args[2]!=="partitura-native" || !args[1].endsWith("/config") || typeof command!=="string") throw new Error("invalid-fixture-ssh-argv");
 const config=readFileSync(args[1],"utf8");
 appendFileSync(join(root,"trace.jsonl"),JSON.stringify({command,args,env:process.env,hostname:config.match(/HostName (.+)/)[1]})+"\\n");
-const hostId=plan.hostId, epoch=plan.epoch??"a".repeat(32);
+const epochFile=join(root,"epoch");
+const hostId=plan.hostId;
+let epoch=plan.epoch??(existsSync(epochFile)?readFileSync(epochFile,"utf8"):"a".repeat(32));
 const emit=(kind,fields={})=>console.log(JSON.stringify({protocolVersion:2,hostId,kind,...fields}));
 if(plan.unavailable) process.exit(255);
 if(parts[0]==="health") {emit("health",{brokerRevision:"b".repeat(64),capabilities:["health","status","reconcile","run-v2"],profile:"registry-only",epoch,status:plan.healthBusy?"busy":"ready",accepting:!plan.healthBusy,capacity:plan.healthBusy?0:1,reasons:plan.healthBusy?["runner-active"]:[],jobRootFreeBytes:1e12,tartRootFreeBytes:1e12,hostFloorBytes:53687091200});}
@@ -57,7 +59,7 @@ else if(parts[0]==="run-v2") {
 else if(parts[0]==="reconcile") {
  if(plan.busy) emit("busy",{job:parts[1],runner:{job:parts[1],attempt:"c".repeat(32),stage:"receiving",heartbeat:plan.heartbeat??Date.now()/1000}});
  else if(plan.cleanup) {emit(plan.cleanup,{job:parts[1]});process.exit(1);}
- else emit(plan.unknown?"reconciled-unknown":"reconciled-terminal",{job:parts[1],epoch,nonce:"d".repeat(32),reconciledJobs:[parts[1]]});
+ else {epoch=epoch==="b".repeat(32)?"c".repeat(32):"b".repeat(32);writeFileSync(epochFile,epoch);emit(plan.unknown?"reconciled-unknown":"reconciled-terminal",{job:parts[1],epoch,nonce:"d".repeat(32),reconciledJobs:[parts[1]]});}
 } else if(parts[0]==="status") {
  try {emit("known",JSON.parse(readFileSync(join(root,parts[1]+".json"),"utf8")));}
  catch {emit("unknown-job",{job:parts[1],tombstonePresent:true,inconsistentDirectory:false});}

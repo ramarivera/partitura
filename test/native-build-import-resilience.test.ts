@@ -24,6 +24,36 @@ import { testPaths } from "./fixtures/paths.js";
 const path = testPaths();
 
 it.live(
+  "legacy root already listed in otherRoots is deduplicated without weakening overlap refusal",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* registryFixture(path("duplicate-legacy-root"));
+        const legacy = yield* legacyFixture(fixture);
+        yield* fixture.state.close();
+        const state = yield* openNativeBuildState({
+          ...fixture.options,
+          otherRoots: [legacy.root],
+        });
+        const transport = yield* createNativeBuildTransport(state, {
+          suffix: "example.test",
+          executable: fixture.executable,
+        });
+        yield* importLegacyNativeSlot(state, transport, legacy.input);
+        expect(
+          state.owned("owner-org", legacy.sessionId, legacy.id).imported,
+        ).toBe(true);
+        expect(
+          (yield* importLegacyNativeSlot(state, transport, {
+            ...legacy.input,
+            scratchRoot: state.options.scratchRoot,
+          }).pipe(Effect.flip)).reason,
+        ).toBe("overlapping-native-roots");
+      }),
+    ),
+);
+
+it.live(
   "uncached legacy receipts are remote-only and fetchable on the imported generation",
   () =>
     Effect.scoped(

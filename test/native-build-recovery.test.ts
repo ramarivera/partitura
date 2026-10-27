@@ -708,50 +708,44 @@ it.live(
 it.live("scratch quota refusal happens before artifact SSH", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const fixture = yield* testAwait(
-        registryFixture(path("artifact-quota"), {
-          bytesTotal: nativeLimits.bundle + nativeLimits.overhead,
-        }),
-      );
-      const client = yield* testAwait(
-        createRegistryNativeBuildClient(fixture.state, fixture.transport, {
-          canSubmit: () => true,
-          prepareBundle: () => Effect.succeed(bundle()),
-        }),
-      );
-      try {
-        const job = yield* testAwait(
-          client.start({
-            organizationId: "org-a",
-            sessionId: "session-a",
-            generationId: fixture.generation.id,
-            workspacePath: fixture.root,
-            commit: "e".repeat(40),
-            pullRequest: 7,
-            action: "archive",
-          }),
+      const fixture = yield* registryFixture(path("artifact-quota"), {
+        bytesTotal: nativeLimits.bundle + nativeLimits.overhead,
+      });
+      yield* Effect.gen(function* () {
+        const client = yield* createRegistryNativeBuildClient(
+          fixture.state,
+          fixture.transport,
+          {
+            canSubmit: () => true,
+            prepareBundle: () => Effect.succeed(bundle()),
+          },
         );
-        yield* testAwait(client.wait(job.jobId));
-        const held = yield* testAwait(
-          fixture.state.reserve(job, "source.bundle", nativeLimits.bundle),
+        const job = yield* client.start({
+          organizationId: "org-a",
+          sessionId: "session-a",
+          generationId: fixture.generation.id,
+          workspacePath: fixture.root,
+          commit: "e".repeat(40),
+          pullRequest: 7,
+          action: "archive",
+        });
+        yield* client.wait(job.jobId);
+        const held = yield* fixture.state.reserve(
+          job,
+          "source.bundle",
+          nativeLimits.bundle,
         );
-        try {
-          yield* testAwait(
-            expect(
-              testRejects(client.artifact("org-a", "session-a", job.jobId)),
-            ).rejects.toThrow("scratch-quota-exceeded"),
-          );
-        } finally {
-          yield* testAwait(held.release());
-        }
+        yield* testAwait(
+          expect(
+            testRejects(client.artifact("org-a", "session-a", job.jobId)),
+          ).rejects.toThrow("scratch-quota-exceeded"),
+        ).pipe(Effect.ensuring(held.release().pipe(Effect.orDie)));
         expect(
           (yield* testAwait(fixture.trace())).some((call) =>
             call.command.startsWith("artifact "),
           ),
         ).toBe(false);
-      } finally {
-        yield* testAwait(fixture.state.close());
-      }
+      }).pipe(Effect.ensuring(fixture.state.close().pipe(Effect.orDie)));
     }),
   ),
 );

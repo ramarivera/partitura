@@ -3,8 +3,10 @@ import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import { nativeIO } from "../src/services/native-build-errors.js";
+import { createNativeBuildRecovery } from "../src/services/native-build-recovery.js";
 import {
   nativeLimits,
+  newRecovery,
   openNativeBuildState,
 } from "../src/services/native-build-state.js";
 import {
@@ -113,6 +115,40 @@ it.live(
         expect(restored.failures[0]?.error._tag).toBe(
           "@Gateway/NativeOperationError",
         );
+        expect(transport.credentialState(bad.id)).toBe("failed");
+        const job = registryJob(bad, {
+          state: "submitting",
+          recovery: {
+            ...newRecovery(),
+            state: "pending",
+            deadline: 900_000,
+          },
+        });
+        yield* state.transaction((draft) => {
+          draft.jobs.push(job);
+        });
+        let time = 100_000;
+        const recovery = createNativeBuildRecovery(state, transport, {
+          now: () => time,
+        });
+        yield* recovery.tick(job.jobId);
+        const held = state.owned("org-a", "session-a", job.jobId).recovery;
+        expect(held).toMatchObject({
+          state: "operator-required",
+          lastReason: "missing-credentials",
+          observation: "credentials-failed",
+          returnEligible: false,
+        });
+        const metadata = yield* nativeIO(() =>
+          readFile(join(state.options.stateRoot, "metadata.json"), "utf8"),
+        );
+        time += 600_000;
+        yield* recovery.tick(job.jobId);
+        expect(
+          yield* nativeIO(() =>
+            readFile(join(state.options.stateRoot, "metadata.json"), "utf8"),
+          ),
+        ).toBe(metadata);
         expect(transport.hasCredential(fixture.generation.id)).toBe(true);
         const another = yield* state.addGeneration(
           "primary",
@@ -141,6 +177,39 @@ it.live(
       }),
     ),
 );
+
+for (const code of [0, 1])
+  it.live(
+    `authenticated oversized output with exit ${code} is a protocol mismatch`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fixture = yield* registryFixture(path(`oversized-${code}`));
+          yield* nativeIO(() =>
+            writeFile(
+              fixture.executable,
+              `#!${process.execPath}\nprocess.stdout.write("x".repeat(8192));process.exitCode=${code};\n`,
+              { mode: 0o700 },
+            ),
+          );
+          expect(
+            (yield* fixture.transport
+              .envelope(fixture.generation, "health")
+              .pipe(Effect.flip)).reason,
+          ).toBe("protocol-mismatch");
+          const job = registryJob(fixture.generation, { artifactBytes: 1 });
+          expect(
+            (yield* fixture.transport
+              .artifact(
+                fixture.generation,
+                job,
+                join(fixture.root, "artifact.partial"),
+              )
+              .pipe(Effect.flip)).reason,
+          ).toBe("protocol-mismatch");
+        }),
+      ),
+  );
 
 it.live("capacity pruning promptly disposes old generation credentials", () =>
   Effect.scoped(

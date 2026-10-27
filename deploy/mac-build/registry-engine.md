@@ -29,9 +29,11 @@ matches against saved public destinations. Restore reports failures per
 generation and continues with the others. Concurrent loads share one flight.
 A generation is credential-pending until its source restore completes; pending
 provider reads must retry according to the two-hour startup policy. A completed
-restore with no exact key marks that generation missing. Neither pending nor
-missing credentials can be replaced by the current generation's destination or
-key. Keep a generation lease for every published admission candidate. Capacity
+restore with no exact key marks that generation missing. Materialization failures
+settle as failed credentials and place recovery in a missing-credentials hold
+with a credentials-failed observation; they never poll as pending indefinitely.
+Neither pending nor missing credentials can be replaced by the current
+generation's destination or key. Keep a generation lease for every published admission candidate. Capacity
 pruning disposes credentials for removed generations.
 
 The SSH diagnostic classifier recognizes only tested OpenSSH 9.2p1 diagnostics.
@@ -41,10 +43,12 @@ auth observations preserve an unused host-return check and retain their actual
 reason. Ordinary deadline expiry, including gateway downtime, also preserves
 that single check. Wrong-host and malformed protocol assertions remain manual.
 
-A successful terminal receipt releases quarantine only after fresh clean health
-from the same host and epoch. Ambiguous or unsafe outcomes still require fenced
-reconciliation. Recovery removes obsolete bundles once jobs resolve. Corrupt
-cached artifacts can be refetched after consumer leases have been released.
+A terminal receipt is persisted before cleanup IO and never releases quarantine
+alone. Every run-v2 outcome except identified host-busy requires cancel tombstone,
+fenced reconciliation with epoch rotation, status readback when known, and fresh
+matching clean post-reconcile health. Recovery removes obsolete bundles once jobs
+resolve. Corrupt cached artifacts can be refetched after consumer leases have
+been released.
 
 ## Offline import
 

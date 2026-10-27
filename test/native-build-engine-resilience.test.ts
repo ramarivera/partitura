@@ -1,13 +1,17 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
-import { Cause, Effect, Exit, Fiber } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect";
 import { nativeGitBundle } from "../src/services/native-build-bundle.js";
 import { nativeIO } from "../src/services/native-build-errors.js";
 import { NativeBuildFiles } from "../src/services/native-build-files.js";
 import { createRegistryNativeBuildClient } from "../src/services/native-build-registry-client.js";
 import { openNativeBuildState } from "../src/services/native-build-state.js";
-import { decodeBrokerEnvelope } from "../src/services/native-build-transport.js";
+import {
+  decodeBrokerEnvelope,
+  type NativeBrokerTransport,
+  NativeTransportError,
+} from "../src/services/native-build-transport.js";
 import {
   registryFixture,
   registryJob,
@@ -33,8 +37,144 @@ const bundle = () =>
     })(),
   );
 
+for (const step of ["reconcile", "health"] as const)
+  it.live(`durable success survives subsequent ${step} failure`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* registryFixture(path(`success-${step}-failure`));
+        const transport: NativeBrokerTransport = {
+          ...fixture.transport,
+          envelope: Effect.fn("Test.failAfterReceipt")(function* (
+            ...args: Parameters<NativeBrokerTransport["envelope"]>
+          ) {
+            const command = args[1];
+            if (
+              fixture.state
+                .snapshot()
+                .jobs.some((job) => job.state === "succeeded") &&
+              command.split(" ")[0] === step
+            ) {
+              // Check the committed file before failing cleanup, not just memory.
+              const metadata = JSON.parse(
+                yield* nativeIO(() =>
+                  readFile(
+                    join(fixture.options.stateRoot, "metadata.json"),
+                    "utf8",
+                  ),
+                ),
+              );
+              expect(metadata.jobs[0]).toMatchObject({
+                state: "succeeded",
+                artifactBytes: Buffer.byteLength("opaque archive bytes"),
+                artifactSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+              });
+              return yield* Effect.fail(
+                NativeTransportError.new("unavailable"),
+              );
+            }
+            return yield* fixture.transport.envelope(...args);
+          }),
+        };
+        const client = yield* createRegistryNativeBuildClient(
+          fixture.state,
+          transport,
+          {
+            canSubmit: () => true,
+            prepareBundle: bundle,
+          },
+        );
+        const job = yield* client.start(request(fixture));
+        yield* client.wait(job.jobId);
+        const recorded = yield* client.status("org-a", "session-a", job.jobId);
+        expect(recorded.state).toBe("succeeded");
+        expect(recorded.artifactSha256).toMatch(/^[a-f0-9]{64}$/u);
+        expect(recorded.recovery.state).toBe("pending");
+        expect(recorded.recovery.lastReason).toBe("unavailable");
+        expect(fixture.state.quarantined(fixture.metadata.hostId)).toBe(true);
+        const trace = yield* nativeIO(() => fixture.trace());
+        expect(
+          trace.filter((call) => call.command.startsWith("run-v2 ")),
+        ).toHaveLength(1);
+        yield* fixture.state.close();
+        const reopened = yield* openNativeBuildState(fixture.options);
+        expect(reopened.owned("org-a", "session-a", job.jobId).state).toBe(
+          "succeeded",
+        );
+      }),
+    ),
+  );
+
+it.live("pre-submission quota refusal persists its real failure code", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fixture = yield* registryFixture(path("start-quota"), {
+        bytesPerBuilder: 1,
+      });
+      const client = yield* createRegistryNativeBuildClient(
+        fixture.state,
+        fixture.transport,
+        {
+          canSubmit: () => true,
+          prepareBundle: bundle,
+        },
+      );
+      const job = yield* client.start(request(fixture));
+      yield* client.wait(job.jobId);
+      expect(
+        yield* client.status("org-a", "session-a", job.jobId),
+      ).toMatchObject({
+        state: "failed",
+        failureCode: "scratch-quota-exceeded",
+      });
+      expect(client.failure(job.jobId)?.reason).toBe("scratch-quota-exceeded");
+      expect(
+        (yield* nativeIO(() => fixture.trace())).map((call) => call.command),
+      ).toEqual(["health"]);
+      yield* fixture.state.close();
+      const reopened = yield* openNativeBuildState(fixture.options);
+      expect(reopened.owned("org-a", "session-a", job.jobId).failureCode).toBe(
+        "scratch-quota-exceeded",
+      );
+    }),
+  ),
+);
+
 it.live(
-  "clean terminal plus fresh same-epoch health releases without cancel or reconcile",
+  "pre-submission interruption is recorded by the interrupt finalizer",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* registryFixture(path("start-interruption"));
+        const entered = yield* Deferred.make<void>();
+        const client = yield* createRegistryNativeBuildClient(
+          fixture.state,
+          fixture.transport,
+          {
+            canSubmit: () => true,
+            prepareBundle: () =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Effect.never),
+              ),
+          },
+        );
+        const job = yield* client.start(request(fixture));
+        yield* Deferred.await(entered);
+        yield* client.cancel("org-a", "session-a", job.jobId);
+        expect(
+          yield* client.status("org-a", "session-a", job.jobId),
+        ).toMatchObject({
+          state: "interrupted",
+          failureCode: "native-job-interrupted",
+        });
+        expect(client.failure(job.jobId)?.reason).toBe(
+          "native-job-interrupted",
+        );
+      }),
+    ),
+);
+
+it.live(
+  "success persists then runs fenced cleanup and matching post-reconcile health",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -59,10 +199,17 @@ it.live(
           (yield* client.status("org-a", "session-a", job.jobId)).recovery
             .state,
         ).toBe("resolved-terminal");
+        expect(fixture.state.quarantined(fixture.metadata.hostId)).toBe(false);
+        const resolved = yield* client.status("org-a", "session-a", job.jobId);
+        expect(resolved.recovery.resolvedEpoch).toBe("b".repeat(32));
+        expect(resolved.recovery.resolvedEpoch).not.toBe(job.epoch);
         const trace = yield* nativeIO(() => fixture.trace());
         expect(trace.map((entry) => entry.command.split(" ")[0])).toEqual([
           "health",
           "run-v2",
+          "cancel",
+          "reconcile",
+          "status",
           "health",
         ]);
         for (const operation of [
@@ -143,7 +290,7 @@ it.live(
 
 for (const phase of ["create", "delete"] as const)
   it.live(
-    `hanging fake git ${phase} update-ref is bounded and hooks are disabled`,
+    `hanging fake git ${phase} is reaped within its bound and receives hooksPath override`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
