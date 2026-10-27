@@ -262,10 +262,14 @@ export function createNativeBuildRecovery(
     Effect.scoped(
       Effect.gen(function* () {
         if (inFlight.has(id)) return;
-        const job = state
+        const observed = state
           .snapshot()
           .jobs.find((candidate) => candidate.jobId === id);
-        if (!job || !unresolvedRecovery(job) || job.recovery.nextAt > now())
+        if (
+          !observed ||
+          !unresolvedRecovery(observed) ||
+          observed.recovery.nextAt > now()
+        )
           return;
         if (
           [...inFlight].some(
@@ -273,25 +277,37 @@ export function createNativeBuildRecovery(
               state
                 .snapshot()
                 .jobs.find((candidate) => candidate.jobId === other)
-                ?.verifiedHostId === job.verifiedHostId,
+                ?.verifiedHostId === observed.verifiedHostId,
           )
         )
           return;
         const generation = yield* nativeTry(() => {
           const generation = state
             .snapshot()
-            .generations.find((candidate) => candidate.id === job.generationId);
-          if (!generation || generation.transport.hostId !== job.verifiedHostId)
+            .generations.find(
+              (candidate) => candidate.id === observed.generationId,
+            );
+          if (
+            !generation ||
+            generation.transport.hostId !== observed.verifiedHostId
+          )
             throw NativeOperationError.new("native-state-corrupt");
           return generation;
         });
-        yield* Effect.acquireRelease(
+        const claimed = yield* Effect.acquireRelease(
           Effect.sync(() => {
+            const releaseHost = state.claimRecovery(observed.verifiedHostId);
+            if (!releaseHost) return undefined;
             inFlight.add(id);
-            return [state.retainGeneration(generation.id), state.retainJob(id)];
+            return [
+              releaseHost,
+              state.retainGeneration(generation.id),
+              state.retainJob(id),
+            ];
           }),
           (releases) =>
             Effect.gen(function* () {
+              if (!releases) return;
               for (const release of releases) release();
               inFlight.delete(id);
               const current = state
@@ -307,6 +323,12 @@ export function createNativeBuildRecovery(
                   .pipe(Effect.orDie);
             }),
         );
+        if (!claimed) return;
+        // A human may have resolved the snapshot's obligation before this claim.
+        const job = state
+          .snapshot()
+          .jobs.find((candidate) => candidate.jobId === id);
+        if (!job || !unresolvedRecovery(job)) return;
         if (!transport.hasCredential(generation.id)) {
           if (
             job.recovery.state === "operator-required" &&

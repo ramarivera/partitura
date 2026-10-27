@@ -34,6 +34,7 @@ import { GatewayConfig, type T3LaunchConfig } from "./config.js";
 import { GitHubApp } from "./github-app.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { McpOAuth, removeMcpAgentDb } from "./mcp-oauth.js";
+import { NativeBuildFleet } from "./native-build-fleet.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import type { RpcEvent, RpcWorkerHandle } from "./rpc-worker.js";
@@ -460,7 +461,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         sessionMutationGatesRef,
       });
 
+      const nativeFleet = yield* Effect.serviceOption(NativeBuildFleet);
       const linearHostToolsForRun = makeLinearHostToolsForRun({
+        owner,
+        ...(Option.isSome(nativeFleet)
+          ? { nativeFleet: nativeFleet.value }
+          : {}),
         deviceBackup,
         config,
         withSessionMutationGate,

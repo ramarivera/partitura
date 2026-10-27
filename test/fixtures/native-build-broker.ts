@@ -82,7 +82,7 @@ export function memoryBroker(
               job: job.jobId,
               runner: {
                 job: job.jobId,
-                attempt: job.attempt,
+                attempt: job.attempt ?? "",
                 stage: "receiving",
                 heartbeat: (clock() - (settings.fresh ? 0 : 120_000)) / 1000,
               },

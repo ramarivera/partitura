@@ -18,6 +18,7 @@ import { NativeSecretBudget } from "./native-build-secret-budget.js";
 import { NativeSecretJournal } from "./native-build-secret-journal.js";
 import {
   type SecretBucket,
+  type SecretJournalData,
   type SecretOperation,
   SecretSource,
   type SecretWork,
@@ -76,6 +77,29 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
       });
       const dispatch = yield* Semaphore.make(1);
       const cache = new Map<string, BuilderCredential>();
+      // Remember exactly the obsolete operations across journal EIO. A later
+      // explicit refresh for a disabled builder must not inherit this fence.
+      const obsolete = new Set<string>();
+      const obsoleteKey = (operation: SecretOperation, work: SecretWork) =>
+        `${operation.id}:${work.builderId}:${sourceKey(work)}`;
+      const flushObsolete = Effect.fn("NativeBuildSecretCache.flushObsolete")(
+        function* () {
+          if (!obsolete.size) return;
+          const selected = new Set(obsolete);
+          yield* journal.transaction((data, at) => {
+            for (const operation of data.operations)
+              for (const work of operation.sources)
+                if (
+                  selected.has(obsoleteKey(operation, work)) &&
+                  work.status === "pending"
+                ) {
+                  work.status = "superseded";
+                  work.completedAt = at;
+                }
+          }, now());
+          for (const key of selected) obsolete.delete(key);
+        },
+      );
       let cycleRecorded = false;
       // A crash after dispatch is ambiguous and already charged. Only startup may retry.
       yield* journal.transaction((data, at) => {
@@ -305,6 +329,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         () =>
           dispatch.withPermit(
             Effect.gen(function* () {
+              yield* flushObsolete();
               const expired = new Map<
                 string,
                 { builderId: string; code: string; nextFit: number }
@@ -361,39 +386,54 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                   : operation.kind === "agent"
                     ? "agent"
                     : "human";
+              const markWork = (
+                data: SecretJournalData,
+                at: number,
+                reading: boolean,
+              ) => {
+                const selectedWork = data.operations
+                  .find((op) => op.id === operation.id)
+                  ?.sources.find((candidate) => sourceKey(candidate) === key);
+                if (
+                  obsolete.has(obsoleteKey(operation, work)) &&
+                  selectedWork?.status !== "running"
+                )
+                  throw NativeSecretError.new("provider-operation-superseded");
+                let matched = false;
+                for (const op of data.operations)
+                  for (const candidate of op.sources) {
+                    if (
+                      sourceKey(candidate) !== key ||
+                      (candidate.status === "pending" &&
+                        obsolete.has(obsoleteKey(op, candidate))) ||
+                      !(
+                        candidate.status === "pending" ||
+                        (reading &&
+                          candidate.status === "running" &&
+                          candidate.readStartedAt === undefined)
+                      )
+                    )
+                      continue;
+                    matched = true;
+                    if (candidate.status === "pending") {
+                      candidate.attempts++;
+                      delete candidate.readStartedAt;
+                      delete candidate.code;
+                    }
+                    candidate.status = "running";
+                    if (reading) candidate.readStartedAt = at;
+                  }
+                if (!matched)
+                  throw NativeSecretError.new("provider-operation-superseded");
+              };
               const mark = Effect.fn("NativeBuildSecretCache.started")(
-                function* (reading = true) {
+                function* () {
                   const at = yield* journal.transaction((data, at) => {
-                    let matched = false;
-                    for (const op of data.operations)
-                      for (const candidate of op.sources) {
-                        if (
-                          sourceKey(candidate) !== key ||
-                          !(
-                            candidate.status === "pending" ||
-                            (reading &&
-                              candidate.status === "running" &&
-                              candidate.readStartedAt === undefined)
-                          )
-                        )
-                          continue;
-                        matched = true;
-                        if (candidate.status === "pending") {
-                          candidate.attempts++;
-                          delete candidate.readStartedAt;
-                          delete candidate.code;
-                        }
-                        candidate.status = "running";
-                        if (reading) candidate.readStartedAt = at;
-                      }
-                    if (!matched)
-                      throw NativeSecretError.new(
-                        "provider-operation-superseded",
-                      );
+                    markWork(data, at, true);
                     return at;
                   }, now());
                   dispatched = true;
-                  if (reading) started = at;
+                  started = at;
                 },
               );
               yield* Effect.gen(function* () {
@@ -423,15 +463,25 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                         operation.org,
                         now(),
                         (data) =>
-                          data.operations.some((op) =>
-                            op.sources.some(
-                              (candidate) =>
-                                sourceKey(candidate) === key &&
-                                candidate.status === "pending",
-                            ),
+                          data.operations.some(
+                            (op) =>
+                              op.id === operation.id &&
+                              op.sources.some(
+                                (candidate) =>
+                                  sourceKey(candidate) === key &&
+                                  !obsolete.has(obsoleteKey(op, candidate)) &&
+                                  candidate.status === "pending",
+                              ),
                           ),
+                        (data, at) => markWork(data, at, false),
                       )
-                      .pipe(Effect.andThen(mark(false))),
+                      .pipe(
+                        Effect.tap(() =>
+                          Effect.sync(() => {
+                            dispatched = true;
+                          }),
+                        ),
+                      ),
                   () => mark(),
                 );
                 if (started === undefined) yield* mark(); // File sources have the same operation semantics and no provider debit.
@@ -537,20 +587,15 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
       const supersede = Effect.fn("NativeBuildSecretCache.supersede")(
         function* (builderIds: readonly string[]) {
           const ids = new Set(builderIds);
-          yield* journal.transaction((data, at) => {
-            for (const operation of data.operations)
-              for (const work of operation.sources)
-                if (
-                  !work.retained &&
-                  ids.has(work.builderId) &&
-                  (work.status === "pending" ||
-                    (work.status === "running" &&
-                      work.readStartedAt === undefined))
-                ) {
-                  work.status = "superseded";
-                  work.completedAt = at;
-                }
-          }, now());
+          for (const operation of journal.snapshot().operations)
+            for (const work of operation.sources)
+              if (
+                !work.retained &&
+                ids.has(work.builderId) &&
+                work.status === "pending"
+              )
+                obsolete.add(obsoleteKey(operation, work));
+          yield* flushObsolete();
           yield* Queue.offer(wake, undefined);
           yield* notify();
         },

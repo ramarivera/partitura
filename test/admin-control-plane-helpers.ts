@@ -15,6 +15,7 @@ import { httpApp } from "../src/http/router.js";
 import { Admin, createAdminSession } from "../src/services/admin.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { McpOAuth } from "../src/services/mcp-oauth.js";
+import { NativeBuildFleet } from "../src/services/native-build-fleet.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { OAuth } from "../src/services/oauth.js";
 import { Reconciler } from "../src/services/reconciler.js";
@@ -107,11 +108,17 @@ export const withApp = <A, E>(
     | WorkspaceRepo
     | Scope.Scope
   >,
+  options?: {
+    readonly nativeBuilders?: NativeBuildFleet["Service"];
+    readonly config?: GatewayConfig["Service"];
+  },
 ) =>
   Effect.gen(function* () {
     yield* Effect.scope;
     const services = Layer.mergeAll(
-      GatewayConfig.layer,
+      options?.config
+        ? Layer.succeed(GatewayConfig, options.config)
+        : GatewayConfig.layer,
       TokenCrypto.layer,
       AdminSessionRepo.layer,
       DeliveryRepo.layer,
@@ -133,7 +140,21 @@ export const withApp = <A, E>(
       Layer.provide(
         Layer.mergeAll(
           SqliteClientLive(":memory:"),
-          ConfigProvider.layer(configProvider),
+          ConfigProvider.layer(
+            options?.config
+              ? ConfigProvider.orElse(
+                  ConfigProvider.fromUnknown({
+                    GATEWAY_ADMIN_ORGANIZATION_IDS: [
+                      ...(options.config.gatewayAdminOrganizationIds ?? []),
+                    ].join(","),
+                  }),
+                  configProvider,
+                )
+              : configProvider,
+          ),
+          ...(options?.nativeBuilders
+            ? [Layer.succeed(NativeBuildFleet, options.nativeBuilders)]
+            : []),
         ),
       ),
     );

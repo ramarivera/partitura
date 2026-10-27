@@ -1,5 +1,9 @@
 import { Schema } from "effect";
 import { builderId } from "./native-build-file-io.js";
+import {
+  FleetMetadata,
+  type MutableFleetMetadata,
+} from "./native-build-fleet-models.js";
 
 const Id = Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u));
 const Name = Schema.String.check(Schema.isPattern(builderId));
@@ -141,11 +145,13 @@ export const Metadata = Schema.Struct({
   version: Schema.Literal(1),
   generations: Schema.Array(Generation),
   jobs: Schema.Array(RegistryJob),
+  fleet: Schema.optionalKey(FleetMetadata),
 });
 export type MetadataValue = {
   version: 1;
   generations: NativeGeneration[];
   jobs: NativeRegistryJob[];
+  fleet?: MutableFleetMetadata;
 };
 export const newRecovery = (): NativeRecovery => ({
   state: "not-required",

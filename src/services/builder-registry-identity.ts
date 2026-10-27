@@ -3,15 +3,15 @@ import { BuilderRegistryError } from "./builder-registry-json.js";
 import type { BuilderEntry } from "./builder-registry-schema.js";
 import type { BuilderCredential } from "./builder-secret-provider.js";
 import { nativeTry } from "./native-build-errors.js";
+import { observeNativeMaintenance } from "./native-build-maintenance.js";
 import {
   NativeBuildStateService,
   type NativeGeneration,
-  terminalNativeJob,
-  unresolvedRecovery,
 } from "./native-build-state.js";
 import {
   type BrokerEnvelope,
   NativeBuildTransport,
+  NativeTransportError,
 } from "./native-build-transport.js";
 
 export interface BuilderIdentityResult {
@@ -59,22 +59,24 @@ export class BuilderRegistryIdentity extends Context.Service<BuilderRegistryIden
                     );
                 yield* transport.materialize(generation, credential.privateKey);
                 const health = yield* transport.envelope(generation, "health");
+                yield* observeNativeMaintenance(state, entry.id, health);
                 return { generation, health } satisfies BuilderIdentityResult;
               }),
             ).pipe(
               Effect.mapError((cause) =>
-                BuilderRegistryError.new("builder-health-unavailable", cause),
+                BuilderRegistryError.new(
+                  cause instanceof NativeTransportError &&
+                    ["needs-refresh", "host-key-mismatch"].includes(
+                      cause.reason,
+                    )
+                    ? cause.reason
+                    : "builder-health-unavailable",
+                  cause,
+                ),
               ),
             ),
         ),
-        reserved: (hostId: string) =>
-          state
-            .snapshot()
-            .jobs.some(
-              (job) =>
-                job.verifiedHostId === hostId &&
-                (!terminalNativeJob(job) || unresolvedRecovery(job)),
-            ),
+        reserved: (hostId: string) => state.quarantined(hostId),
       };
     }),
   },

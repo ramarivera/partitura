@@ -9,6 +9,7 @@ import {
   type BuilderRegistrySnapshot,
   credentialRevision,
   registrySemanticKey,
+  sourceReference,
 } from "./builder-registry-schema.js";
 import type {
   BuilderCredential,
@@ -113,7 +114,11 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       }
     };
     const worker = Effect.fn("BuilderRegistry.resolve")(function* (id: string) {
+      let initial = true;
       for (;;) {
+        // Let a burst of accepted revisions replace pending work before another read.
+        if (!initial) yield* Effect.yieldNow;
+        initial = false;
         const work = pending.get(id);
         if (!work) return;
         pending.delete(id);
@@ -265,6 +270,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       blocked: ReadonlySet<string> = new Set(),
     ) {
       const retired: Scope.Closeable[] = [];
+      const obsolete: string[] = [];
+      const cancelOld: Deferred.Deferred<void>[] = [];
       const retire = (id: string) => {
         const lease = leases.get(id);
         if (lease) {
@@ -278,21 +285,23 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           error = undefined;
           const key = `${registrySemanticKey(snapshot)}:${[...blocked].sort().join(",")}`;
           if (key === semantic) return false;
-          const obsolete = [...entries.values()]
-            .filter((old) => {
-              const next = snapshot.builders.find(
-                (entry) => entry.id === old.entry.id,
-              );
-              return (
-                !next?.enabled ||
-                credentialRevision(next) !== credentialRevision(old.entry)
-              );
-            })
-            .map((old) => old.entry.id);
-          if (obsolete.length) yield* supersede(obsolete);
+          obsolete.push(
+            ...[...entries.values()]
+              .filter((old) => {
+                const next = snapshot.builders.find(
+                  (entry) => entry.id === old.entry.id,
+                );
+                return (
+                  !next ||
+                  (old.entry.enabled && !next.enabled) ||
+                  credentialRevision(next) !== credentialRevision(old.entry)
+                );
+              })
+              .map((old) => old.entry.id),
+          );
           for (const id of obsolete) {
             const cancel = cancellations.get(id);
-            if (cancel) yield* Deferred.succeed(cancel, undefined);
+            if (cancel) cancelOld.push(cancel);
           }
           desired = structuredClone(snapshot);
           semantic = key;
@@ -342,6 +351,18 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           return true;
         }),
       );
+      // Safety state is published before best-effort provider cleanup.
+      if (obsolete.length)
+        yield* supersede(obsolete).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning(
+              "Native provider supersession could not be persisted",
+              { code: error.code },
+            ),
+          ),
+        );
+      for (const cancel of cancelOld)
+        yield* Deferred.succeed(cancel, undefined);
       yield* Effect.forEach(retired, (lease) => Scope.close(lease, Exit.void));
       yield* launch();
       return changed;
@@ -359,6 +380,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     const refreshHealth = Effect.fn("BuilderRegistry.checkHealth")(function* (
       id: string,
       admissionCheck = false,
+      forced = false,
     ) {
       yield* gate.withPermit(
         Effect.sync(() => {
@@ -366,7 +388,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           if (
             current?.entry.enabled &&
             current.credential &&
-            now() >= current.retryAt &&
+            (forced || now() >= current.retryAt) &&
             (!admissionCheck || !reserved(current)) &&
             !pending.has(id) &&
             !workers.has(id)
@@ -378,6 +400,10 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         }),
       );
       yield* launch();
+      const flight = workers.get(id);
+      // This worker belongs to the registry scope, including when another caller
+      // already started it. A timed-out waiter must not cancel shared resolution.
+      if (forced && flight) yield* Fiber.join(flight);
     });
     const awaitIdle = Effect.fn("BuilderRegistry.awaitIdle")(function* () {
       while (workers.size || pending.size) {
@@ -521,6 +547,84 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       );
     });
     return {
+      // Private control-plane access. HTTP and tools must project sanitized fields.
+      current: (id: string) => {
+        const current = entries.get(id);
+        return current === undefined ? undefined : structuredClone(current);
+      },
+      recordHealth: Effect.fn("BuilderRegistry.recordHealth")(
+        (
+          id: string,
+          generationId: string,
+          health: BuilderIdentityResult["health"],
+          failure?: string,
+        ) =>
+          gate.withPermit(
+            Effect.sync(() => {
+              const current = entries.get(id);
+              if (
+                !current?.identity ||
+                current.identity.generation.id !== generationId
+              )
+                return;
+              const error =
+                failure ||
+                health.kind !== "health" ||
+                health.hostId !==
+                  current.identity.generation.transport.hostId ||
+                health.profile !== "registry-only"
+                  ? (failure ?? "builder-identity-mismatch")
+                  : undefined;
+              const checkedAt = now();
+              current.error = error;
+              if (!error) {
+                current.identity = { ...current.identity, health };
+                current.checkedAt = checkedAt;
+              }
+              // Share the verified observation, never a mutable admission object.
+              for (const preparation of preparations.values()) {
+                if (
+                  preparation.admission.generationId !== generationId ||
+                  !preparation.current.identity
+                )
+                  continue;
+                preparation.current.error = error;
+                if (!error) {
+                  preparation.current.identity = structuredClone({
+                    ...preparation.current.identity,
+                    health,
+                  });
+                  preparation.current.checkedAt = checkedAt;
+                }
+              }
+            }),
+          ),
+      ),
+      installCredential: Effect.fn("BuilderRegistry.installCredential")(
+        function* (
+          id: string,
+          revision: number,
+          credential: BuilderCredential,
+        ) {
+          yield* gate.withPermit(
+            Effect.sync(() => {
+              const current = entries.get(id);
+              if (
+                !current?.entry.enabled ||
+                current.entry.secretRevision !== revision ||
+                sourceReference(current.entry.secretSource) !==
+                  credential.transport.source
+              )
+                return;
+              current.credential = credential;
+              current.recheck = true;
+              current.ticket = ++ticket;
+              enqueue(current, false);
+            }),
+          );
+          yield* launch();
+        },
+      ),
       publish,
       refreshHealth,
       awaitIdle,

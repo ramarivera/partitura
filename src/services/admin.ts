@@ -12,6 +12,7 @@ import {
 } from "./admin-core.js";
 import { mapCauseToResponse } from "./admin-responses.js";
 import { mcpRoutes } from "./admin-routes-mcp.js";
+import { nativeBuildersRoutes } from "./admin-routes-native-builders.js";
 import { pagesRoutes } from "./admin-routes-pages.js";
 import { repositoriesRoutes } from "./admin-routes-repositories.js";
 import { rerunRoutes } from "./admin-routes-rerun.js";
@@ -20,6 +21,7 @@ import { GatewayConfig } from "./config.js";
 import { Executor } from "./executor.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { McpOAuth } from "./mcp-oauth.js";
+import { NativeBuildFleet } from "./native-build-fleet.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { Reconciler } from "./reconciler.js";
 import {
@@ -57,6 +59,8 @@ export const createAdminHandle = (deps: AdminDeps) =>
       const now = yield* Clock.currentTimeMillis;
       const url = new URL(request.url);
       const context = createAdminContext(deps, request, now, url);
+      const nativeBuilders = yield* nativeBuildersRoutes(context);
+      if (Option.isSome(nativeBuilders)) return nativeBuilders;
       const pages = yield* pagesRoutes(context);
       if (Option.isSome(pages)) return pages;
       const rerun = yield* rerunRoutes(context);
@@ -116,7 +120,11 @@ export class Admin extends Context.Service<Admin>()("Admin", {
     const nixEnvironment = yield* NixEnvironment;
     const runInputRepo = yield* RunInputRepo;
     const linearGateway = yield* LinearGateway;
+    const nativeBuilders = yield* Effect.serviceOption(NativeBuildFleet);
     const handle = createAdminHandle({
+      ...(Option.isSome(nativeBuilders)
+        ? { nativeBuilders: nativeBuilders.value }
+        : {}),
       config,
       adminSessionRepo,
       executorInstanceRepo,

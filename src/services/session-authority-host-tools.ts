@@ -18,6 +18,12 @@ import {
   type createNativeBuildClient,
   deliverNativeArtifact,
 } from "./native-build-client.js";
+import type { NativeBuildFleet } from "./native-build-fleet.js";
+import {
+  callNativeRefresh,
+  nativeBuildRefreshTool,
+  nativeRefreshAdvertised,
+} from "./native-build-refresh-tool.js";
 import type {
   RpcHostToolCall,
   RpcHostToolDefinition,
@@ -37,6 +43,8 @@ type NativeBuilder = "primary" | "backup";
 export const makeLinearHostToolsForRun = ({
   deviceBackup,
   config,
+  owner,
+  nativeFleet,
   withSessionMutationGate,
   runRepo,
   workspaceRepo,
@@ -49,6 +57,8 @@ export const makeLinearHostToolsForRun = ({
   linearOption,
   reportedPullRequestUrlsRef,
 }: {
+  owner: string;
+  nativeFleet?: NativeBuildFleet["Service"];
   deviceBackup: ReturnType<typeof makeT3DeviceBackup> | undefined;
   config: GatewayConfig["Service"];
   withSessionMutationGate: <A, E, R>(
@@ -144,6 +154,9 @@ export const makeLinearHostToolsForRun = ({
       },
     ];
     const definitions: ReadonlyArray<RpcHostToolDefinition> = [
+      ...(nativeRefreshAdvertised(config, run.organizationId, nativeFleet)
+        ? [nativeBuildRefreshTool]
+        : []),
       ...linearDefinitions,
       githubCreatePullRequestToolDefinition,
       ...(deviceBackup === undefined ||
@@ -230,6 +243,18 @@ export const makeLinearHostToolsForRun = ({
       Effect.gen(function* () {
         const fail = (message: string) => textResult(message, undefined, true);
         const raw = request.arguments;
+        if (request.toolName === "native_build_refresh")
+          return yield* callNativeRefresh(
+            {
+              config,
+              owner,
+              fleet: nativeFleet,
+              runRepo,
+              withSessionMutationGate,
+            },
+            run,
+            raw,
+          );
         if (request.toolName === "t3_device_backup") {
           if (deviceBackup === undefined)
             return fail("T3 device backup is disabled");

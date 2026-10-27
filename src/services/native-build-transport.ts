@@ -21,6 +21,7 @@ import {
   type BrokerEnvelope,
   classifyNativeSsh,
   decodeBrokerEnvelope,
+  type NativeBrokerBinding,
   NativeTransportError,
   renderNativeSsh,
   validateNativeTransport,
@@ -47,7 +48,7 @@ export interface NativeBrokerTransport {
   envelope(
     generation: NativeGeneration,
     command: string,
-    job?: NativeRegistryJob,
+    job?: NativeBrokerBinding,
     options?: NativeTransportSettings,
   ): Effect.Effect<BrokerEnvelope, NativeOperationError | NativeTransportError>;
   artifact(
@@ -385,7 +386,7 @@ export const createNativeBuildTransport = Effect.fn(
   const envelope = Effect.fn("NativeBuildTransport.envelope")(function* (
     generation: NativeGeneration,
     command: string,
-    job?: NativeRegistryJob,
+    job?: NativeBrokerBinding,
     settings?: NativeTransportSettings,
   ) {
     const result = yield* run(generation, command, settings);

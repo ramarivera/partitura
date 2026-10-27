@@ -171,7 +171,7 @@ it.effect(
 );
 
 it.effect(
-  "superseding during helper initialization prevents the pending get and its debit",
+  "superseding before reservation prevents the pending get and its debit",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
