@@ -290,6 +290,9 @@ bd dolt push                                # sync beads data to the git remote 
 - Conventional commits: `feat(scope):`, `fix(scope):`, `refactor:`, `docs:`,
   `test:`. Scopes in use: `security`, `webhooks`, `admin`, `deploy`, `hygiene`.
 - `mise exec -- bun run check` must exit 0 before pushing.
+- CI (`.github/workflows/check.yml`) runs the same `bun run check` on every
+  PR and push to `main`. Its `bun run check` job is a required status check on
+  `main`, so a PR can't merge until it passes.
 - Bot review comments gate merges: address or explicitly resolve them before
   merging.
 - Never bypass git hooks or mute failing checks.
