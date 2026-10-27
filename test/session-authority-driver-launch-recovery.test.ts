@@ -11,10 +11,12 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "../src/services/store/repositories.js";
+import { occupyOldT3Range, t3TestPorts } from "./fixtures/t3-ports.js";
 import { createDriverFixture } from "./session-authority-driver-fixture.js";
 import { createAuthorityFixture } from "./session-authority-fixture.js";
 
 const fixture = createAuthorityFixture();
+const portsFor = t3TestPorts();
 const { seedDriverRun, awaitState, withT3Authority, t3Server } =
   createDriverFixture(fixture);
 const {
@@ -44,7 +46,10 @@ describe("AgentDriver authority integration", () => {
             { mode: 0o755 },
           ),
         );
-        const portBase = 20_000 + ((process.pid * 11) % 20_000);
+        // Keep the old PID-derived range occupied to reproduce the CI collision.
+        const oldBase = 20_000 + ((process.pid * 11) % 20_000);
+        yield* occupyOldT3Range(oldBase, 4);
+        const portBase = portsFor(4);
         yield* withAuthority(
           () =>
             Effect.gen(function* () {
@@ -193,7 +198,7 @@ describe("AgentDriver authority integration", () => {
             ],
           },
         );
-      }),
+      }).pipe(Effect.scoped),
     20_000,
   );
   it.live(

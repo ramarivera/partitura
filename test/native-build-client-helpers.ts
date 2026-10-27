@@ -7,7 +7,7 @@ import { testPaths } from "./fixtures/paths.js";
 export const path = testPaths();
 export const payload = "opaque-artifact";
 const fakeSsh = `
-import {appendFileSync,mkdtempSync,readFileSync,writeFileSync} from "node:fs";
+import {appendFileSync,existsSync,mkdtempSync,readFileSync,writeFileSync} from "node:fs";
 import {dirname,join} from "node:path";
 import {spawnSync} from "node:child_process";
 import {createHash} from "node:crypto";
@@ -39,11 +39,19 @@ if(command[0]==="run") {
  const artifact={artifactSha256:createHash("sha256").update(payload).digest("hex"),artifactBytes:payload.length};
  const failed=config.receiptOverrides?.state==="failed";
  const receipt={job:command[1],commit:command[2],action:command[4],state:"succeeded",...(failed&&!config.failedArtifact?{}:artifact),...(config.receiptOverrides??{})};
+ if(config.crashRun) process.exit(255);
  let serialized=JSON.stringify(receipt);
  if(config.rawArtifactBytes!==undefined)serialized=serialized.replace(/"artifactBytes":[^,}]+/, '"artifactBytes":'+config.rawArtifactBytes);
  console.log(serialized);
  process.exit(config.exitCode??0);
-} else if(command[0]==="artifact") process.stdout.write(config.corrupt?"corrupted":"${payload}");
+} else if(command[0]==="status" && config.statusReceipt) {
+ if(config.statusBarrier) {
+  writeFileSync(config.statusBarrier+".entered", "ready");
+  while(!existsSync(config.statusBarrier)) await Bun.sleep(5);
+ }
+ console.log(JSON.stringify({job:command[1],...config.statusReceipt}));
+}
+else if(command[0]==="artifact") process.stdout.write(config.corrupt?"corrupted":"${payload}");
 else console.log(JSON.stringify({job:command[1],state:"cancellation-requested"}));
 `;
 

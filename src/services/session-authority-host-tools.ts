@@ -399,11 +399,12 @@ export const makeLinearHostToolsForRun = ({
                 }
                 case "native_build_cancel": {
                   if (typeof job !== "string") return fail("job is required");
-                  await client.cancel(run.sessionId, job);
+                  const cancelled = await client.cancel(run.sessionId, job);
                   nativeBuildJobs
                     .get(run.sessionId)
                     ?.delete(`${builder}:${job}`);
-                  return textResult("Native build canceled");
+                  const response = { ...cancelled, builder };
+                  return textResult(JSON.stringify(response), response);
                 }
                 default:
                   return fail(`Unknown native build tool: ${request.toolName}`);

@@ -12,6 +12,9 @@ for (const [stage, failureCode] of [
   ["capacity", "host-capacity-unavailable"],
   ["disk-preflight", "host-disk-space-unavailable"],
   ["disk-post-transfer", "host-disk-space-unavailable"],
+  ["cleanup", "execution-interrupted"],
+  ["receiving", "receive-interrupted"],
+  ["keychain-policy", "keychain-policy-unavailable"],
 ] as const) {
   it.live(`preserves ${failureCode} through the native gateway`, () =>
     Effect.promise(async () => {
@@ -262,9 +265,20 @@ it.live(
           { mode: 0o600 },
         );
         if (stage === "boot") {
-          await expect(createNativeBuildClient(fixture.config)).rejects.toThrow(
-            "Inconsistent",
-          );
+          const client = await createNativeBuildClient(fixture.config);
+          try {
+            await expect(client.status("session-a", job.job)).rejects.toThrow(
+              "not found",
+            );
+            expect(
+              await readFile(
+                join(fixture.config.scratchRoot, `${job.job}.json.invalid`),
+                "utf8",
+              ),
+            ).toContain("host-disk-space-unavailable");
+          } finally {
+            await client.close();
+          }
         } else {
           const client = await createNativeBuildClient(fixture.config);
           try {
@@ -495,6 +509,13 @@ it.live(
         join(fixture.config.scratchRoot, `${job}.json`),
         JSON.stringify({ job: "../escape", sessionId: "session-a" }),
       );
-      await expect(createNativeBuildClient(fixture.config)).rejects.toThrow();
+      const recovered = await createNativeBuildClient(fixture.config);
+      try {
+        await expect(recovered.status("session-a", job)).rejects.toThrow(
+          "not found",
+        );
+      } finally {
+        await recovered.close();
+      }
     }),
 );
