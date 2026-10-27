@@ -37,6 +37,7 @@ export const fakeBuilderAdapters = () => {
   const reads: string[] = [],
     checks: string[] = [];
   const blocks = new Map<string, Deferred.Deferred<void>>();
+  const healthFailures = new Set<string>();
   const healthBlocks = new Map<string, Deferred.Deferred<void>>();
   const hosts = new Map<string, string>();
   const reserved = new Set<string>();
@@ -76,6 +77,10 @@ export const fakeBuilderAdapters = () => {
       checks.push(`${item.id}:${item.secretRevision}`);
       const block = healthBlocks.get(item.id);
       if (block) yield* Deferred.await(block);
+      if (healthFailures.has(item.id))
+        return yield* Effect.fail(
+          BuilderRegistryError.new("builder-health-unavailable"),
+        );
       const binding = `${item.id}:${item.secretRevision}:${credential.transport.hostId}`;
       const generationId =
         generations.get(binding) ?? String(++sequence).padStart(32, "0");
@@ -112,6 +117,7 @@ export const fakeBuilderAdapters = () => {
     checks,
     blocks,
     healthBlocks,
+    healthFailures,
     hosts,
     reserved,
     failures,

@@ -23,6 +23,8 @@ interface Current {
   credential?: BuilderCredential;
   identity?: BuilderIdentityResult;
   checkedAt: number;
+  healthFailures: number;
+  retryAt: number;
   duplicate: boolean;
   recheck: boolean;
   error: string | undefined;
@@ -151,6 +153,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
               leases.set(id, lease);
               current.identity = verified;
               current.checkedAt = now();
+              current.healthFailures = 0;
+              current.retryAt = 0;
               current.recheck = false;
               current.error = undefined;
               failures.delete(id);
@@ -166,6 +170,18 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
                 const current = live();
                 if (!current) return;
                 current.error = cause.code;
+                if (current.credential) {
+                  current.retryAt =
+                    now() +
+                    Math.min(
+                      120_000,
+                      5000 * 2 ** Math.min(current.healthFailures, 5),
+                    );
+                  current.healthFailures = Math.min(
+                    current.healthFailures + 1,
+                    6,
+                  );
+                }
                 failures.set(id, cause);
                 yield* Effect.logWarning("Native builder resolution failed", {
                   builderId: id,
@@ -254,6 +270,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
                     entry,
                     ticket: ++ticket,
                     checkedAt: 0,
+                    healthFailures: 0,
+                    retryAt: 0,
                     duplicate: false,
                     recheck: false,
                     error: undefined,
@@ -277,8 +295,19 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       yield* launch();
       return changed;
     });
+    const reserved = (current: Current) => {
+      const hostId = current.credential?.transport.hostId;
+      return (
+        hostId !== undefined &&
+        (identity.reserved(hostId) ||
+          [...preparations.values()].some(
+            (item) => item.admission.hostId === hostId,
+          ))
+      );
+    };
     const refreshHealth = Effect.fn("BuilderRegistry.checkHealth")(function* (
       id: string,
+      admissionCheck = false,
     ) {
       yield* gate.withPermit(
         Effect.sync(() => {
@@ -286,6 +315,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           if (
             current?.entry.enabled &&
             current.credential &&
+            now() >= current.retryAt &&
+            (!admissionCheck || !reserved(current)) &&
             !pending.has(id) &&
             !workers.has(id)
           ) {
@@ -318,26 +349,34 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
                   : []),
               ];
       for (const id of candidates) {
+        const eligible = yield* gate.withPermit(
+          Effect.sync(() => {
+            const current = entries.get(id);
+            return current && !reserved(current);
+          }),
+        );
+        if (!eligible) continue;
         const current = entries.get(id);
-        if (current?.identity && now() - current.checkedAt > 15_000) {
-          yield* refreshHealth(id);
+        if (
+          current &&
+          (!current.identity ||
+            current.error ||
+            now() - current.checkedAt > 15_000)
+        ) {
+          yield* refreshHealth(id, true);
           const flight = workers.get(id);
           if (flight) yield* Fiber.join(flight);
         }
         const acquired = yield* Effect.acquireRelease(
           gate.withPermit(
-            Effect.sync(() => {
+            Effect.gen(function* () {
               const current = entries.get(id);
               if (!current || reason(current) || !current.identity)
                 return undefined;
               const hostId = current.identity.generation.transport.hostId;
-              if (
-                identity.reserved(hostId) ||
-                [...preparations.values()].some(
-                  (item) => item.admission.hostId === hostId,
-                )
-              )
-                return undefined;
+              if (reserved(current)) return undefined;
+              // Pin the generation before publication can retire its current lease.
+              yield* identity.retain(current.identity.generation.id);
               const controller = new AbortController();
               const admission: BuilderAdmission = {
                 builderId: id,
@@ -345,7 +384,11 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
                 hostId,
                 signal: controller.signal,
               };
-              preparations.set(admission, { admission, controller, current });
+              preparations.set(admission, {
+                admission,
+                controller,
+                current: structuredClone(current),
+              });
               return admission;
             }),
           ),
@@ -358,7 +401,6 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
             }),
         );
         if (acquired) {
-          yield* identity.retain(acquired.generationId);
           return acquired;
         }
       }
@@ -451,12 +493,10 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         error,
         entries: [...entries.values()].map((current) => ({
           id: current.entry.id,
-          available:
-            reason(current) === undefined &&
-            !identity.reserved(
-              current.identity?.generation.transport.hostId ?? "",
-            ),
-          reason: reason(current),
+          available: reason(current) === undefined && !reserved(current),
+          reason:
+            reason(current) ??
+            (reserved(current) ? "builder-reserved" : undefined),
           generationId: current.identity?.generation.id,
           hostId: current.credential?.transport.hostId,
         })),

@@ -44,7 +44,10 @@ export const loadBuilderRegistrySettings = Effect.fn(
 )(function* (otherRoots: readonly string[]) {
   const settings = yield* Config.all({
     registryFile: pathSetting("NATIVE_BUILD_REGISTRY_FILE"),
-    stateRoot: pathSetting("NATIVE_BUILD_STATE_ROOT", "/app/data/native-build"),
+    stateRoot: pathSetting(
+      "NATIVE_BUILD_STATE_ROOT",
+      "/app/data/native-build-registry",
+    ),
     scratchRoot: pathSetting(
       "NATIVE_BUILD_REGISTRY_SCRATCH_ROOT",
       "/app/native-build-registry-scratch",
@@ -99,6 +102,14 @@ export const loadBuilderRegistrySettings = Effect.fn(
       return yield* Effect.fail(
         invalid("Native registry scratch root overlaps another root"),
       );
+  if (settings.registryFile !== undefined)
+    for (const root of [stateRoot, cacheRoot])
+      if (otherRoots.some((other) => nativePathsOverlap(root, resolve(other))))
+        return yield* Effect.fail(
+          invalid(
+            "Native registry state/cache root overlaps a legacy or worker root",
+          ),
+        );
   return {
     ...settings,
     stateRoot,

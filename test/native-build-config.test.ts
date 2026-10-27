@@ -20,7 +20,7 @@ it.effect(
     Effect.gen(function* () {
       const defaults = yield* settings({});
       expect(defaults.registryFile).toBeUndefined();
-      expect(defaults.stateRoot).toBe("/app/data/native-build");
+      expect(defaults.stateRoot).toBe("/app/data/native-build-registry");
       expect(defaults.scratchRoot).toBe("/app/native-build-registry-scratch");
       expect(defaults.cacheRoot).toBe("/run/partitura-native");
       expect(defaults.suffix).toBe("xalda-procyon.ts.net");
@@ -176,3 +176,41 @@ for (const registry of [false, true])
         ).toBe("Failure");
       }),
   );
+
+for (const key of ["NATIVE_BUILD_STATE_ROOT", "NATIVE_BUILD_CACHE_ROOT"])
+  for (const root of ["/legacy/scratch", "/legacy", "/legacy/scratch/child"])
+    it.effect(
+      `${key} refuses legacy/worker overlap ${root} only in registry mode`,
+      () =>
+        Effect.gen(function* () {
+          const values = { [key]: root };
+          expect(
+            (yield* settings(values, ["/legacy/scratch"]))[
+              key === "NATIVE_BUILD_STATE_ROOT" ? "stateRoot" : "cacheRoot"
+            ],
+          ).toBe(root);
+          expect(
+            (yield* Effect.exit(
+              settings(
+                {
+                  ...values,
+                  NATIVE_BUILD_REGISTRY_FILE: "/run/registry/registry.json",
+                },
+                ["/legacy/scratch"],
+              ),
+            ))._tag,
+          ).toBe("Failure");
+        }),
+    );
+
+it.effect(
+  "registry defaults are disjoint from the example legacy scratch root",
+  () =>
+    Effect.gen(function* () {
+      const loaded = yield* settings(
+        { NATIVE_BUILD_REGISTRY_FILE: "/run/builders/registry.json" },
+        ["/app/data/native-build"],
+      );
+      expect(loaded.stateRoot).toBe("/app/data/native-build-registry");
+    }),
+);

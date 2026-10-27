@@ -114,6 +114,10 @@ it.live(
           { ...valid, sshUser: "root" },
           { ...valid, hostKeys: [{ type: "ssh-ed25519", base64: "AAAA" }] },
           { ...valid, retiringPrivateKeyB64: "not-canonical" },
+          {
+            ...valid,
+            retiringPrivateKeyB64: Buffer.from("not-a-key").toString("base64"),
+          },
         ];
         for (const value of invalid)
           expect(

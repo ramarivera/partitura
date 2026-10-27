@@ -44,6 +44,7 @@ export function nativeProcess(
   const kill = () => {
     if (!child.pid) return;
     try {
+      // A surviving group still needs killing; PID/PGID reuse remains a residual risk.
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {
       if (
