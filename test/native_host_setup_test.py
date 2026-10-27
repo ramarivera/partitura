@@ -1,4 +1,5 @@
 """Standalone host setup contract tests. Set TMPDIR to owned scratch storage."""
+import base64
 import importlib.util
 import hashlib
 import json
@@ -59,7 +60,7 @@ class NativeHostSetupTests(unittest.TestCase):
         launcher = importlib.util.module_from_spec(loader)
         loader.loader.exec_module(launcher)
         original_helper = (ROOT / 'deploy/mac-build/provision.py').read_text()
-        broker = (ROOT / 'deploy/mac-build/broker.py').read_bytes()
+        broker = host_setup.broker_from_directory(ROOT / 'deploy/mac-build/broker')
         real_popen, real_select = subprocess.Popen, launcher.select.select
         for phase, line in ((1, "print('classified', flush=True)"), (2, "print('ready', flush=True)")):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -95,7 +96,7 @@ class NativeHostSetupTests(unittest.TestCase):
             runtime, tart = Path(directory) / 'runtime', Path(directory) / 'tart'
             runtime.mkdir(mode=0o700)
             (tart / 'vms').mkdir(parents=True)
-            child = subprocess.Popen([sys.executable, '-I', '-c', script, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            child = subprocess.Popen([sys.executable, '-I', '-c', script, str(runtime), str(tart), base64.b64encode(host_setup.broker_from_directory(ROOT / 'deploy/mac-build/broker')).decode('ascii'), json.dumps(dict(root=str(runtime), tartHome=str(tart)))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 self.assertTrue(launcher.select.select([child.stdout], [], [], 3)[0])
                 self.assertEqual(child.stdout.readline(), b'classified\n')

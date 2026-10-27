@@ -94,7 +94,11 @@ import stat
 import sys
 import uuid
 import re
-import types
+import base64
+import io
+import importlib.abc
+import importlib.util
+import zipfile
 
 root = Path(sys.argv[1])
 if not root.is_absolute() or root.resolve() != root:
@@ -131,9 +135,23 @@ if tart.resolve() != tart or (tart / 'vms').is_symlink() or any(item.name.starts
     raise SystemExit('drain owned clones before installation')
 # Execute only the root wrapper's hash-verified broker bytes, never code from a
 # job tree. Classification does no keychain IO and cannot start a native build.
-broker = types.ModuleType('installation_inventory')
-broker.__file__ = '/dev/null'
-exec(compile(sys.argv[3], '<sealed broker inventory>', 'exec'), broker.__dict__)
+archive = zipfile.ZipFile(io.BytesIO(base64.b64decode(sys.argv[3], validate=True)))
+class BrokerLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != 'partitura_broker' and not fullname.startswith('partitura_broker.'):
+            return None
+        name = fullname.replace('.', '/')
+        package = fullname == 'partitura_broker'
+        member = name + ('/__init__.py' if package else '.py')
+        if member not in archive.namelist():
+            raise ImportError('missing sealed broker module')
+        return importlib.util.spec_from_loader(fullname, self, is_package=package)
+    def exec_module(self, module):
+        member = module.__name__.replace('.', '/') + ('/__init__.py' if module.__name__ == 'partitura_broker' else '.py')
+        module.__file__ = '/dev/null'
+        exec(compile(archive.read(member), '<sealed broker inventory>', 'exec'), module.__dict__)
+sys.meta_path.insert(0, BrokerLoader())
+import partitura_broker as broker
 config = json.loads(sys.argv[4])
 jobs = broker.inventory_obligations(config)
 for job in jobs:
@@ -230,7 +248,8 @@ def render_settings(args):
         old['keychain_policy'] = None if args.keychain_policy == 'preserve' else json.loads(args.keychain_policy)
     policy = dict(old, **{key: value for key, value in dict(profile=args.profile, minimum_free_bytes=args.minimum_free_bytes, daemon_relock_qualified=args.daemon_relock_qualified, daemon_relock_macos_build=args.daemon_relock_macos_build).items() if value is not None})
     names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
-    blobs = {name: show(name) for name in names}
+    blobs = {name: show(name) for name in names if name != 'broker.py'}
+    blobs['broker.py'] = hs.broker_from_commit(clone, commit, hs.git_environment())
     digest = {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()}
     settings = {
         'account': args.account,
