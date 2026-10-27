@@ -51,7 +51,18 @@ async function progress(id) {
     }
   };
   for (let i = 0; i < 120; i++) {
-    const value = await get(base + "/refreshes/" + encodeURIComponent(id));
+    let value;
+    try {
+      value = await get(base + "/refreshes/" + encodeURIComponent(id));
+    } catch (error) {
+      show({
+        operationId: id,
+        error: error.message,
+        message: "Progress check failed. Use Resume progress to retry.",
+      });
+      resume.hidden = false;
+      return;
+    }
     show(value);
     if (value.done) return;
     await new Promise((resolve) => setTimeout(resolve, 1000));
