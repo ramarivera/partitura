@@ -273,6 +273,8 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
         : Promise.resolve(child.stdin.end());
       // A pre-input refusal can close stdin before the bundle finishes. Drain
       // bounded stdout and wait for exit before deciding whether EPIPE matters.
+      // EPIPE is the qualified signal on the pinned Bun runtime. Other stream
+      // errors stay failures unless separately reproduced and qualified.
       const [inputResult, , exitCode] = await Promise.all([
         input.then(
           () => ({ error: undefined }),
@@ -297,7 +299,11 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       ]);
       if (inputResult.error !== undefined && exitCode !== 1)
         throw inputResult.error;
-      return { output: Buffer.concat(chunks).toString("utf8"), exitCode };
+      return {
+        output: Buffer.concat(chunks).toString("utf8"),
+        exitCode,
+        inputComplete: inputResult.error === undefined,
+      };
     } finally {
       clearTimeout(timer);
       if (child.exitCode === null) child.kill("SIGKILL");
@@ -575,6 +581,8 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             const failure =
               Schema.decodeUnknownSync(FailedReceiptSchema)(response);
             validateNativeBuildDiagnostics(failure);
+            if (!result.inputComplete && failure.stage !== "disk-preflight")
+              throw new Error("Invalid native pre-input refusal");
             Object.assign(job, failure);
             return;
           }

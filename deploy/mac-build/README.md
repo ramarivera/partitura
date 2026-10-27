@@ -12,7 +12,10 @@ the installed revision before calling a configured host ready.
 
 The gateway accepts `host-disk-space-unavailable` only with `disk-preflight`
 or `disk-post-transfer`. These diagnostics identify the requested job, commit
-and action even when a broker refuses input and closes stdin early. Unidentified,
+and action even when a broker refuses input and closes stdin early. After a broken
+stdin, only `disk-preflight` refusals are accepted. Post-transfer and workflow
+failures require completed input. `EPIPE` is the qualified broken-pipe signal on
+the pinned Bun runtime; other stream errors remain generic failures. Unidentified,
 malformed or inconsistent output remains a generic failed build. The existing
 `primary` and `backup` clients and their legacy configuration remain in use.
 This gateway change doesn't install disk enforcement on a Mac.
@@ -27,14 +30,31 @@ literals. Before downgrading the gateway:
    acknowledgement; it doesn't detect or stop a running gateway.
 2. Approve and install an old-emitting broker profile before accepting new work
    with the old gateway. This slice doesn't change any installed broker.
-3. From a protected checkout of this revision with its frozen dependencies
-   installed, run the root-local helper with the pinned Bun runtime. Use each
-   configured legacy scratch root separately and an existing root-owned mode-0700
-   backup directory outside both scratch roots, on the same filesystem. For example:
+3. Run the helper on the Docker host, against the **host paths** backing the
+   stopped container's legacy scratch mounts, not its `/app/...` container paths.
+   The runtime image doesn't include this source helper. Use a trusted checkout
+   of this revision with frozen dependencies already installed and a pinned Bun
+   binary. The binary, checkout, all checkout contents including dependencies,
+   and every ancestor must be root-owned and not group- or world-writable. Don't
+   execute a user-writable checkout as root. Establish this trust before launching
+   Bun; the helper cannot undo code that ran during runtime startup or imports.
+
+   Use each configured legacy host scratch path separately and an existing
+   root-owned mode-0700 backup directory outside both scratch roots, on the same
+   filesystem. Change to `/` and launch with an empty environment, a fixed PATH,
+   explicit empty Bun config and dotenv loading disabled. This prevents cwd
+   `bunfig.toml` preloads, `.env` and inherited loader settings from running as root.
+   For example, using placeholder host paths that must match your deployment:
 
    ```nu
-   sudo /path/to/pinned/bun /path/to/checkout/deploy/mac-build/native-build-admin.ts rollback-disk-diagnostics --legacy-root /app/native-build-scratch --backup-root /app/native-build-rollback --gateway-stopped
+   cd /
+   sudo env -i PATH=/usr/bin:/bin /opt/partitura/bin/bun --config=/dev/null --no-env-file /srv/partitura/source/deploy/mac-build/native-build-admin.ts rollback-disk-diagnostics --legacy-root /srv/partitura/native-build-scratch --backup-root /srv/partitura/native-build-rollback --gateway-stopped
    ```
+
+   The CLI requires this cwd, flag set and environment, and checks ownership and
+   writable bits on the executable, checkout root, entry script and their
+   ancestors. These are sanity checks after startup, not proof that an untrusted
+   checkout or its dependencies are safe to execute.
 
 4. Inspect the JSON result. `projected` lists affected job IDs, `unchanged` lists
    compatible records and `quarantined` lists corrupt/unprojectable records moved
@@ -51,9 +71,14 @@ literals. Before downgrading the gateway:
 
 The projection changes only terminal failed disk diagnostics to
 `host-capacity-unavailable` and `capacity`. It preserves the job ID, session owner,
-commit, action and terminal state. Other compatible records remain byte-for-byte
-unchanged. Files must be private, singly linked regular files; symlinks and unsafe
-directories are refused. An exclusive `.native-build-admin.lock` fences concurrent
+commit, action and terminal state. Valid non-disk records remain byte-for-byte
+unchanged, including excess keys the baseline decoder ignores.
+Disk records with unknown fields are quarantined rather than silently dropping
+unrecognized data during a rewrite. Files must be private, singly linked regular
+files; symlinks and unsafe directories are refused. The source and backup roots
+must stay private. Root-owned sticky ancestors such as `/tmp` are allowed;
+non-sticky writable ancestors and non-root/non-self owners are refused.
+An exclusive `.native-build-admin.lock` fences concurrent
 offline helpers, not gateway processes. After a helper crash, remove a leftover
 lock only after confirming the gateway and all helper processes are stopped and
 inspecting any partial backup. No helper operation contacts a Mac or secret provider.

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -10,7 +10,7 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Schema } from "effect";
 import {
   NativeBuildJobSchema,
@@ -22,9 +22,7 @@ const JOB_FILE = /^[a-f0-9]{32}\.json$/u;
 
 /** Offline projection only. Never manufacture a terminal state for a live job. */
 export function projectLegacyDiskRecord(value: unknown) {
-  const job = Schema.decodeUnknownSync(NativeBuildJobSchema)(value, {
-    onExcessProperty: "error",
-  });
+  const job = Schema.decodeUnknownSync(NativeBuildJobSchema)(value);
   if (job.state === "starting" || job.state === "running")
     throw new Error("unfinished-native-job");
   const disk =
@@ -33,12 +31,33 @@ export function projectLegacyDiskRecord(value: unknown) {
     job.stage === "disk-post-transfer";
   if (job.state === "failed") validateNativeBuildDiagnostics(job);
   if (!disk) return job;
+  // Unchanged records keep their exact bytes, including baseline-compatible
+  // excess keys. Don't guess the meaning of extra fields when rewriting a job.
+  Schema.decodeUnknownSync(NativeBuildJobSchema)(value, {
+    onExcessProperty: "error",
+  });
   if (job.state !== "failed") throw new Error("invalid-disk-terminal-state");
   return {
     ...job,
     failureCode: "host-capacity-unavailable" as const,
     stage: "capacity" as const,
   };
+}
+
+export function validateRollbackDirectory(
+  info: Pick<Stats, "isDirectory" | "isSymbolicLink" | "uid" | "mode">,
+  privateRoot: boolean,
+) {
+  const rootOwnedStickyAncestor =
+    !privateRoot && info.uid === 0 && (info.mode & 0o1000) !== 0;
+  if (
+    !info.isDirectory() ||
+    info.isSymbolicLink() ||
+    (info.uid !== 0 && info.uid !== process.getuid?.()) ||
+    ((info.mode & (privateRoot ? 0o077 : 0o022)) !== 0 &&
+      !rootOwnedStickyAncestor)
+  )
+    throw new Error("unsafe-rollback-directory");
 }
 
 async function privateDirectory(path: string) {
@@ -48,13 +67,7 @@ async function privateDirectory(path: string) {
   // checked directory while records are read or atomically replaced.
   for (let current = path; ; current = dirname(current)) {
     const info = await lstat(current);
-    if (
-      !info.isDirectory() ||
-      info.isSymbolicLink() ||
-      (info.uid !== 0 && info.uid !== process.getuid?.()) ||
-      (info.mode & (current === path ? 0o077 : 0o022)) !== 0
-    )
-      throw new Error("unsafe-rollback-directory");
+    validateRollbackDirectory(info, current === path);
     if (dirname(current) === current) break;
   }
   const descriptor = await open(
@@ -65,6 +78,36 @@ async function privateDirectory(path: string) {
     return await descriptor.stat();
   } finally {
     await descriptor.close();
+  }
+}
+
+/** These checks run after Bun startup. They cannot undo preloaded code; the
+ * operator must use the documented clean launch and a trusted sealed checkout.
+ */
+export function validateRollbackLaunchContext(context: {
+  readonly cwd: string;
+  readonly execArgv: readonly string[];
+  readonly environment: Readonly<Record<string, string | undefined>>;
+}) {
+  if (
+    context.cwd !== "/" ||
+    context.execArgv.length !== 2 ||
+    !context.execArgv.includes("--config=/dev/null") ||
+    !context.execArgv.includes("--no-env-file") ||
+    context.environment.PATH !== "/usr/bin:/bin" ||
+    Object.keys(context.environment).some((key) => key !== "PATH")
+  )
+    throw new Error("unsafe-rollback-launch");
+}
+
+async function protectedCodePath(path: string) {
+  if (!isAbsolute(path) || (await realpath(path)) !== path)
+    throw new Error("unsafe-rollback-code");
+  for (let current = path; ; current = dirname(current)) {
+    const info = await lstat(current);
+    if (info.uid !== 0 || (info.mode & 0o022) !== 0 || info.isSymbolicLink())
+      throw new Error("unsafe-rollback-code");
+    if (dirname(current) === current) break;
   }
 }
 
@@ -135,6 +178,14 @@ export async function rollbackLegacyDiskRecords(options: {
       constants.O_NOFOLLOW,
     0o600,
   );
+  let primaryFailed = false;
+  let primaryError: unknown;
+  const result = {
+    backup: "",
+    projected: [] as string[],
+    unchanged: [] as string[],
+    quarantined: [] as string[],
+  };
   try {
     const records = [];
     for (const name of (await readdir(options.legacyRoot))
@@ -160,7 +211,7 @@ export async function rollbackLegacyDiskRecords(options: {
         const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
         if (bytesRead > MAX_RECORD)
           throw new Error(`oversized-native-record:${name.slice(0, 32)}`);
-        bytes = bytes.subarray(0, bytesRead);
+        bytes = Buffer.from(bytes.subarray(0, bytesRead));
       } finally {
         await file.close();
       }
@@ -191,12 +242,7 @@ export async function rollbackLegacyDiskRecords(options: {
     await mkdir(join(backup, "originals"), { mode: 0o700 });
     await mkdir(join(backup, "quarantine"), { mode: 0o700 });
     await syncDirectory(options.backupRoot);
-    const result = {
-      backup,
-      projected: [] as string[],
-      unchanged: [] as string[],
-      quarantined: [] as string[],
-    };
+    result.backup = backup;
     for (const record of records) {
       const jobId = record.name.slice(0, 32);
       const changed =
@@ -241,12 +287,31 @@ export async function rollbackLegacyDiskRecords(options: {
       }
       await syncDirectory(options.legacyRoot);
     }
-    return result;
-  } finally {
-    await lock.close();
-    await unlink(lockPath);
-    await syncDirectory(options.legacyRoot);
+  } catch (error) {
+    primaryFailed = true;
+    primaryError = error;
   }
+  let cleanupFailed = false;
+  let cleanupError: unknown;
+  for (const cleanup of [
+    () => lock.close(),
+    () => unlink(lockPath),
+    () => syncDirectory(options.legacyRoot),
+  ]) {
+    try {
+      await cleanup();
+    } catch (error) {
+      if (!cleanupFailed) cleanupError = error;
+      cleanupFailed = true;
+    }
+  }
+  if (primaryFailed) {
+    if (cleanupFailed)
+      console.error("Native disk rollback lock cleanup failed.");
+    throw primaryError;
+  }
+  if (cleanupFailed) throw cleanupError;
+  return result;
 }
 
 if (import.meta.main) {
@@ -273,6 +338,14 @@ if (import.meta.main) {
       throw new Error(
         "root-required; usage: rollback-disk-diagnostics --legacy-root PATH --backup-root PATH --gateway-stopped",
       );
+    validateRollbackLaunchContext({
+      cwd: process.cwd(),
+      execArgv: process.execArgv,
+      environment: process.env,
+    });
+    await protectedCodePath(process.execPath);
+    await protectedCodePath(resolve(import.meta.dir, "../.."));
+    await protectedCodePath(import.meta.path);
     const result = await rollbackLegacyDiskRecords({
       legacyRoot,
       backupRoot,

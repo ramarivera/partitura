@@ -621,6 +621,8 @@ for (const invalid of [
   "wrong-stage",
   "success-exit",
   "transport-exit",
+  "post-transfer",
+  "workflow",
 ] as const) {
   it.live(
     `validates pre-input disk refusal after a broken stdin: ${invalid}`,
@@ -659,7 +661,17 @@ for (const invalid of [
                 ? { job: "f".repeat(32) }
                 : invalid === "wrong-stage"
                   ? { stage: "capacity" }
-                  : {},
+                  : invalid === "post-transfer"
+                    ? { stage: "disk-post-transfer" }
+                    : invalid === "workflow"
+                      ? {
+                          stage: "workflow",
+                          failureCode: "workflow-failed",
+                          workflowExitCode: 1,
+                          artifactBytes: payload.length,
+                          artifactSha256: "a".repeat(64),
+                        }
+                      : {},
           }),
         );
         const client = await createNativeBuildClient(fixture.config);
@@ -681,6 +693,9 @@ for (const invalid of [
           else {
             expect(result.failureCode).toBeUndefined();
             expect(result.stage).toBeUndefined();
+            await expect(client.artifact("session-a", job.job)).rejects.toThrow(
+              "no deliverable artifact",
+            );
           }
         } finally {
           await client.close();
