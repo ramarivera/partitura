@@ -4,6 +4,7 @@ import errno
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -11,9 +12,8 @@ import unittest
 from unittest.mock import patch, AsyncMock, Mock
 
 SOURCE = Path(__file__).resolve().parents[1] / "deploy/session-sandbox/broker.py"
-spec = importlib.util.spec_from_file_location("firecracker_broker", SOURCE)
-broker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(broker)
+sys.path.insert(0, str(SOURCE.parent))
+from sandbox_broker import core as broker
 vm = broker.vm
 
 

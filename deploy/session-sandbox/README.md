@@ -5,6 +5,20 @@ host runtime and workspace mounts. Firecracker is the default session backend;
 Sysbox is an explicit alternative. Neither backend exposes the host Docker
 socket to workers. Installing source files does not qualify a live deployment.
 
+## Broker installation
+
+Build the single-file broker from the repository root, then install it alongside
+`firecracker.py`. The systemd unit continues to run the same broker path.
+
+```sh
+python3 deploy/session-sandbox/build-broker.py /absolute/scratch/broker.py
+install -m 0755 /absolute/scratch/broker.py /opt/partitura-sandbox/broker.py
+install -m 0644 deploy/session-sandbox/firecracker.py /opt/partitura-sandbox/firecracker.py
+```
+
+The build uses sorted zip entries with fixed timestamps and permissions. It
+doesn't include Python bytecode or require packages outside the standard library.
+
 ## Firecracker guest
 
 The generic x86_64 Linux guest starts from the digest-pinned worker image built
