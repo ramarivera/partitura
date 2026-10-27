@@ -20,10 +20,22 @@ def dedicated_home(bootstrap=False):
     info = home.lstat()
     if home.resolve() != home or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError('dedicated home must be owned mode 0700')
-    # Fresh one-shot setup initializes the keychain before the fenced installer
-    # transaction can apply/read back its settings. This only writes the caller's
-    # own private credential. An installed config always retains its binding.
+    # Fresh setup requires a root-sealed account/uid binding from the one-shot
+    # provisioner. Caller-controlled argv and a private home aren't authority.
     if bootstrap and not os.path.lexists(CONFIG):
+        binding = CONFIG.with_name('credential-bootstrap.json')
+        for path in (binding, *binding.parents):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('unsafe bootstrap account binding')
+        descriptor = os.open(binding, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4096 or stat.S_IMODE(info.st_mode) != 0o444:
+                raise ValueError('unsafe bootstrap account binding')
+            value = json.load(stream)
+        if value != dict(schema=1, account=account.pw_name, uid=os.getuid(), home=str(home)):
+            raise ValueError('caller is not the configured bootstrap account')
         return home
     for path in (CONFIG, *CONFIG.parents):
         info = path.lstat()

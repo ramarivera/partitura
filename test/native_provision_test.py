@@ -272,6 +272,82 @@ class RenderSettingsTests(unittest.TestCase):
 
 
 class KeychainPolicyTests(unittest.TestCase):
+    def test_bootstrap_binding_is_root_sealed_readable_and_uid_bound_under_private_umask(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            binding = Path(directory) / 'sealed/state/credential-bootstrap.json'
+            actual = Path.lstat
+            def metadata(path):
+                info = actual(path)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=0, st_nlink=info.st_nlink)
+            identity = SimpleNamespace(pw_uid=502, pw_dir='/Users/builder')
+            with patch.object(module, 'BOOTSTRAP_BINDING', binding), patch.object(module.os, 'geteuid', return_value=0), patch.object(module.pwd, 'getpwnam', return_value=identity), patch.object(Path, 'lstat', metadata):
+                mask = os.umask(0o077)
+                try:
+                    self.assertEqual(module.bootstrap_binding('builder'), 0)
+                finally:
+                    os.umask(mask)
+                self.assertEqual(binding.stat().st_mode & 0o777, 0o444)
+                self.assertEqual(binding.parent.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(binding.parent.parent.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(json.loads(binding.read_text()), dict(schema=1, account='builder', uid=502, home='/Users/builder'))
+                self.assertEqual(module.bootstrap_binding('builder'), 0)
+                identity.pw_uid = 503
+                with self.assertRaisesRegex(ValueError, 'bootstrap binding differs'):
+                    module.bootstrap_binding('builder')
+
+    def test_guard_abort_restored_releases_only_its_own_fences_and_classifies_legacy_jobs(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            root = Path(directory)
+            runtime, tart = root / 'runtime', root / 'tart'
+            runtime.mkdir(mode=0o700)
+            (tart / 'vms').mkdir(parents=True)
+            old = runtime / ('a'*32)
+            old.mkdir(mode=0o700)
+            (old / 'receipt.json').write_text(json.dumps(dict(job='a'*32, state='running', commit='d'*40, action='archive')))
+            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))]
+            # A verified rollback hasn't unlocked anything. Preserve old job
+            # evidence and release the installer's new fences for the old broker.
+            result = subprocess.run(command, input=b'abort-restored\n', capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'legacy job receipts require broker SSH recovery', result.stderr)
+            self.assertFalse((runtime / 'cleanup-required').exists())
+            self.assertFalse((runtime / 'maintenance-blocked').exists())
+            self.assertFalse((runtime / 'inventory-required').exists())
+            self.assertEqual(json.loads((old / 'receipt.json').read_text())['state'], 'running')
+            # An unexpected legacy file fails validation before any fence write.
+            (old / 'unexpected').touch()
+            refused = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertFalse((runtime / 'cleanup-required').exists())
+            (old / 'unexpected').unlink()
+            # A real cleanup job must never be mistaken for an installer token.
+            token = 'f'*32
+            (runtime / 'maintenance-blocked').write_text('installation-incomplete ' + token + '\n')
+            (runtime / 'cleanup-required').write_text('b'*32 + '\n')
+            refused = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual((runtime / 'cleanup-required').read_text(), 'b'*32 + '\n')
+
+    def test_fresh_credential_branch_orders_binding_writer_password_and_keychain_and_preserves_existing(self):
+        source = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()
+        lifecycle = source.split('step "5a initialize missing fresh-host credentials"', 1)[1].split('case $rc in', 1)[0]
+        script = '''set -euo pipefail
+account=builder; INSTALL=/sealed; RMB=/source; PY=(python3); policy_only=0
+step() { :; }; die() { echo "$*" >&2; exit 1; }
+sudo() {
+  if [ "$1" = test ]; then return 1; fi
+  if [ "$1" = cat ]; then printf 'pinned writer bytes'; return; fi
+  if [ "$1" = -H ] && [ "$2" = -u ]; then cat >/dev/null; fi
+  echo "CALL $*" >&2
+}
+''' + lifecycle
+        result = subprocess.run(['/bin/bash', '-c', script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stages = ['bootstrap-binding --account builder', '- --bootstrap', 'password --account builder', '- keychain']
+        positions = [result.stderr.index(stage) for stage in stages]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn('keychain-policy', result.stderr)
+
     def test_install_guard_fences_until_commit_and_failed_install_can_resume(self):
         import fcntl
         import select
@@ -280,12 +356,12 @@ class KeychainPolicyTests(unittest.TestCase):
             runtime, tart = root / 'runtime', root / 'tart'
             runtime.mkdir(mode=0o700)
             (tart / 'vms').mkdir(parents=True)
-            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart)]
+            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))]
             child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 self.assertTrue(select.select([child.stdout], [], [], 5)[0])
                 self.assertEqual(child.stdout.readline(), b'ready\n')
-                self.assertEqual((runtime / 'maintenance-blocked').read_text(), 'installation-incomplete\n')
+                self.assertRegex((runtime / 'maintenance-blocked').read_text(), r'^installation-incomplete [a-f0-9]{32}\n$')
                 with (runtime / 'runner.lock').open('rb') as lock:
                     with self.assertRaises(BlockingIOError):
                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -311,6 +387,9 @@ class KeychainPolicyTests(unittest.TestCase):
                     child.kill()
                 child.communicate(timeout=5)
             self.assertTrue((runtime / 'cleanup-required').exists())
+            refused_abort = subprocess.run(command, input=b'abort-restored\n', capture_output=True, timeout=5)
+            self.assertNotEqual(refused_abort.returncode, 0)
+            self.assertTrue((runtime / 'cleanup-required').exists())
             retry = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
             self.assertEqual(retry.returncode, 0, retry.stderr)
             self.assertFalse((runtime / 'cleanup-required').exists())
@@ -320,39 +399,6 @@ class KeychainPolicyTests(unittest.TestCase):
             refused = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn(b'drain and reconcile', refused.stderr)
-
-    def policy(self, mode, state, ignore_set=False, snapshot=None):
-        class Api:
-            def __init__(self, call): self.call = call
-            def __call__(self, *args): return self.call(*args)
-        def copy(handle, pointer):
-            for key, value in state.items(): setattr(pointer._obj, key, value)
-            return 0
-        def update(handle, pointer):
-            if not ignore_set:
-                state.update({key: getattr(pointer._obj, key) for key in state})
-            return 0
-        security = SimpleNamespace(SecKeychainSetUserInteractionAllowed=Api(lambda allowed: 0), SecKeychainOpen=Api(lambda path, handle: 0), SecKeychainCopySettings=Api(copy), SecKeychainSetSettings=Api(update))
-        cf = SimpleNamespace(CFRelease=Api(lambda handle: None))
-        info = SimpleNamespace(st_mode=0o100600, st_uid=1000, st_nlink=1)
-        argv = ['policy', mode] + ([json.dumps(snapshot)] if snapshot is not None else [])
-        with patch('sys.argv', argv), patch('os.getuid', return_value=1000), patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir='/Users/builder', pw_name='builder')), patch.object(Path, 'is_symlink', return_value=False), patch.object(Path, 'lstat', return_value=info), patch('os.path.lexists', return_value=True), patch.object(ctypes, 'CDLL', side_effect=[security, cf]), contextlib.redirect_stdout(io.StringIO()) as printed:
-            exec(module.KEYCHAIN_POLICY_SCRIPT, {})
-        return printed.getvalue()
-
-    def test_settings_apply_readback_restore_without_unlock_or_credentials(self):
-        old = dict(lockOnSleep=False, useLockInterval=False, lockInterval=7200)
-        state = dict(old)
-        snapshot = json.loads(self.policy('snapshot', state))
-        self.policy('apply', state)
-        self.assertEqual(state, dict(lockOnSleep=1, useLockInterval=1, lockInterval=300))
-        self.policy('check', state)
-        self.policy('restore', state, snapshot=snapshot)
-        self.assertEqual(state, old)
-        with self.assertRaisesRegex(SystemExit, 'readback differs'):
-            self.policy('apply', state, ignore_set=True)
-        with self.assertRaisesRegex(SystemExit, 'readback differs'):
-            self.policy('check', state)
 
     def test_policy_only_branch_preserves_existing_password_and_keychain(self):
         source = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()

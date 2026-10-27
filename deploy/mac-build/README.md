@@ -202,31 +202,46 @@ directory's include would load a backup. It restores the file if `sshd -t`
 fails. The credential writer reads the new password; root then sets the account
 password from that saved credential over a private pseudo-terminal, so the
 secret never appears in a process argument or environment. It initializes the
-build keychain before the managed-file transaction so the automatic-lock policy
-can be applied and read back while admission remains fenced. The credential
-writer has an explicit fresh-host `--bootstrap` mode for this ordering. It
-still requires the caller's own canonical private home and never bypasses an
-existing installed account binding. It doesn't test the unlock: on macOS 27 an
-unlock run through `sudo -u` from the operator's session fails even when the
-keychain is right, while the broker's own SSH session unlocks it. The first
-build is the proof, and the broker stops with `unlock-failed` before cloning.
-Existing credential/keychain pairs are preserved, including installations made
-by the previous one-shot installer. No rerun deletes or replaces a keychain.
-An installed host missing its keychain stops for explicit repair instead of treating a key update as fresh
-password/keychain initialization.
+build keychain before the managed-file transaction. Fresh-host `--bootstrap`
+requires a root-owned mode 0444 account binding created by the root helper under
+`/Library/Partitura/NativeBuild/credential-bootstrap.json`. It binds the dedicated
+account's name, uid and canonical private home; an arbitrary unprivileged account
+cannot bootstrap. An existing installed config must agree with that binding.
+
+The sudo installer never checks, reads settings from or changes settings on the
+keychain. On macOS 27, operations through `sudo -u` from the operator's session
+fail even with the correct password, while the broker's own SSH session works.
+The first separately approved build proves unlock; `unlock-failed` stops before
+cloning. Existing credential/keychain pairs are preserved. No rerun deletes or
+replaces a keychain. A partial main-era install with both files absent can finish
+initialization through a full approved rerun without `--policy-only`, using the
+installed account binding. An existing keychain without its credential requires
+explicit host repair. Policy-only updates never initialize either file.
 Password initialization uses root-private stable state under
 `/Library/Partitura/NativeBuild/provisioning`, independent of the source commit.
-A missing credential beside an existing keychain stops for explicit host repair.
-Old `keychain-created` markers never skip new policy/readback checks.
 
-Every run verifies `lockOnSleep`, `useLockInterval` and a
-300-second lock interval through Security.framework, applying it transactionally
-when needed, without unlocking or
-passing the saved password through argv or env. This timeout is defense in depth;
-it never clears a cleanup fence. If it breaks a real Tart workflow, stop rollout
-and resolve the access window explicitly. Installer success still requires the
-first separately approved broker-session build to prove unlock. Daemon relock
-qualification is separate.
+The sealed `broker.keychain_policy` defaults to `null`, meaning leave settings
+unchanged, including on legacy upgrades. No automatic-lock interval reaches a
+production host through the default installer. An explicit policy is an object
+with `lockOnSleep` and `useLockInterval` booleans and a `lockInterval` in seconds.
+For an approved qualification update, `--keychain-policy` accepts that JSON, for
+example `'{"lockOnSleep":true,"useLockInterval":true,"lockInterval":300}'`.
+Choose and qualify the interval on an isolated or backup host before approving it
+for a primary. The broker applies it inside its SSH session immediately after
+unlock, reads it back before cloning, and fails with `keychain-policy-unavailable`
+if that fails or differs. Legacy receipts keep the existing `unlock` /
+`unlock-failed` diagnostic so the live gateway can decode them. It saves the prior settings before mutation in private
+`keychain-policy.json`. Receipts/status carry successful prior/requested/readback
+values and `preRelockState`; health exposes cached evidence without a keychain
+API call. The first prior snapshot persists across repeated applications of the
+same requested policy. An interval is defense in depth and never clears a fence.
+
+To revert, quiesce the host, take the recorded prior object and approve a
+policy-only update with `--keychain-policy` set to those exact values. An approved
+SSH build must show the restored readback. Then approve a second policy-only
+update with `--keychain-policy preserve` to stop managing settings. `preserve`
+alone doesn't undo a policy already applied. These policy values aren't secrets;
+passwords still never enter argv or env. Daemon relock qualification is separate.
 
 For an approved key/policy update on an installed host, use the same entry point
 with `--policy-only --apply`, the existing account/base/Tart-home selections and
@@ -241,11 +256,12 @@ The old single `--authorized-key` flag and old settings `authorized_key` remain
 valid. New settings use `authorized_keys`, with one or two unique public keys
 when enabled and an empty list when disabled. Supplying both forms is invalid.
 The `broker` settings carry `protocol: 2`, `host_id`, `profile`,
-`minimum_free_bytes`, `daemon_relock_qualified` and `daemon_relock_macos_build`.
+`minimum_free_bytes`, `daemon_relock_qualified`, `daemon_relock_macos_build` and
+optional `keychain_policy`.
 The protocol is fixed by this broker revision; the other fields become the
 extended sealed broker config. Fresh installs default to `legacy`, 50 GiB and
 unqualified daemon relock. Existing settings without `broker` preserve the
-installed profile, floor and qualification instead of resetting them.
+installed profile, floor, qualification and keychain policy instead of resetting them.
 
 `--host-id` supplies an independently recorded UUID or the one-shot renderer
 proposes a UUID once and retains it across rerenders. Root apply persists it in
@@ -266,20 +282,44 @@ and installed manifest covers the same seven managed targets, including Tart.
 The immutable identity journal is separate installation state.
 
 Root apply takes the existing runner lock nonblocking as the dedicated account,
-refuses outstanding fences/owned clones, and writes durable admission fences
-before replacing anything. The transaction inherits the guard pipe so loss of
-its wrapper cannot release runner.lock while file replacement is still alive.
-The old daemon is stopped before code changes. The
-transaction snapshots all managed files, the prior daemon load state and existing
-keychain settings. It installs the plist last and checks launchd after bootstrap;
-any failure restores files/settings and the prior load state. It never loads two
-maintenance instances. Admission remains fenced through successful transaction
-readback; commit rotates the epoch and requests bounded boot inventory. Health
-cannot become ready until that inventory finishes, normally on the next minute
-pass. A failed transaction leaves an `installation-incomplete` fence. Repair the
-reported cause and rerun the same approved stage/apply; only this exact installer
-fence pair is resumable automatically. Other safety fences require authenticated
-broker reconciliation or explicit host repair, never manual flag deletion.
+refuses outstanding safety fences/owned clones, and classifies private job state
+using the sealed broker's read-only inventory. It reports stale main-era job IDs
+without exposing receipt contents. Classified receipt/input debris can be
+recovered by the new broker in an authenticated SSH session before accepting
+legacy input, including when the unqualified daemon has left a pending relock.
+Unknown or unsafe objects stop installation before it creates any fence.
+
+The guard writes matching random tokens into `cleanup-required` and
+`maintenance-blocked` before replacing anything. The transaction inherits its
+pipe so loss of the wrapper cannot release `runner.lock` during replacement.
+The old daemon is stopped before code changes. The transaction snapshots managed
+files and the daemon's system-domain load state using `launchctl print system/<label>`.
+It installs the plist last and checks launchd after bootstrap. Failure restores
+files and the prior load state; it never loads two maintenance instances. There
+are no keychain settings operations in this transaction or its rollback.
+
+Successful readback commits the guard, rotates the epoch and requests bounded
+boot inventory. Health can't become ready until inventory finishes. A failed
+transaction reports a distinct restored result only if rollback succeeded. The
+root wrapper then revalidates the original manifest and payloads before asking
+the guard to remove its own token-matched fences. The restored predecessor can
+keep building. An incomplete rollback, failed revalidation or interrupted guard
+retains `installation-incomplete <token>`. Repair the reported cause and rerun
+the approved stage/apply; `--check` reports installation needed even if managed
+files already match. Only an exact installer token pair is resumable, and a
+resumed incomplete install must finish successful readback before release.
+
+If rollback retained backups, use their reported paths and the reviewed
+predecessor manifest for separately approved host repair, then finish the
+validated installer. Never delete flags by hand. SSH `reconcile` refuses an
+installer fence. Ordinary broker cleanup uses an authenticated restricted SSH
+command such as `ssh -i KEY -o UserKnownHostsFile=PINNED_HOSTS partitura-build@HOST
+'reconcile JOB32HEX'`; the new broker accepts that command in legacy mode. Use
+its reported obligation ID, inspect the returned cleanup result and fresh health,
+and repeat for bounded batches if required. Cancellation acknowledgement alone
+isn't cleanup evidence. Before upgrading a main-era broker, its existing `cancel
+JOB32HEX` remains the recovery command. Actual owned clones and safety fences
+must be drained before installation.
 
 The run ends with stable identity/profile, base hash and the host-key line for
 the gateway's `known_hosts`. No installer action changes a gateway transport or
@@ -490,8 +530,9 @@ remain valid and default the disk floor to 50 GiB. Only the sealed configuration
 can raise the execution floor. Registry-only mode refuses legacy `run`; legacy
 mode refuses `run-v2`. Health and reconciliation require an installed host
 identity. Legacy status/cancel shapes remain unchanged even with an identity
-installed. The installer in this tree still emits the original configuration. It
-doesn't install these new fields or maintenance.
+installed. This installer emits the extended configuration and installs the
+maintenance daemon. Optional `keychainPolicy` is `null` to preserve settings or
+the sealed settings object described above; older configurations remain valid.
 
 Registry JSON is a closed, newline-terminated envelope of at most 4096 UTF-8
 bytes, including `protocolVersion: 2`, installed `hostId` and a fixed `kind`.
@@ -503,7 +544,7 @@ Main kinds are:
 
 | Kind | Fields and meaning |
 | --- | --- |
-| `health` | `brokerRevision`, `capabilities`, `profile`, `epoch`, `status`, `accepting`, `capacity`, disk byte counts, fixed `reasons` and `housekeepingSkippedEntries`. The latter contains `artifacts` and `history` counts from each category's last pass, zero before a pass or if diagnostics are unreadable. Status is `ready`, `busy` or `blocked`; capacity is 0 or 1. Busy/blocked health exits zero. |
+| `health` | `brokerRevision`, `capabilities`, `profile`, `epoch`, `status`, `accepting`, `capacity`, disk byte counts, cached `keychainPolicy` evidence, fixed `reasons` and `housekeepingSkippedEntries`. The latter contains `artifacts` and `history` counts from each category's last pass, zero before a pass or if diagnostics are unreadable. Status is `ready`, `busy` or `blocked`; capacity is 0 or 1. Busy/blocked health exits zero. |
 | `known` | Job identity and receipt fields. State is `receiving`, `running`, `succeeded`, `failed` or `cancelled`. Optional diagnostics and artifact fields are allowlisted. `artifactExpired` is a flag, never a state. |
 | `unknown-job` | `job`, `tombstonePresent`, `inconsistentDirectory`. No receipt exists. History may have expired after thirty days; this isn't proof the job never ran. An inconsistent directory requires reconciliation. Invalid/unreadable state returns an error instead. |
 | `refused` | `job`, `commit`, `action`, `attempt`, `accepted: false`, fixed `code`. Exit 1. Includes `host-busy`, `stale-epoch`, `submission-expired`, `duplicate-job`, `duplicate-attempt`, `cancelled`, `legacy-profile`, `host-reconciled`, `host-maintenance`, `cleanup-required` or `keychain-relock-pending`. `host-maintenance` means inventory is pending, in backoff or encountered transient IO; it doesn't establish a cleanup fault. |
@@ -558,7 +599,9 @@ another build to enter.
 
 Cancel acknowledges a durable tombstone with exit zero even if cleanup fails;
 acknowledgement never proves cleanup. Registry cancel only writes/fsyncs its
-tombstone. Legacy cancel can reconcile multiple abandoned jobs under the lock,
+tombstone. Legacy run can complete post-install inventory and pending daemon relock in its
+authenticated SSH session before reading input. A real cleanup-required fence
+still needs cancel/reconcile. Legacy cancel can reconcile multiple abandoned jobs under the lock,
 retaining their fences on failure. Reconcile takes the exclusive lock, inspects
 exact `partitura-job-<job32hex>` clones and bounded private state, removes
 abandoned input, terminalizes interrupted receiving/running receipts, and
@@ -643,7 +686,7 @@ success, permission to retry, or that the original command didn't execute.
 
 Daemon relock is unqualified by default. Such a pass can remove VM/input debris
 but retains `keychain-relock-pending` and the epoch if unlock might have
-happened. A later authenticated SSH reconcile or pre-input `run-v2` recovery
+happened. A later authenticated SSH reconcile or pre-input legacy/`run-v2` recovery
 completes relock/readback. Even a sealed qualification becomes ineffective after
 a macOS build change. These fake-only tests don't qualify Security.framework
 behavior, cross-session relock, power-loss cleanup, sshd keepalives or a
@@ -662,8 +705,10 @@ some macOS versions also need an initial desktop login for that account. A
 manually created keychain alone isn't proven sufficient. See the upstream
 [Tart investigation](https://github.com/openai/tart/issues/1146).
 
-The bootstrap currently creates the account and private paths, but doesn't
-initialize its keychain or desktop security state. Treat those as unresolved
+The standalone `bootstrap-host.sh` creates the account and private paths, but
+doesn't initialize its keychain or desktop security state. The one-shot
+`provision-host.sh` initializes a fresh dedicated keychain; it still can't prove
+desktop security state. Treat those as unresolved
 host prerequisites until a job boots through the installed restricted SSH route.
 Provisioning a keychain or changing account authentication requires separate
 operator approval. Preserve public-key-only SSH, the forced command and disabled
@@ -676,7 +721,9 @@ through `/dev/tty` with echo disabled, twice. The human runs it with
 on a host that needs the process-scoped Command Line Tools selection, after the approved password initialization. It refuses an existing destination,
 an inherited operator HOME, or a different account. The new file is mode 0600;
 the earlier `.partitura-native-keychain.password` is left unused and untouched.
-Neither the installer nor bootstrap sets a password or logs a user in.
+The one-shot installer sets a fresh account password from the saved credential
+over a private pseudo-terminal. Standalone host setup/bootstrap doesn't set a
+password. No installer logs a user in.
 
 Only `run` reads that credential, after receiving the bundle and acquiring the
 runner lock. The broker opens the explicit dedicated login keychain and unlocks
@@ -706,14 +753,15 @@ available-to-account space on the actual job and Tart roots after base preparati
 Keep the MacBook disabled if either root is below its sealed floor. Review the
 predecessor manifest/payloads and the proposed settings and identity before the
 one-shot legacy-profile upgrade. The installer changes root-managed broker,
-keys/config/sshd files, identity state, launchd registration and keychain settings;
+keys/config/sshd files, identity state and launchd registration;
 Remote Login admission remains scoped and never enables the service globally.
 
 Read back the exact managed manifest, effective SSH policy for the build account
-and an unrelated operator account, launchd identity/load state and keychain
-settings. Verify both restricted public keys separately during a planned overlap.
-Record the installed macOS build from `/usr/bin/sw_vers -buildVersion`. Neither
-successful settings readback nor a sudo-session unlock qualifies daemon relock.
+and an unrelated operator account, and launchd identity/load state. Preserve
+keychain settings on the production legacy rollout. For an explicitly requested
+policy, use the first approved broker SSH build's receipt/health readback. Verify both restricted public keys separately during a planned overlap.
+Record the installed macOS build from `/usr/bin/sw_vers -buildVersion`. A successful SSH settings readback doesn't qualify daemon relock; never use a
+sudo-session keychain check.
 
 On an approved isolated qualification host/account using a dedicated test login
 keychain and a fake repository task, exercise the installed broker under real
@@ -722,7 +770,10 @@ unlock marker, then let the installed LaunchDaemon clean VM/input state. In the
 daemon's security context, require SecKeychainLock followed by
 SecKeychainGetStatus reporting locked. Confirm locked state again through a new,
 independent sshd session. Also qualify locked-at-boot, killed-run and power-loss
-cleanup, and a workflow long enough to cross the 300-second auto-lock interval.
+cleanup. Separately qualify any proposed auto-lock policy with a full workflow
+longer than its chosen interval, including artifact collection and cleanup. Read
+`preRelockState` and the saved policy values from the approved SSH build receipt.
+Do this on an isolated or backup host before primary rollout.
 Do not borrow the operator's login keychain or clear fences to force a pass.
 Until this evidence exists, retain `daemon_relock_qualified: false`; pending
 relock must be completed by authenticated SSH reconciliation. These are host

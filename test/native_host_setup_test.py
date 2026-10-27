@@ -18,12 +18,16 @@ host_setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host_setup)
 
 
+SCRATCH = Path(os.environ.get('TMPDIR') or Path.home() / 'dev/agentic-scratchpads/partitura/builder-registry-impl/python-tests').resolve()
+SCRATCH.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
 class NativeHostSetupTests(unittest.TestCase):
     def test_root_identity_journal_survives_reruns_and_refuses_conflicts(self):
         loader = importlib.util.spec_from_file_location('native_identity', ROOT / 'deploy/mac-build/native_host.py')
         launcher = importlib.util.module_from_spec(loader)
         loader.loader.exec_module(launcher)
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
             journal = Path(directory) / 'installation.json'
             config = dict(hostId='12345678-1234-1234-1234-123456789abc')
             actual_lstat = Path.lstat
@@ -33,7 +37,11 @@ class NativeHostSetupTests(unittest.TestCase):
             def installed(path):
                 return path.read_bytes() if path == journal and path.exists() else None
             with patch.object(launcher, 'IDENTITY_PATH', journal), patch.object(launcher, 'read_installed', side_effect=installed), patch.object(Path, 'lstat', root_metadata):
-                launcher.ensure_identity(config, 'builder')
+                old_umask = os.umask(0o777)
+                try:
+                    launcher.ensure_identity(config, 'builder')
+                finally:
+                    os.umask(old_umask)
                 first = journal.read_bytes()
                 launcher.ensure_identity(config, 'builder')
                 self.assertEqual(journal.read_bytes(), first)
@@ -48,7 +56,7 @@ class NativeHostSetupTests(unittest.TestCase):
         loader = importlib.util.spec_from_file_location('native_predecessor', ROOT / 'deploy/mac-build/native_host.py')
         launcher = importlib.util.module_from_spec(loader)
         loader.loader.exec_module(launcher)
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
             root = Path(directory)
             broker, writer, plist, tart = [root / name for name in ('broker', 'writer', 'plist', 'tart')]
             manifest_path = root / 'manifest'

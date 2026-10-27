@@ -27,6 +27,16 @@ class CredentialWriterTests(unittest.TestCase):
             def metadata(path):
                 return SimpleNamespace(st_mode=0o40700, st_uid=502) if path == Path('/Users/builder') else SimpleNamespace(st_mode=0o100444, st_uid=0)
             with patch.object(writer, 'CONFIG', config), patch.object(writer.pwd, 'getpwuid', return_value=account), patch.object(writer.os, 'getuid', return_value=502), patch.dict(os.environ, HOME='/Users/builder'), patch.object(Path, 'resolve', return_value=Path('/Users/builder')), patch.object(Path, 'lstat', metadata):
+                with self.assertRaises(FileNotFoundError):
+                    writer.dedicated_home(bootstrap=True)
+                binding = config.with_name('credential-bootstrap.json')
+                binding.write_text(json.dumps(dict(schema=1, account='builder', uid=501, home='/Users/builder')))
+                binding.chmod(0o444)
+                with self.assertRaisesRegex(ValueError, 'configured bootstrap account'):
+                    writer.dedicated_home(bootstrap=True)
+                binding.chmod(0o600)
+                binding.write_text(json.dumps(dict(schema=1, account='builder', uid=502, home='/Users/builder')))
+                binding.chmod(0o444)
                 self.assertEqual(writer.dedicated_home(bootstrap=True), Path('/Users/builder'))
                 with self.assertRaises(FileNotFoundError):
                     writer.dedicated_home()

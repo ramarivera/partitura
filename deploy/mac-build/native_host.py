@@ -18,8 +18,8 @@ import sys
 import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
-INSTALL_HOST_SHA256 = "b37f29583d464db0e8e49744d566b3a00b967c1e4c218b91c0847ac4ed6c3d1a"
-PROVISION_SHA256 = "ac9b6b41224efb91e611398bd6eba6211bc6e19852fe3f0b144103535892964c"
+INSTALL_HOST_SHA256 = "b8863ad7ae1f203b8889dcd198536683e599206cd59ad4275fe0930fa41d1009"
+PROVISION_SHA256 = "1298d586e8b4a9a802107ba2f438ee88e952795699a52f013863727875b3068f"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 STAGED_FILES = {
     '/Library/Partitura/NativeBuild/credential-writer.py': 'credential-writer.py',
@@ -139,8 +139,10 @@ def ensure_identity(config: dict, account: str) -> None:
             raise ValueError('unsafe installation identity ancestor')
     for item in reversed(missing):
         item.mkdir(mode=0o755)
+        item.chmod(0o755)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
     with os.fdopen(descriptor, 'w') as stream:
+        os.fchmod(stream.fileno(), 0o444)
         stream.write(json.dumps(value, sort_keys=True) + '\n')
         stream.flush()
         os.fsync(stream.fileno())
@@ -159,21 +161,27 @@ def helper_constant(blob: bytes, name: str) -> str:
 
 
 @contextlib.contextmanager
-def installation_guard(config: dict, account: str, helper: bytes):
+def installation_guard(config: dict, account: str, helper: bytes, broker: bytes):
     script = helper_constant(helper, 'INSTALL_GUARD_SCRIPT')
-    command = ['/usr/bin/sudo', '--non-interactive', '-H', '-u', account, '/usr/bin/env', '-i', f'HOME=/Users/{account}', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', 'DEVELOPER_DIR=/Library/Developer/CommandLineTools', '/usr/bin/python3', '-I', '-c', script, config['root'], config['tartHome']]
-    guard = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    command = ['/usr/bin/sudo', '--non-interactive', '-H', '-u', account, '/usr/bin/env', '-i', f'HOME=/Users/{account}', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', 'DEVELOPER_DIR=/Library/Developer/CommandLineTools', '/usr/bin/python3', '-I', '-c', script, config['root'], config['tartHome'], broker.decode(), json.dumps(config)]
+    guard = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True, close_fds=True)
     try:
         if not select.select([guard.stdout], [], [], 15)[0] or guard.stdout.readline(64) != b'ready\n':
             raise ValueError('native jobs are busy, fenced or unsafe; drain/reconcile before installation')
         # The installer inherits this write end too. If this root wrapper dies,
         # EOF cannot release the run lock while its transaction is still alive.
-        yield guard.stdin.fileno()
-        guard.stdin.write(b'commit\n')
+        rolled_back = False
+        try:
+            yield guard.stdin.fileno()
+        except InstallationRestored:
+            rolled_back = True
+        guard.stdin.write(b'abort-restored\n' if rolled_back else b'commit\n')
         guard.stdin.flush()
         guard.stdin.close()
         if guard.wait(timeout=15) != 0:
             raise ValueError('installation readback complete but admission fence remains')
+        if rolled_back:
+            raise InstallationRestored('installation failed; verified predecessor restored and installer fences removed')
     finally:
         if guard.stdin and not guard.stdin.closed:
             guard.stdin.close()
@@ -184,6 +192,10 @@ def installation_guard(config: dict, account: str, helper: bytes):
             # Never kill its lock owner to make installation look complete.
             print('native host installation guard still owns admission; host inspection required', file=sys.stderr)
         guard.stdout.close()
+
+
+class InstallationRestored(ValueError):
+    pass
 
 
 def fail(message: str) -> int:
@@ -290,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     if os.geteuid() != 0:
         return fail("--apply requires root privileges")
     try:
+        original_manifest = read_installed(MANIFEST_PATH)
         verify_predecessor(payloads, args.predecessor_manifest_sha256)
         config = json.loads(payloads['config.json'])
         if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', config['hostId']) or config['profile'] not in ('legacy', 'registry-only'):
@@ -313,8 +326,14 @@ def main(argv: list[str] | None = None) -> int:
             target.chmod(0o600)
         subprocess.run(['/usr/bin/ditto', '--rsrc', str(stage / 'tart.app'), str(root_stage / 'tart.app')], check=True)
         try:
-            with installation_guard(config, args.account, payloads['provision.py']) as guard_fd:
-                result = subprocess.run(["/bin/bash", str(root_script), str(root_stage), args.tart_sha256, args.account], pass_fds=(guard_fd,), check=True)
+            with installation_guard(config, args.account, payloads['provision.py'], payloads['broker.py']) as guard_fd:
+                result = subprocess.run(["/bin/bash", str(root_script), str(root_stage), args.tart_sha256, args.account], pass_fds=(guard_fd,), check=False)
+                if result.returncode == 75:
+                    if read_installed(MANIFEST_PATH) != original_manifest:
+                        raise ValueError('rollback changed the predecessor manifest; admission remains fenced')
+                    verify_predecessor(payloads, args.predecessor_manifest_sha256)
+                    raise InstallationRestored()
+                result.check_returncode()
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             return fail(f'host installation did not complete: {error}')
     return result.returncode

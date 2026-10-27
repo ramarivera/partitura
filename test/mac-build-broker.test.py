@@ -213,12 +213,12 @@ class BrokerTests(unittest.TestCase):
         self.keychain.close.assert_called_once()
 
     def test_explicit_credential_read_refuses_missing_links_modes_and_wrong_password(self):
+        from unittest.mock import Mock
         credential = self.root / 'credential'
         # Instantiate without loading Apple's framework on the Linux test host.
         chain = RealLoginKeychain.__new__(RealLoginKeychain)
         chain.config = {'keychainCredentialPath': str(credential)}
         chain.ref = None
-        from unittest.mock import Mock
         chain.security = Mock()
         chain.security.SecKeychainUnlock.return_value = -25293
         with self.assertRaises(FileNotFoundError):
@@ -596,6 +596,120 @@ class RegistryBrokerTests(unittest.TestCase):
         self.boot_patch.start()
         self.addCleanup(self.boot_patch.stop)
 
+    def test_keychain_settings_require_unlock_and_policy_is_opt_in_before_clone(self):
+        from types import SimpleNamespace
+        state = dict(lockOnSleep=False, useLockInterval=False, lockInterval=7200)
+        locked = [True]
+        def copy(ref, pointer):
+            if locked[0]: return -25308  # securityd makeUnlocked(false).
+            for key, value in state.items(): setattr(pointer._obj, key, value)
+            return 0
+        def update(ref, pointer):
+            if locked[0]: return -25308
+            state.update({key: bool(getattr(pointer._obj, key)) if key != 'lockInterval' else pointer._obj.lockInterval for key in state})
+            return 0
+        chain = RealLoginKeychain.__new__(RealLoginKeychain)
+        chain.ref = broker.C.c_void_p(1)
+        chain.security = SimpleNamespace(SecKeychainCopySettings=copy, SecKeychainSetSettings=update)
+        chain.check = RealLoginKeychain.check
+        policy = dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)
+        with self.assertRaisesRegex(broker.KeychainError, 'policy-read:-25308'):
+            chain.apply_policy(policy, self.root / 'keychain-policy.json')
+        self.keychain.unlock.side_effect = lambda: locked.__setitem__(0, False)
+        self.keychain.apply_policy.side_effect = chain.apply_policy
+        self.keychain.lock.side_effect = lambda: locked.__setitem__(0, True)
+        self.keychain.state.side_effect = lambda: 'locked' if locked[0] else 'unlocked'
+        self.config['keychainPolicy'] = policy
+        original = broker.owned
+        def owned(args, *rest, **kwargs):
+            if args[1] == 'clone':
+                self.assertEqual(state, policy)
+                self.assertFalse(locked[0])
+            return original(args, *rest, **kwargs)
+        with patch.object(broker, 'owned', side_effect=owned):
+            code, receipt = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt['keychainPolicy']['before']['lockInterval'], 7200)
+        self.assertEqual(receipt['keychainPolicy']['actual'], policy)
+        self.assertEqual(receipt['preRelockState'], 'unlocked')
+        self.assertTrue(locked[0])
+        self.assertEqual(self.wire('status ' + self.job)[1]['keychainPolicy'], receipt['keychainPolicy'])
+        with patch.object(broker, 'LoginKeychain', side_effect=AssertionError('health accessed keychain')):
+            self.assertEqual(self.wire('health')[1]['keychainPolicy']['lastReadback']['actual'], policy)
+
+    def test_policy_readback_mismatch_keeps_prior_evidence_and_pre_relock_state_detects_autolock(self):
+        from types import SimpleNamespace
+        chain = RealLoginKeychain.__new__(RealLoginKeychain)
+        chain.ref = broker.C.c_void_p(1)
+        before = dict(lockOnSleep=False, useLockInterval=False, lockInterval=7200)
+        chain.security = SimpleNamespace(SecKeychainSetSettings=lambda *args: 0)
+        policy = dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)
+        with patch.object(chain, 'settings', return_value=before):
+            with self.assertRaisesRegex(broker.KeychainError, '^policy-readback$'):
+                chain.apply_policy(policy, self.root / 'keychain-policy.json')
+        self.assertEqual(broker.policy_evidence(self.root), dict(before=before, requested=policy, actual=None))
+        # A timer may have locked it again by cleanup. Record that independently
+        # of the broker's mandatory relock and its locked-state readback.
+        self.keychain.state.return_value = 'locked'
+        code, receipt = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt['preRelockState'], 'locked')
+        self.keychain.lock.assert_called_once()
+
+    def test_keychain_policy_mismatch_fails_before_clone_and_legacy_default_preserves_settings(self):
+        self.config['keychainPolicy'] = dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)
+        self.keychain.apply_policy.side_effect = broker.KeychainError('policy-readback')
+        code, receipt = self.invoke()
+        self.assertEqual((code, receipt['stage'], receipt['failureCode']), (1, 'keychain-policy', 'keychain-policy-unavailable'))
+        self.assertFalse((self.root / 'trace').exists())
+        self.keychain.lock.assert_called_once()
+        self.config['profile'] = 'legacy'
+        def legacy(job):
+            request = ('run', job, 'd'*40, '12', 'archive', 6, 0)
+            output = io.StringIO()
+            reader, writer = os.pipe()
+            os.write(writer, b'bundle'); os.close(writer)
+            with os.fdopen(reader, 'rb', buffering=0) as source, patch.object(broker.sys, 'stdin', type('Input', (), {'buffer': source})()), contextlib.redirect_stdout(output), preserved_shutdown_signals():
+                code = broker.run_job(self.config, request)
+            return code, json.loads(output.getvalue())
+        code, receipt = legacy('b'*32)
+        self.assertEqual((code, receipt['stage'], receipt['failureCode']), (1, 'unlock', 'unlock-failed'))
+        self.assertEqual(self.wire('status ' + 'b'*32)[1]['stage'], 'unlock')
+        self.assertFalse((self.root / 'trace').exists())
+        self.keychain.apply_policy.reset_mock()
+        self.config['keychainPolicy'] = None
+        self.assertEqual(legacy('c'*32)[0], 0)
+        self.keychain.apply_policy.assert_not_called()
+
+    def test_legacy_run_recovers_main_era_running_receipt_and_pending_daemon_relock_before_input(self):
+        self.config['profile'] = 'legacy'
+        old = self.root / ('b'*32)
+        old.mkdir()
+        broker.record(old, job='b'*32, commit='d'*40, action='archive', state='running')
+        broker.durable_write(self.root / 'inventory-required', 'installation\n')
+        self.assertEqual(self.maintenance(), 1)
+        self.assertTrue((self.root / 'keychain-relock-pending').exists())
+        # The live gateway still sends the legacy command and needs no new verb.
+        reader, writer = os.pipe()
+        os.write(writer, b'bundle'); os.close(writer)
+        request = ('run', self.job, 'd'*40, '12', 'archive', 6, 0)
+        original = broker.receive
+        def receive(*args, **kwargs):
+            self.assertFalse((self.root / 'keychain-relock-pending').exists())
+            self.assertEqual(json.loads((old / 'receipt.json').read_text())['state'], 'failed')
+            return original(*args, **kwargs)
+        with os.fdopen(reader, 'rb', buffering=0) as source, patch.object(broker.sys, 'stdin', type('Input', (), {'buffer': source})()), patch.object(broker, 'receive', side_effect=receive), contextlib.redirect_stdout(io.StringIO()), preserved_shutdown_signals():
+            self.assertEqual(broker.run_job(self.config, request), 0)
+
+    def test_ssh_reconcile_cannot_clear_or_replace_installation_fences(self):
+        token = 'f'*32
+        for cleanup in (token, self.job):
+            broker.durable_write(self.root / 'cleanup-required', cleanup + '\n')
+            broker.durable_write(self.root / 'maintenance-blocked', 'installation-incomplete ' + token + '\n')
+            self.assertEqual(self.reconcile()[1]['kind'], 'cleanup-required')
+            self.assertEqual((self.root / 'cleanup-required').read_text(), cleanup + '\n')
+            self.assertEqual((self.root / 'maintenance-blocked').read_text(), 'installation-incomplete ' + token + '\n')
+
     def invoke(self, request=None, prefix=b''):
         reader, writer = os.pipe()
         os.write(writer, prefix + b'bundle')
@@ -653,6 +767,14 @@ class RegistryBrokerTests(unittest.TestCase):
             for value in (dict(legacy, profile='registry-only'), dict(config, hostId='not-a-host'), dict(config, profile='mixed'), dict(config, daemonRelockQualified=True), dict(config, daemonRelockQualified=1)):
                 path.write_text(json.dumps(value))
                 with self.assertRaisesRegex(ValueError, 'configuration|identity|qualification'):
+                    broker.load_config()
+            for policy in (None, dict(lockOnSleep=True, useLockInterval=True, lockInterval=600)):
+                value = dict(config, keychainPolicy=policy)
+                path.write_text(json.dumps(value))
+                self.assertEqual(broker.load_config(), value)
+            for policy in ('preserve', {}, dict(lockOnSleep=1, useLockInterval=True, lockInterval=600), dict(lockOnSleep=True, useLockInterval=True, lockInterval=True), dict(lockOnSleep=True, useLockInterval=True, lockInterval=-1)):
+                path.write_text(json.dumps(dict(config, keychainPolicy=policy)))
+                with self.assertRaisesRegex(ValueError, 'invalid keychain policy'):
                     broker.load_config()
             for floor in (True, '53687091200', broker.DISK_FLOOR - 1, 2**63):
                 path.write_text(json.dumps(dict(config, minimumFreeBytes=floor)))

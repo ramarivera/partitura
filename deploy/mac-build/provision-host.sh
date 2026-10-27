@@ -15,7 +15,7 @@ Usage: provision-host.sh --source-vm PATH --source-sha256 HASH --authorized-key 
   [--authorized-key SECOND_KEY] [--host-id UUID] [--profile legacy|registry-only]
   [--minimum-free-bytes BYTES] [--predecessor-manifest-sha256 HASH]
   [--daemon-relock-qualified --daemon-relock-macos-build BUILD]
-  [--daemon-relock-unqualified]
+  [--daemon-relock-unqualified] [--keychain-policy preserve|JSON]
 
   --source-vm       clean Tart VM directory, laid out as <tart home>/vms/<name>
   --source-sha256   pinned tree hash of that VM (see README)
@@ -29,9 +29,10 @@ Usage: provision-host.sh --source-vm PATH --source-sha256 HASH --authorized-key 
                     ~/dev/agentic-scratchpads/partitura/host-inputs)
 
 Steps, each skipped when already done: storage, account, base VM preparation
-and qualification, root install of the broker and SSH policy, SSH admission,
-build credential and password, build keychain, readback for the gateway.
-The first build proves the keychain unlocks; nothing earlier can (see step 8).
+and qualification, missing build credential/password/keychain initialization,
+root install of the broker and SSH policy, SSH admission and final readback.
+The first approved SSH build proves unlock. The installer never checks or
+changes keychain settings; an optional sealed policy runs after SSH unlock.
 EOF
 }
 
@@ -78,6 +79,7 @@ while [ "$#" -gt 0 ]; do
     --daemon-relock-macos-build)
       [[ "${2-}" =~ ^[A-Za-z0-9]{1,32}$ ]] || { echo "invalid macOS build" >&2; exit 2; }
       daemon_build=$2; policy_args+=("$1" "$2"); shift 2 ;;
+    --keychain-policy) policy_args+=("$1" "${2-}"); shift 2 ;;
     --minimum-free-bytes) minimum_free_bytes=${2-}; policy_args+=("$1" "${2-}"); shift 2 ;;
     --predecessor-manifest-sha256) predecessor=${2-}; shift 2 ;;
     --daemon-relock-qualified|--daemon-relock-unqualified)
@@ -266,7 +268,7 @@ cred=/Users/$account/.partitura-native-login.password
 kc=/Users/$account/Library/Keychains/login.keychain-db
 if sudo test -e "$kc"; then
   sudo test -e "$cred" || die "existing keychain has no saved credential; explicit host repair required"
-elif [ "$policy_only" -eq 1 ] || sudo test -e "$INSTALL/config.json"; then
+elif [ "$policy_only" -eq 1 ]; then
   die "installed host requires an initialized credential/keychain; explicit host repair required"
 fi
 if [ "$policy_only" -eq 0 ]; then
@@ -351,6 +353,7 @@ else
   [ "$policy_only" -eq 0 ] || die "--policy-only requires an initialized credential/keychain"
   if ! sudo test -e "$cred"; then
     echo "Paste a NEW password for $account (store it in your password manager first). Asked twice."
+    sudo -H "${PY[@]}" "$RMB/provision.py" bootstrap-binding --account "$account" || die "credential bootstrap binding failed"
     sudo cat "$RMB/credential-writer.py" | asbuild "${PY[@]}" - --bootstrap || die "credential writer failed"
   fi
   if ! sudo test -e "$state/password-set"; then

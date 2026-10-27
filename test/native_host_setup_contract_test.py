@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -22,7 +23,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 ED25519_BLOB = (11).to_bytes(4, "big") + b"ssh-ed25519" + b"x" * 32
 VALID_KEY = "ssh-ed25519 " + base64.b64encode(ED25519_BLOB).decode() + " test-key"
-SCRATCH = Path(os.environ.get("TMPDIR", str(Path.home() / "dev/agentic-scratchpads/partitura/native-host-setup-tests")))
+SCRATCH = Path((os.environ.get("TMPDIR") or str(Path.home() / "dev/agentic-scratchpads/partitura/builder-registry-impl/python-tests")))
 SCRATCH.mkdir(parents=True, mode=0o700, exist_ok=True)
 scratch_metadata = SCRATCH.lstat()
 if not stat.S_ISDIR(scratch_metadata.st_mode) or scratch_metadata.st_uid != os.getuid() or stat.S_IMODE(scratch_metadata.st_mode) != 0o700:
@@ -30,6 +31,46 @@ if not stat.S_ISDIR(scratch_metadata.st_mode) or scratch_metadata.st_uid != os.g
 
 
 class PartituraNativeHostTest(unittest.TestCase):
+    def test_policy_check_never_accesses_keychain_and_only_absent_system_service_needs_installation(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 113, stdout='', stderr='Could not find service "net.partitura.native-build-maintenance" in domain for system')
+        self.assertFalse(MODULE.verify_host_policy({}, run))
+        self.assertEqual(calls, [['/bin/launchctl', 'print', 'system/' + MODULE.MAINTENANCE_LABEL]])
+        def denied(args, **kwargs):
+            return subprocess.CompletedProcess(args, 5, stdout='', stderr='permission denied')
+        with self.assertRaisesRegex(MODULE.NativeHostError, 'cannot read system'):
+            MODULE.verify_host_policy({}, denied)
+
+    def test_current_files_with_incomplete_installation_fence_never_report_success(self):
+        import contextlib
+        config = MODULE.validate_settings(self.enabled_settings())
+        with contextlib.ExitStack() as stack:
+            for name in ('checked_source_blobs', 'verify_tart_source', 'verify_qualified_base', 'verify_account', 'verify_private_runtime', 'verify_runtime_capacity', 'sshd_effective', 'expected_host_files'):
+                stack.enter_context(patch.object(MODULE, name))
+            stack.enter_context(patch.object(MODULE, 'resolve_broker_policy', return_value=config))
+            stack.enter_context(patch.object(MODULE, 'check_existing_files', return_value=False))
+            stack.enter_context(patch.object(MODULE, 'installation_pending', return_value=True))
+            policy = stack.enter_context(patch.object(MODULE, 'verify_host_policy'))
+            self.assertEqual(MODULE.check(config, system='Darwin'), 2)
+            policy.assert_not_called()
+
+    def test_installation_fence_readback_is_bounded_and_account_scoped(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            config = dict(account='builder', runtime=dict(root=directory))
+            def run(args, **kwargs):
+                start = args.index('-c')
+                return subprocess.run([sys.executable, '-I', *args[start:]], **kwargs)
+            self.assertFalse(MODULE.installation_pending(config, run))
+            marker = Path(directory) / 'maintenance-blocked'
+            marker.write_text('installation-incomplete ' + 'a'*32 + '\n')
+            marker.chmod(0o600)
+            self.assertTrue(MODULE.installation_pending(config, run))
+            marker.write_text('x'*129)
+            with self.assertRaises(subprocess.CalledProcessError):
+                MODULE.installation_pending(config, run)
+
     @classmethod
     def setUpClass(cls):
         cls.settings = {
@@ -106,7 +147,7 @@ class PartituraNativeHostTest(unittest.TestCase):
 
     def test_legacy_settings_preserve_installed_identity_profile_and_floor(self):
         config = MODULE.validate_settings(self.enabled_settings())
-        installed = dict(MODULE.make_broker_config(config), hostId='12345678-1234-1234-1234-123456789abc', profile='registry-only', minimumFreeBytes=60 * 1024**3, daemonRelockQualified=True, daemonRelockMacOSBuild='27A123')
+        installed = dict(MODULE.make_broker_config(config), hostId='12345678-1234-1234-1234-123456789abc', profile='registry-only', minimumFreeBytes=60 * 1024**3, daemonRelockQualified=True, daemonRelockMacOSBuild='27A123', keychainPolicy=dict(lockOnSleep=True, useLockInterval=True, lockInterval=600))
         def read(path):
             return installed if path == MODULE.ROOT_CONFIG else None
         with patch.object(MODULE, 'read_root_json', side_effect=read):
@@ -535,7 +576,7 @@ class PartituraNativeHostTest(unittest.TestCase):
                                 MODULE.check_existing_files(files, config, manifest_path=manifest_path)
 
     def test_failed_update_restores_all_managed_files_and_retry_passes_preflight(self):
-        for failure in ('sshd', 'policy', 'bootstrap', 'readback'):
+        for failure in ('sshd', 'bootstrap', 'readback'):
             for was_loaded in (False, True):
                 with self.subTest(failure=failure, was_loaded=was_loaded):
                     self.exercise_install_rollback(failure, was_loaded)
@@ -710,12 +751,15 @@ elif name == "sshd":
 elif name == "launchctl":
     state = Path({str(daemon_state)!r})
     if args[0] == 'list':
-        if state.exists(): print('123 0 net.partitura.native-build-maintenance')
+        pass # Login domain is empty even if the system daemon is loaded.
     elif args[0] == 'print':
-        if {failure!r} == 'readback' and Path({str(policy_state)!r}).read_text() == 'new' and Path({str(fail_once)!r}).exists():
+        assert args[1] == 'system/net.partitura.native-build-maintenance'
+        if {failure!r} == 'readback' and Path({str(daemon_state)!r}).exists() and Path({str(fixture_state)!r}).exists() and int(Path({str(fixture_state)!r}).read_text()) >= 2 and Path({str(fail_once)!r}).exists():
             Path({str(fail_once)!r}).unlink()
             sys.exit(1)
-        sys.exit(0 if state.exists() else 113)
+        if not state.exists():
+            print('Could not find service', file=sys.stderr)
+            sys.exit(113)
     elif args[0] == 'bootout':
         state.unlink()
     elif args[0] == 'bootstrap':
@@ -725,16 +769,7 @@ elif name == "launchctl":
             Path({str(fail_once)!r}).unlink()
             sys.exit(1)
 elif name == "sudo":
-    state = Path({str(policy_state)!r})
-    mode = args[-1]
-    if mode == 'snapshot': print(state.read_text())
-    elif mode == 'apply':
-        state.write_text('new')
-        if {failure!r} == 'policy' and Path({str(fail_once)!r}).exists():
-            Path({str(fail_once)!r}).unlink()
-            sys.exit(1)
-    elif args[-2] == 'restore': state.write_text(args[-1])
-    else: raise SystemExit('unexpected policy mode')
+    raise SystemExit('securityd denies keychain access in sudo context')
 elif name not in ("codesign", "chown", "plutil"):
     raise SystemExit(f"unexpected fixture command: {{name}} {{args}}")
 '''
@@ -761,15 +796,44 @@ elif name not in ("codesign", "chown", "plutil"):
                 installer = installer.replace(old_path, new_path)
 
             def run_installer():
-                return subprocess.run(
-                    ["/bin/bash", "-euo", "pipefail", "-c", installer, "--", str(stage), tart_sha256, config["account"]],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                # Exercise the real wrapper/guard protocol as well as the real
+                # transaction. The restored predecessor must be unfenced even
+                # when securityd would reject every sudo-context settings call.
+                loader = importlib.util.spec_from_file_location('rollback_launcher', ROOT / 'deploy/mac-build/native_host.py')
+                launcher = importlib.util.module_from_spec(loader)
+                loader.loader.exec_module(launcher)
+                runtime, tart = Path(directory) / 'runtime', Path(directory) / 'runtime-tart'
+                runtime.mkdir(mode=0o700, exist_ok=True)
+                (tart / 'vms').mkdir(parents=True, exist_ok=True)
+                guard_config = dict(root=str(runtime), tartHome=str(tart))
+                popen = subprocess.Popen
+                def fake_sudo(args, **kwargs):
+                    if args[0] == '/usr/bin/sudo':
+                        start = args.index('-c')
+                        return popen([sys.executable, '-I', *args[start:]], **kwargs)
+                    return popen(args, **kwargs)
+                result = None
+                try:
+                    with patch.object(launcher.subprocess, 'Popen', side_effect=fake_sudo):
+                        with launcher.installation_guard(guard_config, config['account'], (ROOT / 'deploy/mac-build/provision.py').read_bytes(), (ROOT / 'deploy/mac-build/broker.py').read_bytes()):
+                            result = subprocess.run(
+                                ["/bin/bash", "-euo", "pipefail", "-c", installer, "--", str(stage), tart_sha256, config["account"]],
+                                capture_output=True, text=True, check=False,
+                            )
+                            if result.returncode == 75:
+                                self.assertEqual(manifest_path.read_bytes(), old_manifest)
+                                for path, (contents, mode) in old_contents.items():
+                                    self.assertEqual((path.read_bytes(), stat.S_IMODE(path.stat().st_mode)), (contents, mode))
+                                raise launcher.InstallationRestored()
+                            result.check_returncode()
+                except launcher.InstallationRestored:
+                    pass
+                self.assertFalse((runtime / 'cleanup-required').exists())
+                self.assertFalse((runtime / 'maintenance-blocked').exists())
+                return result
 
             failed_update = run_installer()
-            self.assertNotEqual(failed_update.returncode, 0, failed_update.stdout + failed_update.stderr)
+            self.assertEqual(failed_update.returncode, 75, failed_update.stdout + failed_update.stderr)
             self.assertEqual(installed_executable.read_bytes(), old_tart)
             self.assertEqual(daemon_state.exists(), was_loaded)
             self.assertEqual(policy_state.read_text(), "old")
@@ -807,7 +871,7 @@ elif name not in ("codesign", "chown", "plutil"):
             self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
             self.assertEqual(installed_executable.read_bytes(), new_tart)
             self.assertTrue(daemon_state.exists())
-            self.assertEqual(policy_state.read_text(), "new")
+            self.assertEqual(policy_state.read_text(), "old")
             self.assertFalse(retry_preflight(), "successful retry should match the new manifest")
 
     def test_installer_validates_live_sshd_and_restores_the_dropin_on_failure(self):

@@ -241,9 +241,15 @@ def validate_settings(settings: object) -> dict:
     validate_authorized_keys(keys, config['enabled'])
     config.pop("authorized_key", None)
     config["authorized_keys"] = keys
-    policy = dict(host_id="", protocol=2, profile="legacy", minimum_free_bytes=MINIMUM_FREE_BYTES, daemon_relock_qualified=False, daemon_relock_macos_build="")
+    policy = dict(host_id="", protocol=2, profile="legacy", minimum_free_bytes=MINIMUM_FREE_BYTES, daemon_relock_qualified=False, daemon_relock_macos_build="", keychain_policy=None)
     if "broker" in config:
-        policy = dict(required_mapping(config["broker"], BROKER_POLICY_KEYS, "broker"))
+        raw = config['broker']
+        if not isinstance(raw, dict) or set(raw) - BROKER_POLICY_KEYS - {'keychain_policy'} or BROKER_POLICY_KEYS - set(raw):
+            raise NativeHostError('invalid broker policy fields')
+        policy.update(raw)
+    value = policy['keychain_policy']
+    if value is not None and (not isinstance(value, dict) or set(value) != {'lockOnSleep', 'useLockInterval', 'lockInterval'} or type(value['lockOnSleep']) is not bool or type(value['useLockInterval']) is not bool or type(value['lockInterval']) is not int or not 0 <= value['lockInterval'] <= 2**32 - 1):
+        raise NativeHostError('invalid broker keychain_policy')
     if not isinstance(policy["host_id"], str) or policy["host_id"] and not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", policy["host_id"]):
         raise NativeHostError("broker.host_id must be a canonical UUID")
     if type(policy["protocol"]) is not int or policy["protocol"] != 2 or policy["profile"] not in ("legacy", "registry-only"):
@@ -394,6 +400,7 @@ def make_broker_config(config: dict) -> dict:
     policy = config.get("broker")
     if policy and policy["host_id"]:
         result.update(hostId=policy["host_id"], profile=policy["profile"], minimumFreeBytes=policy["minimum_free_bytes"], daemonRelockQualified=policy["daemon_relock_qualified"], daemonRelockMacOSBuild=policy["daemon_relock_macos_build"])
+        result['keychainPolicy'] = policy.get('keychain_policy')
     return result
 
 
@@ -469,7 +476,8 @@ def resolve_broker_policy(config: dict) -> dict:
     account = config['account']
     if installed:
         extension = {"hostId", "profile", "minimumFreeBytes", "daemonRelockQualified", "daemonRelockMacOSBuild"}
-        if set(installed) not in (BROKER_CONFIG_KEYS, BROKER_CONFIG_KEYS | extension, BROKER_CONFIG_KEYS | (extension - {"minimumFreeBytes"})) or installed.get('keychainPath') != f'/Users/{account}/Library/Keychains/login.keychain-db':
+        shapes = (BROKER_CONFIG_KEYS, BROKER_CONFIG_KEYS | extension, BROKER_CONFIG_KEYS | (extension - {"minimumFreeBytes"}), BROKER_CONFIG_KEYS | extension | {'keychainPolicy'}, BROKER_CONFIG_KEYS | (extension - {'minimumFreeBytes'}) | {'keychainPolicy'})
+        if set(installed) not in shapes or installed.get('keychainPath') != f'/Users/{account}/Library/Keychains/login.keychain-db':
             raise NativeHostError("installed broker state/account differs")
         if installed['root'] != config['runtime']['root'] or installed['tartHome'] != config['runtime']['tart_home']:
             raise NativeHostError("runtime root migration requires separate drained host repair")
@@ -480,7 +488,7 @@ def resolve_broker_policy(config: dict) -> dict:
         raise NativeHostError("conflicting installed host identity")
     if not identifiers:
         raise NativeHostError("initialize a stable host identity through the approved one-shot installer before staging")
-    policy = config.get('broker', dict(host_id='', protocol=2, profile=(installed or {}).get('profile', 'legacy'), minimum_free_bytes=(installed or {}).get('minimumFreeBytes', MINIMUM_FREE_BYTES), daemon_relock_qualified=(installed or {}).get('daemonRelockQualified', False), daemon_relock_macos_build=(installed or {}).get('daemonRelockMacOSBuild', '')))
+    policy = config.get('broker', dict(host_id='', protocol=2, profile=(installed or {}).get('profile', 'legacy'), minimum_free_bytes=(installed or {}).get('minimumFreeBytes', MINIMUM_FREE_BYTES), daemon_relock_qualified=(installed or {}).get('daemonRelockQualified', False), daemon_relock_macos_build=(installed or {}).get('daemonRelockMacOSBuild', ''), keychain_policy=(installed or {}).get('keychainPolicy')))
     result = dict(config, broker=dict(policy, host_id=identifiers.pop()))
     return validate_settings(result)
 
@@ -515,10 +523,37 @@ print('runtime capacity verified: jobRootFreeBytes=%d tartRootFreeBytes=%d minim
     print(result.stdout, end='')
 
 
-def verify_host_policy(config: dict, run=subprocess.run) -> None:
-    script = provision_constant(checked_provision_blob(config), 'KEYCHAIN_POLICY_SCRIPT')
-    run([*account_python(config['account']), '-c', script, 'check'], check=True, capture_output=True, text=True, timeout=15, cwd='/')
-    run(['/bin/launchctl', 'print', 'system/' + MAINTENANCE_LABEL], check=True, capture_output=True, text=True, timeout=15)
+def verify_host_policy(config: dict, run=subprocess.run) -> bool:
+    # Never call a keychain API from sudo. Only the broker's unlocked SSH
+    # session can qualify the optional sealed keychain policy.
+    result = run(['/bin/launchctl', 'print', 'system/' + MAINTENANCE_LABEL], check=False, capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        if 'Could not find service' in result.stderr:
+            return False
+        raise NativeHostError('cannot read system maintenance daemon state')
+    return True
+
+
+def installation_pending(config: dict, run=subprocess.run) -> bool:
+    script = r'''
+import os, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1]) / 'maintenance-blocked'
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except FileNotFoundError:
+    print('clear')
+else:
+    with os.fdopen(fd, 'r') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 128:
+            raise SystemExit('unsafe installation fence')
+        print('incomplete' if stream.read(129).startswith('installation-incomplete') else 'clear')
+'''
+    result = run([*account_python(config['account']), '-c', script, config['runtime']['root']], check=True, capture_output=True, text=True, timeout=15, cwd='/')
+    if result.stdout.strip() not in ('clear', 'incomplete'):
+        raise NativeHostError('invalid installation fence readback')
+    return result.stdout.strip() == 'incomplete'
 
 
 def safe_read(path: Path) -> bytes:
@@ -878,14 +913,12 @@ def check(settings: object, *, system: str | None = None, run=subprocess.run) ->
     effective = sshd_effective(config, run)
     files = expected_host_files(config, blobs)
     stale = check_existing_files(files, config)
-    if stale:
+    if stale or installation_pending(config, run):
         print("partitura native host: prerequisites verified; managed files need installation")
         return 2
     verify_effective_sshd(config, effective)
-    try:
-        verify_host_policy(config, run)
-    except subprocess.CalledProcessError:
-        print("partitura native host: managed files current; daemon/keychain policy needs installation or initialization")
+    if not verify_host_policy(config, run):
+        print("partitura native host: managed files current; maintenance daemon needs installation")
         return 2
     print("partitura native host: pinned sources, account, Tart, base, sshd and files verified")
     return 0

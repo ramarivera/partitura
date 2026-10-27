@@ -46,6 +46,7 @@
     "profile": "legacy",
     "minimum_free_bytes": 53687091200,
     "daemon_relock_qualified": false,
-    "daemon_relock_macos_build": ""
+    "daemon_relock_macos_build": "",
+    "keychain_policy": null
   }
 }

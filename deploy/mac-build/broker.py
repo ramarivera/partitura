@@ -94,8 +94,8 @@ def load_config():
         raise ValueError('oversized installed configuration')
     config = json.loads(text, object_pairs_hook=unique_object)
     legacy = {'tart', 'tartSha256', 'base', 'root', 'tartHome', 'guestRunnerSha256', 'qualifierSha256', 'guestUser', 'guestHome', 'keychainPath', 'keychainCredentialPath'}
-    registry = {'hostId', 'profile', 'daemonRelockQualified', 'daemonRelockMacOSBuild', 'minimumFreeBytes'}
-    if set(config) not in (legacy, legacy | registry, legacy | (registry - {'minimumFreeBytes'})):
+    registry = {'hostId', 'profile', 'daemonRelockQualified', 'daemonRelockMacOSBuild'}
+    if set(config) != legacy and (not (legacy | registry) <= set(config) or set(config) - legacy - registry - {'minimumFreeBytes', 'keychainPolicy'}):
         raise ValueError('invalid installed configuration')
     if 'hostId' in config:
         if not isinstance(config['hostId'], str) or not re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', config['hostId']) or config['profile'] not in ('legacy', 'registry-only'):
@@ -107,6 +107,7 @@ def load_config():
         floor = config.get('minimumFreeBytes', DISK_FLOOR)
         if type(floor) is not int or not DISK_FLOOR <= floor <= 2**63 - 1:
             raise ValueError('invalid installed disk floor')
+        validate_keychain_policy(config.get('keychainPolicy'))
     validate_keychain_paths(config)
     tart = sealed(config['tart'])
     if hashlib.sha256(tart.read_bytes()).hexdigest() != config['tartSha256']:
@@ -144,6 +145,28 @@ class KeychainError(Exception):
     """Contains fixed API stages and numeric status only, never credentials."""
 
 
+def validate_keychain_policy(value):
+    if value is not None and (not isinstance(value, dict) or set(value) != {'lockOnSleep', 'useLockInterval', 'lockInterval'} or type(value['lockOnSleep']) is not bool or type(value['useLockInterval']) is not bool or type(value['lockInterval']) is not int or not 0 <= value['lockInterval'] <= 2**32 - 1):
+        raise ValueError('invalid keychain policy')
+    return value
+
+
+def policy_evidence(root):
+    try:
+        evidence = json_state(root / 'keychain-policy.json')
+        if evidence is not None and set(evidence) == {'before', 'requested', 'actual'} and evidence['before'] is not None and evidence['requested'] is not None:
+            for value in evidence.values():
+                validate_keychain_policy(value)
+            return evidence
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+class KeychainSettings(C.Structure):
+    _fields_ = [('version', C.c_uint32), ('lockOnSleep', C.c_ubyte), ('useLockInterval', C.c_ubyte), ('lockInterval', C.c_uint32)]
+
+
 class LoginKeychain:
     def __init__(self, config):
         validate_keychain_paths(config)
@@ -159,6 +182,8 @@ class LoginKeychain:
             'SecKeychainGetStatus': [C.c_void_p, C.POINTER(C.c_uint32)],
             'SecKeychainUnlock': [C.c_void_p, C.c_uint32, C.c_void_p, C.c_ubyte],
             'SecKeychainLock': [C.c_void_p],
+            'SecKeychainCopySettings': [C.c_void_p, C.POINTER(KeychainSettings)],
+            'SecKeychainSetSettings': [C.c_void_p, C.POINTER(KeychainSettings)],
         }.items():
             function = getattr(self.security, name)
             function.argtypes = arguments
@@ -202,6 +227,30 @@ class LoginKeychain:
         self.check(self.security.SecKeychainLock(self.ref), 'lock')
         if self.state() != 'locked':
             raise KeychainError('lock-state')
+
+    def settings(self):
+        current = KeychainSettings(1, 0, 0, 0)
+        self.check(self.security.SecKeychainCopySettings(self.ref, C.byref(current)), 'policy-read')
+        return dict(lockOnSleep=bool(current.lockOnSleep), useLockInterval=bool(current.useLockInterval), lockInterval=current.lockInterval)
+
+    def apply_policy(self, policy, evidence_path):
+        validate_keychain_policy(policy)
+        # securityd requires an unlocked keychain even for CopySettings. Only
+        # run_job's SSH session may call this, immediately after unlock.
+        before = self.settings()
+        previous = policy_evidence(evidence_path.parent)
+        if previous and previous['requested'] == policy:
+            before = previous['before']  # Preserve the original revert snapshot.
+        evidence = dict(before=before, requested=policy, actual=None)
+        durable_write(evidence_path, json.dumps(evidence) + '\n')
+        desired = KeychainSettings(1, policy['lockOnSleep'], policy['useLockInterval'], policy['lockInterval'])
+        self.check(self.security.SecKeychainSetSettings(self.ref, C.byref(desired)), 'policy-set')
+        actual = self.settings()
+        if actual != policy:
+            raise KeychainError('policy-readback')
+        evidence['actual'] = actual
+        durable_write(evidence_path, json.dumps(evidence) + '\n')
+        return evidence
 
     def close(self):
         if self.ref:
@@ -625,7 +674,7 @@ def runner_state(root):
     value = json_state(root / 'runner.json')
     if value is None:
         return None
-    if set(value) != {'job', 'attempt', 'commit', 'action', 'stage', 'heartbeat'} or not re.fullmatch(JOB, value.get('job', '')) or not re.fullmatch(JOB, value.get('attempt', '')) or not re.fullmatch(COMMIT, value.get('commit', '')) or not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value.get('action', '')) or value['stage'] not in ('receiving', 'capacity', 'unlock', 'clone', 'boot', 'workflow', 'artifact', 'cleanup') or type(value['heartbeat']) not in (int, float) or not math.isfinite(value['heartbeat']) or value['heartbeat'] <= 0:
+    if set(value) != {'job', 'attempt', 'commit', 'action', 'stage', 'heartbeat'} or not re.fullmatch(JOB, value.get('job', '')) or not re.fullmatch(JOB, value.get('attempt', '')) or not re.fullmatch(COMMIT, value.get('commit', '')) or not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value.get('action', '')) or value['stage'] not in ('receiving', 'capacity', 'unlock', 'keychain-policy', 'clone', 'boot', 'workflow', 'artifact', 'cleanup') or type(value['heartbeat']) not in (int, float) or not math.isfinite(value['heartbeat']) or value['heartbeat'] <= 0:
         raise ValueError('invalid runner marker')
     return value
 
@@ -706,7 +755,7 @@ def registry_status(config, job):
         raise ValueError('invalid job receipt')
     # Old receipt causes/host diagnostics and arbitrary future fields stay private.
     fields = {key: value for key, value in diagnostic_receipt(directory, receipt).items() if key in (
-        'job', 'commit', 'action', 'attempt', 'state', 'stage', 'failureCode', 'artifactExpired', 'artifactBytes', 'artifactSha256', 'bootExitCode', 'workflowExitCode',
+        'job', 'commit', 'action', 'attempt', 'state', 'stage', 'failureCode', 'artifactExpired', 'artifactBytes', 'artifactSha256', 'bootExitCode', 'workflowExitCode', 'keychainPolicy', 'preRelockState',
     )}
     if 'commit' in fields and not re.fullmatch(COMMIT, fields['commit']):
         raise ValueError('invalid receipt commit')
@@ -714,10 +763,18 @@ def registry_status(config, job):
         raise ValueError('invalid receipt action')
     if 'attempt' in fields and not re.fullmatch(JOB, fields['attempt']):
         raise ValueError('invalid receipt attempt')
-    if fields.get('stage') not in (None, 'receiving', 'disk-preflight', 'disk-post-transfer', 'capacity', 'unlock', 'clone', 'boot', 'workflow', 'artifact', 'cleanup'):
+    if fields.get('stage') not in (None, 'receiving', 'disk-preflight', 'disk-post-transfer', 'capacity', 'unlock', 'keychain-policy', 'clone', 'boot', 'workflow', 'artifact', 'cleanup'):
         raise ValueError('invalid receipt stage')
-    if fields.get('failureCode') not in (None, 'host-disk-space-unavailable', 'host-capacity-unavailable', 'unlock-failed', 'host-key-unavailable', 'workflow-failed', 'cleanup-required', 'receive-interrupted', 'execution-interrupted'):
+    if fields.get('failureCode') not in (None, 'host-disk-space-unavailable', 'host-capacity-unavailable', 'unlock-failed', 'keychain-policy-unavailable', 'host-key-unavailable', 'workflow-failed', 'cleanup-required', 'receive-interrupted', 'execution-interrupted'):
         raise ValueError('invalid receipt failure code')
+    if 'keychainPolicy' in fields:
+        evidence = fields['keychainPolicy']
+        if not isinstance(evidence, dict) or set(evidence) != {'before', 'requested', 'actual'}:
+            raise ValueError('invalid keychain evidence')
+        for value in evidence.values():
+            validate_keychain_policy(value)
+    if fields.get('preRelockState') not in (None, 'locked', 'unlocked'):
+        raise ValueError('invalid pre-relock state')
     for name in ('artifactBytes', 'bootExitCode', 'workflowExitCode'):
         if name in fields and (type(fields[name]) is not int or not ((0 if name == 'artifactBytes' else -255) <= fields[name] <= (MAX_ARTIFACT if name == 'artifactBytes' else 255))):
             raise ValueError('invalid receipt number')
@@ -736,6 +793,7 @@ def health(config):
     root = Path(config['root'])
     fields = dict(brokerRevision=BROKER_REVISION, capabilities=['health', 'status', 'reconcile', 'run-v2'], profile=config['profile'], epoch=initialize_epoch(config), status='blocked', accepting=False, capacity=0, reasons=[], jobRootFreeBytes=None, tartRootFreeBytes=None, hostFloorBytes=config.get('minimumFreeBytes', DISK_FLOOR))
     fields['housekeepingSkippedEntries'] = housekeeping_counts(root)
+    fields['keychainPolicy'] = dict(requested=config.get('keychainPolicy'), lastReadback=policy_evidence(root))
     jobs, runner = obligations(config)
     fresh = runner is not None and 0 <= time.time() - runner['heartbeat'] <= 60
     # Only a matching active-vm/unlock fence is normal for a current live runner.
@@ -891,7 +949,8 @@ def reconcile_locked(config, requested, daemon=False, deadline=None, allow_block
     jobs |= set(requested)
     if not jobs or len(jobs) > 64:
         raise ValueError('invalid reconciliation set')
-    if read_state(root / 'maintenance-blocked') is not None and not allow_blocked:
+    blocked = read_state(root / 'maintenance-blocked')
+    if blocked is not None and (not allow_blocked or blocked.startswith('installation-incomplete')):
         return 'cleanup-required', sorted(jobs)
     previous_recovery = json_state(root / 'recovery.json')
     previous_cleanup = fence_job(root / 'cleanup-required')
@@ -966,6 +1025,9 @@ def reconcile(config, job):
             emit(config, 'busy', job=job, runner=evidence)
             return 0
         root = Path(config['root'])
+        if (read_state(root / 'maintenance-blocked') or '').startswith('installation-incomplete'):
+            emit(config, 'cleanup-required', job=job)
+            return 1
         initialize_epoch(config)
         jobs = {job}
         try:
@@ -1322,6 +1384,18 @@ def run_job(config, request, lock_held=False, attempt=None, expiry=None):
     with (contextlib.nullcontext(True) if lock_held else run_lock(config, 0)) as acquired, contextlib.ExitStack() as resources:
         if not acquired:
             raise BlockingIOError('native host busy')
+        # Legacy callers have no reconcile handshake. A post-install inventory
+        # or daemon-only relock can be completed in this SSH session before any
+        # input. Actual failed cleanup and installer fences remain refusals.
+        if not lock_held and config.get('profile', 'legacy') == 'legacy' and read_state(root / 'maintenance-blocked') is None and (read_state(root / 'inventory-required') is not None or read_state(root / 'keychain-relock-pending') is not None) and read_state(root / 'cleanup-required') is None:
+            jobs, _ = obligations(config)
+            jobs |= inventory_obligations(config)
+            if jobs:
+                result, _ = reconcile_locked(config, jobs)
+                if result != 'reconciled':
+                    raise ValueError('previous VM cleanup requires operator reconciliation')
+            record_maintenance(root, boot_id())
+            durable_remove(root / 'inventory-required')
         if (root / 'cleanup-required').exists():
             raise ValueError('previous VM cleanup requires operator reconciliation')
         active = root / 'active-vm'
@@ -1405,6 +1479,8 @@ def run_job(config, request, lock_held=False, attempt=None, expiry=None):
         keychain = None
         keychain_attempted = False
         keychain_state = None
+        keychain_policy = None
+        pre_relock_state = None
         finished = threading.Event()
         def watch_cancellation():
             while not finished.wait(1):
@@ -1435,6 +1511,10 @@ def run_job(config, request, lock_held=False, attempt=None, expiry=None):
             # Private host evidence only, never projected through the gateway.
             durable_write(directory / 'keychain.json', json.dumps({'preUnlockState': keychain_state}) + '\n')
             keychain.unlock()
+            if config.get('keychainPolicy') is not None:
+                stage = 'keychain-policy'
+                marker.publish(stage)
+                keychain_policy = keychain.apply_policy(config['keychainPolicy'], root / 'keychain-policy.json')
             stage = 'clone'
             marker.publish(stage)
             clone_attempted = True
@@ -1498,6 +1578,10 @@ def run_job(config, request, lock_held=False, attempt=None, expiry=None):
                 receipt['failureCode'] = 'host-disk-space-unavailable'
             if stage in ('unlock', 'capacity'):
                 receipt['failureCode'] = 'unlock-failed' if stage == 'unlock' else 'host-capacity-unavailable'
+            if stage == 'keychain-policy':
+                # Existing gateways have a closed legacy stage/code decoder.
+                # Keep policy failure within its unlock boundary on that wire.
+                receipt.update(stage='keychain-policy' if attempt is not None else 'unlock', failureCode='keychain-policy-unavailable' if attempt is not None else 'unlock-failed')
             if stage == 'boot' and boot is not None and boot.poll() is not None:
                 receipt['bootExitCode'] = boot.returncode
             if stage == 'workflow' and isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
@@ -1529,6 +1613,8 @@ def run_job(config, request, lock_held=False, attempt=None, expiry=None):
                 try:
                     if keychain is None:
                         keychain = LoginKeychain(config)
+                    with contextlib.suppress(Exception):
+                        pre_relock_state = keychain.state()
                     keychain.lock()
                 except Exception:
                     cleanup_failed = True
@@ -1549,6 +1635,10 @@ def run_job(config, request, lock_held=False, attempt=None, expiry=None):
                 (directory / 'boot.log').unlink(missing_ok=True)
             (directory / 'runner.log').unlink(missing_ok=True)
             receipt = diagnostic_receipt(directory, receipt)
+            if keychain_policy is not None:
+                receipt['keychainPolicy'] = keychain_policy
+            if pre_relock_state in ('locked', 'unlocked'):
+                receipt['preRelockState'] = pre_relock_state
             record(directory, **receipt)
             bundle.unlink(missing_ok=True)
             secret_input.close()
