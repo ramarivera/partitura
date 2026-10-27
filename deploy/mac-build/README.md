@@ -436,7 +436,7 @@ account. The helper verifies the effective forced command, public-key-only
 authentication and disabled forwarding/TTY before editing the existing group.
 It never creates a service ACL or enables Remote Login globally.
 
-Install `broker.py` root:wheel 0555 outside checkouts. Its config is
+The pinned source under `deploy/mac-build/broker/` is assembled at staging into a deterministic zipapp. The installer continues to install that single artifact as `/Library/Partitura/NativeBuild/broker.py`, root:wheel 0555, and pins its SHA-256 in the existing managed-files manifest. Operators use the same provisioning commands. There is deliberately no source file at the old `deploy/mac-build/broker.py` path, so nothing can pin or copy an unbuilt broker. The deflated archive was byte-identical on zlib 1.2.12 (macOS 27.2 `/usr/bin/python3`), 1.2.13 and 1.3.1; if a zlib change ever alters it, `host_setup.py` refuses with "pinned source hash differs" before installing anything. Its config is
 `/Library/Partitura/NativeBuild/config.json`; all ancestors and the verified Tart
 executable must be root-owned and not group/other writable. `root` and `tartHome`
 are canonical mode-0700 directories owned by the dedicated build account.

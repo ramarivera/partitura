@@ -1,4 +1,5 @@
 """One-shot host provisioning helpers: sshd admission, password entry, settings."""
+import base64
 import contextlib
 import ctypes
 import hashlib
@@ -24,6 +25,13 @@ KEY_ONLY = '''PermitRootLogin no
 PasswordAuthentication no
 AllowUsers ramarivera openclaw-ssh
 '''
+
+
+def broker_artifact():
+    spec = importlib.util.spec_from_file_location('broker_archive_test', ROOT / 'deploy/mac-build/broker_archive.py')
+    archive = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(archive)
+    return archive.broker_from_directory(ROOT / 'deploy/mac-build/broker')
 
 
 class AccessPlanTests(unittest.TestCase):
@@ -290,7 +298,7 @@ class RenderSettingsTests(unittest.TestCase):
             hs = importlib.util.module_from_spec(hs_spec)
             hs_spec.loader.exec_module(hs)
             names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
-            blobs = tuple(subprocess.run(['/usr/bin/git', '-C', str(ROOT), 'show', 'HEAD:deploy/mac-build/' + name], check=True, capture_output=True).stdout for name in names)
+            blobs = tuple(hs.broker_from_commit(ROOT, 'HEAD', hs.git_environment()) if name == 'broker.py' else subprocess.run(['/usr/bin/git', '-C', str(ROOT), 'show', 'HEAD:deploy/mac-build/' + name], check=True, capture_output=True).stdout for name in names)
             stage = base / 'stage'
             def ditto(argv, **kwargs):
                 import shutil
@@ -341,7 +349,7 @@ class KeychainPolicyTests(unittest.TestCase):
             old = runtime / ('a'*32)
             old.mkdir(mode=0o700)
             (old / 'receipt.json').write_text(json.dumps(dict(job='a'*32, state='running', commit='d'*40, action='archive')))
-            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))]
+            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart), base64.b64encode(broker_artifact()).decode('ascii'), json.dumps(dict(root=str(runtime), tartHome=str(tart)))]
             # A verified rollback hasn't unlocked anything. Preserve old job
             # evidence and release the installer's new fences for the old broker.
             result = subprocess.run(command, input=b'fence\nstart\nabort-restored\n', capture_output=True, timeout=5)
@@ -393,7 +401,7 @@ sudo() {
             runtime, tart = root / 'runtime', root / 'tart'
             runtime.mkdir(mode=0o700)
             (tart / 'vms').mkdir(parents=True)
-            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart), (ROOT / 'deploy/mac-build/broker.py').read_text(), json.dumps(dict(root=str(runtime), tartHome=str(tart)))]
+            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart), base64.b64encode(broker_artifact()).decode('ascii'), json.dumps(dict(root=str(runtime), tartHome=str(tart)))]
             child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 self.assertTrue(select.select([child.stdout], [], [], 5)[0])

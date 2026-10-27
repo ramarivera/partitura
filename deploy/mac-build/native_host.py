@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import contextlib
 import hashlib
 import json
@@ -19,7 +20,7 @@ import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
 INSTALL_HOST_SHA256 = "b8863ad7ae1f203b8889dcd198536683e599206cd59ad4275fe0930fa41d1009"
-PROVISION_SHA256 = "74e31a8b5f2fd442d66cd38f735f0e2f86ee2ba152decddfa5d853b7e8d3e623"
+PROVISION_SHA256 = "bd7ddf90480cd7dcf35c79c406c802da00d8f38de75b997826ddba2d38e8cc8c"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 STAGED_FILES = {
     '/Library/Partitura/NativeBuild/credential-writer.py': 'credential-writer.py',
@@ -166,7 +167,7 @@ GUARD_READY_SECONDS = 60
 @contextlib.contextmanager
 def installation_guard(config: dict, account: str, helper: bytes, broker: bytes):
     script = helper_constant(helper, 'INSTALL_GUARD_SCRIPT')
-    command = ['/usr/bin/sudo', '--non-interactive', '-H', '-u', account, '/usr/bin/env', '-i', f'HOME=/Users/{account}', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', 'DEVELOPER_DIR=/Library/Developer/CommandLineTools', '/usr/bin/python3', '-I', '-c', script, config['root'], config['tartHome'], broker.decode(), json.dumps(config)]
+    command = ['/usr/bin/sudo', '--non-interactive', '-H', '-u', account, '/usr/bin/env', '-i', f'HOME=/Users/{account}', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', 'DEVELOPER_DIR=/Library/Developer/CommandLineTools', '/usr/bin/python3', '-I', '-c', script, config['root'], config['tartHome'], base64.b64encode(broker).decode('ascii'), json.dumps(config)]
     guard = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True, close_fds=True)
     try:
         def expect(message):
