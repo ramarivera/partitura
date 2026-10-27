@@ -5,7 +5,10 @@ import { type GatewayConfigShape, organizationAllowed } from "./config.js";
 import { deliverNativeArtifact } from "./native-build-client.js";
 import { NativeOperationError, nativeIO } from "./native-build-errors.js";
 import type { NativeBuildJobs } from "./native-build-jobs.js";
-import type { NativeRegistryJob } from "./native-build-state.js";
+import {
+  type NativeRegistryJob,
+  terminalNativeJob,
+} from "./native-build-state.js";
 import type { RpcHostToolCall, RpcHostToolResult } from "./rpc-worker.js";
 import type { RunRepo } from "./store/repositories.js";
 
@@ -124,7 +127,12 @@ export const callRegistryNativeTool = Effect.fn(
         switch (request.toolName) {
           case "native_build_status":
             return result(project(owned));
-          case "native_build_cancel":
+          case "native_build_cancel": {
+            if (terminalNativeJob(owned))
+              return result({
+                ...project(owned),
+                cancellationRequested: false,
+              });
             yield* jobs.cancel(
               current.value.organizationId,
               run.sessionId,
@@ -132,10 +140,17 @@ export const callRegistryNativeTool = Effect.fn(
               input.builder,
             );
             return result({
-              job: input.job,
-              builder: owned.builderId,
+              ...project(
+                yield* jobs.status(
+                  current.value.organizationId,
+                  run.sessionId,
+                  input.job,
+                  input.builder,
+                ),
+              ),
               cancellationRequested: true,
             });
+          }
           case "native_build_artifact": {
             return yield* Effect.scoped(
               Effect.gen(function* () {

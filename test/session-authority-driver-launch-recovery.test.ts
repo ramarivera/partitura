@@ -11,6 +11,7 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "../src/services/store/repositories.js";
+import { unusedT3PortRange } from "./fixtures/t3-ports.js";
 import { createDriverFixture } from "./session-authority-driver-fixture.js";
 import { createAuthorityFixture } from "./session-authority-fixture.js";
 
@@ -44,7 +45,42 @@ describe("AgentDriver authority integration", () => {
             { mode: 0o755 },
           ),
         );
-        const portBase = 20_000 + ((process.pid * 11) % 20_000);
+        // Keep the old PID-derived range occupied to reproduce the CI collision.
+        const oldBase = 20_000 + ((process.pid * 11) % 20_000);
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const listeners: Bun.Server<undefined>[] = [];
+            for (let offset = 0; offset < 4; offset++) {
+              try {
+                listeners.push(
+                  Bun.serve({
+                    hostname: "127.0.0.1",
+                    port: oldBase + offset,
+                    fetch: () => new Response("occupied"),
+                  }),
+                );
+              } catch (error) {
+                if (
+                  !(
+                    error instanceof Error &&
+                    "code" in error &&
+                    error.code === "EADDRINUSE"
+                  )
+                ) {
+                  for (const listener of listeners) listener.stop(true);
+                  throw error;
+                }
+              }
+            }
+            return listeners;
+          }),
+          (listeners) =>
+            Effect.sync(() => {
+              for (const listener of listeners) listener.stop(true);
+            }),
+        );
+        const portBase = unusedT3PortRange(4);
+        expect(portBase < oldBase - 3 || portBase > oldBase + 3).toBe(true);
         yield* withAuthority(
           () =>
             Effect.gen(function* () {
@@ -193,7 +229,7 @@ describe("AgentDriver authority integration", () => {
             ],
           },
         );
-      }),
+      }).pipe(Effect.scoped),
     20_000,
   );
   it.live(

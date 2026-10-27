@@ -12,6 +12,9 @@ for (const [stage, failureCode] of [
   ["capacity", "host-capacity-unavailable"],
   ["disk-preflight", "host-disk-space-unavailable"],
   ["disk-post-transfer", "host-disk-space-unavailable"],
+  ["cleanup", "execution-interrupted"],
+  ["receiving", "receive-interrupted"],
+  ["keychain-policy", "keychain-policy-unavailable"],
 ] as const) {
   it.live(`preserves ${failureCode} through the native gateway`, () =>
     Effect.promise(async () => {

@@ -21,6 +21,7 @@ import type { T3LaunchConfig } from "../src/services/config.js";
 import { sessionWorkerEnvironment } from "../src/services/worker-security.js";
 import { workspaceProcess } from "../src/services/workspace-process.js";
 import { testPaths } from "./fixtures/paths.js";
+import { unusedT3PortRange } from "./fixtures/t3-ports.js";
 
 const pathFor = testPaths();
 const fakeCli = fileURLToPath(
@@ -37,13 +38,10 @@ const cliFor = (behavior: "ok" | "crash"): string => {
   return path;
 };
 
-// Distinct per worker so parallel test files never contend for ports.
-const portBase = 20_000 + ((process.pid * 7) % 20_000);
-
 const launchConfig = (cliPath: string): T3LaunchConfig => ({
   _tag: "Launch",
   cliPath,
-  portBase,
+  portBase: unusedT3PortRange(8),
   portCount: 8,
   launchTimeoutMs: 10_000,
   codexExecutable: "codex",

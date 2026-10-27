@@ -38,7 +38,10 @@ it.live("keeps native requests usable when an orphan cannot be pruned", () =>
       };
       const first = await client.start(request);
       expect((await settled(client, first.job)).state).toBe("succeeded");
-      await client.cancel("session-a", first.job);
+      expect(await client.cancel("session-a", first.job)).toMatchObject({
+        state: "succeeded",
+        cancellationRequested: false,
+      });
       expect((await client.status("session-a", first.job)).state).toBe(
         "succeeded",
       );
@@ -47,7 +50,7 @@ it.live("keeps native requests usable when an orphan cannot be pruned", () =>
         "succeeded",
       );
       const trace = await readFile(fixture.trace, "utf8");
-      expect(trace).toContain(`cancel ${first.job}`);
+      expect(trace).not.toContain(`cancel ${first.job}`);
       await expect(client.close()).rejects.toThrow();
     } finally {
       await rm(orphan, { recursive: true, force: true });
