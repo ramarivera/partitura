@@ -3,7 +3,7 @@ import { Effect, Option } from "effect";
 import { WorkspaceError } from "../domain/errors.js";
 import type { RepositoryRecord } from "../domain/models.js";
 import { isWithin } from "../util/paths.js";
-import { enoent, workspaceFailure } from "./workspace-git.js";
+import { enoent, workspaceFailure } from "./workspace-errors.js";
 import { parseMarker } from "./workspace-resolution.js";
 export const lstatOrMissing = (
   path: string,

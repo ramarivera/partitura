@@ -8,6 +8,7 @@ import {
   prepareWorkerWorkspace,
   workerIdentityCommand,
 } from "./worker-security.js";
+import { enoent, workspaceFailure } from "./workspace-errors.js";
 import { lstatOrMissing } from "./workspace-files.js";
 import {
   cleanupWorkspaceProcess,
@@ -16,19 +17,6 @@ import {
   workspaceProcess,
   workspaceWorkerUid,
 } from "./workspace-process.js";
-export const enoent = (error: unknown): error is Error & { code: "ENOENT" } =>
-  error instanceof Error && "code" in error && error.code === "ENOENT";
-
-export const workspaceFailure =
-  (message: string, reason: WorkspaceError["reason"], sessionId: string) =>
-  (cause: unknown) =>
-    new WorkspaceError({
-      message,
-      sessionId,
-      reason,
-      cause: cause instanceof Error ? cause.message : String(cause),
-    });
-
 export const GITHUB_EXTRA_HEADER_KEY = "http.https://github.com/.extraheader";
 
 export const redactGitOutput = (

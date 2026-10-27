@@ -28,6 +28,7 @@ import {
 
 export { isWithin } from "../util/paths.js";
 
+import { workspaceFailure } from "./workspace-errors.js";
 import {
   ensureRoot,
   lstatOrMissing,
@@ -40,7 +41,6 @@ import {
   runGit,
   runGitOutput,
   unsetGitHubExtraHeader,
-  workspaceFailure,
 } from "./workspace-git.js";
 import {
   isHttpsGitHubRepositoryUrl,

@@ -7,7 +7,7 @@ import {
   buildGitHubExtraHeader,
   type GitHubAppTokenService,
 } from "./github-app.js";
-import { workspaceFailure } from "./workspace-git.js";
+import { workspaceFailure } from "./workspace-errors.js";
 
 export type RepositoryResolution =
   | { readonly kind: "match"; readonly repository: RepositoryRecord }
