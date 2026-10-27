@@ -324,3 +324,73 @@ it.live(
       }),
     ),
 );
+
+it.live(
+  "a recovered terminal receipt survives a failed health check and restart",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* registryFixture(path("recovered-receipt"));
+        const time = 1_000_000;
+        const job = registryJob(fixture.generation, {
+          state: "submitting",
+          submissionExpiresAt: 1,
+        });
+        yield* fixture.state.transaction((draft) => {
+          draft.jobs.push(job);
+        });
+        yield* recoverNativeMetadata(fixture.state, time);
+        const broker = memoryBroker(() => time);
+        broker.settings.terminal = true;
+        broker.settings.healthFailure = "unavailable";
+        yield* createNativeBuildRecovery(fixture.state, broker.transport, {
+          now: () => time,
+        }).tick(job.jobId);
+        expect(broker.calls.map((call) => call.command.split(" ")[0])).toEqual([
+          "cancel",
+          "reconcile",
+          "status",
+          "health",
+        ]);
+        yield* fixture.state.close();
+        const state = yield* openNativeBuildState(fixture.options);
+        yield* recoverNativeMetadata(state, time);
+        const current = state.owned("org-a", "session-a", job.jobId);
+        expect(current.state).toBe("succeeded");
+        expect(current.artifactBytes).toBe(7);
+        expect(current.artifactSha256).toBe("d".repeat(64));
+        // Clean matching health is still required to release quarantine.
+        expect(current.recovery.state).toBe("pending");
+        expect(current.recovery.lastReason).toBe("unavailable");
+        yield* state.close();
+      }),
+    ),
+);
+
+it.live(
+  "an authenticated broker-state-unavailable error follows the retry schedule",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* registryFixture(path("broker-state"));
+        const time = 1_000_000;
+        const job = registryJob(fixture.generation, {
+          state: "submitting",
+          submissionExpiresAt: 1,
+        });
+        yield* fixture.state.transaction((draft) => {
+          draft.jobs.push(job);
+        });
+        yield* recoverNativeMetadata(fixture.state, time);
+        const broker = memoryBroker(() => time);
+        broker.settings.cancelError = true;
+        yield* createNativeBuildRecovery(fixture.state, broker.transport, {
+          now: () => time,
+        }).tick(job.jobId);
+        const current = fixture.state.owned("org-a", "session-a", job.jobId);
+        expect(current.recovery.state).toBe("pending");
+        expect(current.recovery.lastReason).toBe("unavailable");
+        expect(current.recovery.returnEligible).toBe(true);
+      }),
+    ),
+);

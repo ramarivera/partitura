@@ -104,8 +104,20 @@ export function createNativeBuildRecovery(
       current.recovery.state = "cancel-requested";
       current.recovery.attempts++;
     });
+    // The broker reports transient state/IO failures as an authenticated
+    // error envelope. Those follow the unavailable retry schedule; any other
+    // unexpected kind is a protocol mismatch.
     const send = (command: string) =>
-      transport.envelope(generation, command, job, { timeout: remaining });
+      transport
+        .envelope(generation, command, job, { timeout: remaining })
+        .pipe(
+          Effect.flatMap((envelope) =>
+            envelope.kind === "error" &&
+            envelope.code === "broker-state-unavailable"
+              ? Effect.fail(NativeTransportError.new("unavailable"))
+              : Effect.succeed(envelope),
+          ),
+        );
     const remote = Effect.gen(function* () {
       const cancelled = yield* send(`cancel ${job.jobId}`);
       if (cancelled.kind !== "cancellation-requested")
@@ -140,6 +152,13 @@ export function createNativeBuildRecovery(
         return yield* Effect.fail(
           NativeTransportError.new("protocol-mismatch"),
         );
+      // Preserve authenticated execution evidence before health IO. Recovery
+      // stays unresolved until matching clean health releases quarantine.
+      if (receipt)
+        yield* update(job.jobId, (current) => {
+          applyNativeReceipt(current, receipt);
+          current.updatedAt = now();
+        });
       const health = yield* send("health");
       if (health.epoch !== reconciled.epoch || !cleanNativeHealth(health))
         return yield* Effect.fail(

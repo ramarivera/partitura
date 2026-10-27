@@ -18,6 +18,8 @@ export function memoryBroker(
     badHealthEpoch: false,
     healthError: false,
     healthFailure: "" as "" | NativeTransportError["reason"],
+    cancelError: false,
+    terminal: false,
   };
   const transport: NativeBrokerTransport = {
     hasCredential: () => true,
@@ -56,7 +58,18 @@ export function memoryBroker(
           }
           if (!job) throw NativeTransportError.new("protocol-mismatch");
           if (command.startsWith("cancel "))
-            return { ...base, kind: "cancellation-requested", job: job.jobId };
+            return settings.cancelError
+              ? { ...base, kind: "error", code: "broker-state-unavailable" }
+              : { ...base, kind: "cancellation-requested", job: job.jobId };
+          if (command.startsWith("status "))
+            return {
+              ...base,
+              kind: "known",
+              job: job.jobId,
+              state: "succeeded",
+              artifactBytes: 7,
+              artifactSha256: "d".repeat(64),
+            };
           if (settings.cleanup)
             return { ...base, kind: settings.cleanup, job: job.jobId };
           if (settings.busy)
@@ -73,7 +86,9 @@ export function memoryBroker(
             };
           return {
             ...base,
-            kind: "reconciled-unknown",
+            kind: settings.terminal
+              ? "reconciled-terminal"
+              : "reconciled-unknown",
             job: job.jobId,
             epoch: "a".repeat(32),
             nonce: "c".repeat(32),
