@@ -1,6 +1,7 @@
 import type { Option, Redacted } from "effect";
 import type { LogLevel } from "../domain/models.js";
 import type { RuntimeMode } from "../drivers/driver.js";
+import type { BuilderRegistrySettings } from "./config-native-build.js";
 import type { NativeBuildConfig } from "./native-build-client.js";
 import type { T3DeviceBackupConfig } from "./t3-device-backup.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
@@ -61,6 +62,7 @@ export interface T3DriverConfig {
 }
 
 export interface GatewayConfigShape {
+  readonly nativeBuildRegistry?: BuilderRegistrySettings;
   readonly allowedOrganizationIds?: ReadonlySet<string> | undefined;
   readonly gatewayAdminOrganizationIds?: ReadonlySet<string> | undefined;
   readonly githubAppAllowedOwners?:

@@ -1,0 +1,466 @@
+import { Effect, Exit, Fiber, Scope, Semaphore } from "effect";
+import type {
+  BuilderIdentityResult,
+  BuilderRegistryIdentity,
+} from "./builder-registry-identity.js";
+import { BuilderRegistryError } from "./builder-registry-json.js";
+import {
+  type BuilderEntry,
+  type BuilderRegistrySnapshot,
+  credentialRevision,
+  registrySemanticKey,
+} from "./builder-registry-schema.js";
+import type {
+  BuilderCredential,
+  BuilderSecretProvider,
+} from "./builder-secret-provider.js";
+
+type Provider = typeof BuilderSecretProvider.Service;
+type Identity = typeof BuilderRegistryIdentity.Service;
+interface Current {
+  entry: BuilderEntry;
+  ticket: number;
+  credential?: BuilderCredential;
+  identity?: BuilderIdentityResult;
+  checkedAt: number;
+  duplicate: boolean;
+  recheck: boolean;
+  error: string | undefined;
+}
+export interface BuilderAdmission {
+  readonly builderId: string;
+  readonly generationId: string;
+  readonly hostId: string;
+  readonly signal: AbortSignal;
+}
+interface Preparation {
+  readonly admission: BuilderAdmission;
+  readonly controller: AbortController;
+  readonly current: Current;
+}
+interface Work {
+  readonly ticket: number;
+  readonly entry: BuilderEntry;
+  readonly credential?: BuilderCredential;
+}
+
+/** Desired publication, identity publication and admission share this one gate.
+ * Provider and health IO never hold it. This controller isn't wired to production. */
+export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
+  function* (
+    provider: Provider,
+    identity: Identity,
+    now: () => number = Date.now,
+  ) {
+    const scope = yield* Scope.Scope;
+    const gate = yield* Semaphore.make(1);
+    const entries = new Map<string, Current>();
+    const pending = new Map<string, Work>();
+    const workers = new Map<string, Fiber.Fiber<void>>();
+    const preparations = new Map<BuilderAdmission, Preparation>();
+    const leases = new Map<string, Scope.Closeable>();
+    let desired: BuilderRegistrySnapshot | undefined,
+      semantic = "",
+      revision = 0,
+      ticket = 0;
+    let error: string | undefined,
+      stale = false;
+    const failures = new Map<string, unknown>();
+    const enqueue = (current: Current, read: boolean) => {
+      pending.set(current.entry.id, {
+        ticket: current.ticket,
+        entry: current.entry,
+        ...(!read && current.credential
+          ? { credential: current.credential }
+          : {}),
+      });
+    };
+    const conflicts = () => {
+      const counts = new Map<string, number>();
+      for (const current of entries.values())
+        if (current.entry.enabled && current.credential) {
+          const hostId = current.credential.transport.hostId;
+          counts.set(hostId, (counts.get(hostId) ?? 0) + 1);
+        }
+      for (const current of entries.values()) {
+        const duplicate =
+          current.entry.enabled &&
+          current.credential !== undefined &&
+          (counts.get(current.credential.transport.hostId) ?? 0) > 1;
+        if (
+          current.duplicate &&
+          !duplicate &&
+          current.entry.enabled &&
+          current.credential
+        ) {
+          current.recheck = true;
+          current.ticket = ++ticket;
+          enqueue(current, false);
+        }
+        current.duplicate = duplicate;
+      }
+    };
+    const worker = Effect.fn("BuilderRegistry.resolve")(function* (id: string) {
+      for (;;) {
+        const work = pending.get(id);
+        if (!work) return;
+        pending.delete(id);
+        const live = () => {
+          const current = entries.get(id);
+          return current?.entry.enabled && current.ticket === work.ticket
+            ? current
+            : undefined;
+        };
+        yield* Effect.gen(function* () {
+          const credential =
+            work.credential ?? (yield* provider.resolve(work.entry));
+          const accepted = yield* gate.withPermit(
+            Effect.sync(() => {
+              const current = live();
+              if (!current) return false;
+              current.credential = credential;
+              conflicts();
+              return true;
+            }),
+          );
+          if (!accepted) return;
+          const verified = yield* identity.verify(work.entry, credential);
+          if (
+            verified.generation.builderId !== id ||
+            verified.generation.transport.hostId !==
+              credential.transport.hostId ||
+            verified.health.kind !== "health" ||
+            verified.health.hostId !== credential.transport.hostId ||
+            verified.health.profile !== "registry-only"
+          )
+            return yield* Effect.fail(
+              BuilderRegistryError.new("builder-identity-mismatch"),
+            );
+          const lease = yield* Scope.fork(scope);
+          yield* identity.retain(verified.generation.id).pipe(
+            Effect.provideService(Scope.Scope, lease),
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit) ? Scope.close(lease, exit) : Effect.void,
+            ),
+          );
+          const replaced = yield* gate.withPermit(
+            Effect.sync(() => {
+              const current = live();
+              if (!current) return lease;
+              const previous = leases.get(id);
+              leases.set(id, lease);
+              current.identity = verified;
+              current.checkedAt = now();
+              current.recheck = false;
+              current.error = undefined;
+              failures.delete(id);
+              conflicts();
+              return previous;
+            }),
+          );
+          if (replaced) yield* Scope.close(replaced, Exit.void);
+        }).pipe(
+          Effect.catch((cause) =>
+            gate.withPermit(
+              Effect.gen(function* () {
+                const current = live();
+                if (!current) return;
+                current.error = cause.code;
+                failures.set(id, cause);
+                yield* Effect.logWarning("Native builder resolution failed", {
+                  builderId: id,
+                  code: cause.code,
+                });
+              }),
+            ),
+          ),
+        );
+      }
+    });
+    const launch = Effect.fn("BuilderRegistry.launch")(function* () {
+      for (const id of pending.keys())
+        if (!workers.has(id)) {
+          // Register before the child runs, and clear before completion wakes waiters.
+          const fiber = yield* worker(id).pipe(
+            Effect.ensuring(Effect.sync(() => workers.delete(id))),
+            Effect.forkIn(scope, { startImmediately: false }),
+          );
+          workers.set(id, fiber);
+        }
+    });
+    const reason = (current: Current): string | undefined => {
+      if (stale || !desired) return "registry-admission-closed";
+      if (!current.entry.enabled) return "builder-disabled";
+      if (current.duplicate) return "duplicate-host";
+      if (current.recheck || !current.identity || current.error)
+        return current.error ?? "builder-not-ready";
+      const health = current.identity.health;
+      if (
+        health.status !== "ready" ||
+        !health.accepting ||
+        health.capacity !== 1 ||
+        health.runner ||
+        health.reasons?.length
+      )
+        return "builder-health-blocked";
+      const floor = Math.max(
+        current.entry.minimumFreeBytes,
+        health.hostFloorBytes ?? 0,
+      );
+      if (
+        (health.jobRootFreeBytes ?? -1) < floor ||
+        (health.tartRootFreeBytes ?? -1) < floor
+      )
+        return "builder-disk-policy";
+      return undefined;
+    };
+    const publish = Effect.fn("BuilderRegistry.publish")(function* (
+      snapshot: BuilderRegistrySnapshot,
+    ) {
+      const retired: Scope.Closeable[] = [];
+      const retire = (id: string) => {
+        const lease = leases.get(id);
+        if (lease) {
+          leases.delete(id);
+          retired.push(lease);
+        }
+      };
+      const changed = yield* gate.withPermit(
+        Effect.sync(() => {
+          if (stale) return false; // A stale mount requires recreation, never local repair.
+          error = undefined;
+          const key = registrySemanticKey(snapshot);
+          if (key === semantic) return false;
+          desired = structuredClone(snapshot);
+          semantic = key;
+          revision++;
+          const incoming = new Set(snapshot.builders.map((entry) => entry.id));
+          for (const [id] of entries)
+            if (!incoming.has(id)) {
+              entries.delete(id);
+              pending.delete(id);
+              failures.delete(id);
+              retire(id);
+            }
+          for (const entry of snapshot.builders) {
+            const old = entries.get(entry.id);
+            const read =
+              entry.enabled &&
+              (!old?.entry.enabled ||
+                credentialRevision(old.entry) !== credentialRevision(entry));
+            const current: Current =
+              read || !old
+                ? {
+                    entry,
+                    ticket: ++ticket,
+                    checkedAt: 0,
+                    duplicate: false,
+                    recheck: false,
+                    error: undefined,
+                  }
+                : { ...old, entry };
+            entries.set(entry.id, current);
+            if (read || !entry.enabled) retire(entry.id);
+            if (!entry.enabled) {
+              current.ticket = ++ticket;
+              pending.delete(entry.id);
+            } else if (read) enqueue(current, true);
+          }
+          for (const preparation of preparations.values())
+            if (!entries.get(preparation.admission.builderId)?.entry.enabled)
+              preparation.controller.abort();
+          conflicts();
+          return true;
+        }),
+      );
+      yield* Effect.forEach(retired, (lease) => Scope.close(lease, Exit.void));
+      yield* launch();
+      return changed;
+    });
+    const refreshHealth = Effect.fn("BuilderRegistry.checkHealth")(function* (
+      id: string,
+    ) {
+      yield* gate.withPermit(
+        Effect.sync(() => {
+          const current = entries.get(id);
+          if (
+            current?.entry.enabled &&
+            current.credential &&
+            !pending.has(id) &&
+            !workers.has(id)
+          ) {
+            current.recheck = true;
+            current.ticket = ++ticket;
+            enqueue(current, false);
+          }
+        }),
+      );
+      yield* launch();
+    });
+    const awaitIdle = Effect.fn("BuilderRegistry.awaitIdle")(function* () {
+      while (workers.size || pending.size) {
+        yield* launch();
+        yield* Effect.forEach([...workers.values()], Fiber.join);
+      }
+    });
+    const admit = Effect.fn("BuilderRegistry.admit")(function* (
+      target?: string,
+    ) {
+      const candidates =
+        target !== undefined
+          ? [target]
+          : !desired || desired.defaultBuilder === null
+            ? []
+            : [
+                desired.defaultBuilder,
+                ...(desired.selection.fallback === "before-submission"
+                  ? desired.selection.fallbackBuilders
+                  : []),
+              ];
+      for (const id of candidates) {
+        const current = entries.get(id);
+        if (current?.identity && now() - current.checkedAt > 15_000) {
+          yield* refreshHealth(id);
+          const flight = workers.get(id);
+          if (flight) yield* Fiber.join(flight);
+        }
+        const acquired = yield* Effect.acquireRelease(
+          gate.withPermit(
+            Effect.sync(() => {
+              const current = entries.get(id);
+              if (!current || reason(current) || !current.identity)
+                return undefined;
+              const hostId = current.identity.generation.transport.hostId;
+              if (
+                identity.reserved(hostId) ||
+                [...preparations.values()].some(
+                  (item) => item.admission.hostId === hostId,
+                )
+              )
+                return undefined;
+              const controller = new AbortController();
+              const admission: BuilderAdmission = {
+                builderId: id,
+                generationId: current.identity.generation.id,
+                hostId,
+                signal: controller.signal,
+              };
+              preparations.set(admission, { admission, controller, current });
+              return admission;
+            }),
+          ),
+          (admission) =>
+            Effect.sync(() => {
+              if (admission) {
+                preparations.get(admission)?.controller.abort();
+                preparations.delete(admission);
+              }
+            }),
+        );
+        if (acquired) {
+          yield* identity.retain(acquired.generationId);
+          return acquired;
+        }
+      }
+      return yield* Effect.fail(
+        BuilderRegistryError.new("registry-admission-closed"),
+      );
+    });
+    const submit = Effect.fn("BuilderRegistry.submit")(function* <A, E, R>(
+      admission: BuilderAdmission,
+      transition: (minimumFreeBytes: number) => Effect.Effect<A, E, R>,
+    ) {
+      const preparing = preparations.get(admission);
+      if (
+        preparing?.current.credential &&
+        !admission.signal.aborted &&
+        now() - preparing.current.checkedAt > 15_000
+      ) {
+        // Preparation can outlast admission health. Check the admitted immutable
+        // credential, outside the publication gate, without any item read.
+        const checked = yield* identity.verify(
+          preparing.current.entry,
+          preparing.current.credential,
+        );
+        if (
+          checked.generation.id !== admission.generationId ||
+          checked.health.hostId !== admission.hostId
+        )
+          return yield* Effect.fail(
+            BuilderRegistryError.new("registry-submission-closed"),
+          );
+        yield* gate.withPermit(
+          Effect.sync(() => {
+            preparing.current.identity = checked;
+            preparing.current.checkedAt = now();
+          }),
+        );
+      }
+      return yield* gate.withPermit(
+        Effect.gen(function* () {
+          const preparation = preparations.get(admission),
+            current = entries.get(admission.builderId);
+          if (
+            !preparation ||
+            admission.signal.aborted ||
+            !current?.entry.enabled ||
+            stale ||
+            current.duplicate ||
+            preparation.current.duplicate ||
+            preparation.current.recheck
+          )
+            return yield* Effect.fail(
+              BuilderRegistryError.new("registry-submission-closed"),
+            );
+          // A source edit doesn't retarget an already admitted generation. Policy always uses the latest floor.
+          const policy = { ...preparation.current, entry: current.entry };
+          if (reason(policy))
+            return yield* Effect.fail(
+              BuilderRegistryError.new("registry-submission-closed"),
+            );
+          // The durable transition and its in-memory handoff are one interrupt-safe
+          // operation. The callback must only commit ownership, never run SSH.
+          return yield* transition(current.entry.minimumFreeBytes).pipe(
+            Effect.tap(() => Effect.sync(() => preparations.delete(admission))),
+            Effect.uninterruptible,
+          );
+        }),
+      );
+    });
+    return {
+      publish,
+      refreshHealth,
+      awaitIdle,
+      admit,
+      submit,
+      fault: Effect.fn("BuilderRegistry.fault")((cause: BuilderRegistryError) =>
+        gate.withPermit(
+          Effect.sync(() => {
+            error = cause.code;
+            failures.set("registry", cause);
+            if (cause.code === "registry-mount-stale") {
+              stale = true;
+              for (const item of preparations.values()) item.controller.abort();
+            }
+          }),
+        ),
+      ),
+      snapshot: () => ({
+        revision,
+        desired: desired === undefined ? undefined : structuredClone(desired),
+        error,
+        entries: [...entries.values()].map((current) => ({
+          id: current.entry.id,
+          available:
+            reason(current) === undefined &&
+            !identity.reserved(
+              current.identity?.generation.transport.hostId ?? "",
+            ),
+          reason: reason(current),
+          generationId: current.identity?.generation.id,
+          hostId: current.credential?.transport.hostId,
+        })),
+      }),
+    };
+  },
+);
