@@ -6,16 +6,20 @@ import { openNativeStorage } from "./native-build-storage.js";
 
 export * from "./native-build-models.js";
 
-export class NativeStateConfig extends Context.Service<
+export { NativeStateConfig } from "./native-build-state-ownership.js";
+
+import {
   NativeStateConfig,
-  NativeStateOptions
->()("NativeStateConfig") {}
+  NativeStateOwnership,
+} from "./native-build-state-ownership.js";
 export const openNativeBuildState = Effect.fn("NativeBuildState.open")(
-  function* (options: NativeStateOptions) {
+  function* (options: NativeStateOptions, ownedRoot?: string) {
     const storage = yield* Effect.acquireRelease(
       // Opening/committing storage cannot be interrupted between its rename and
       // publication. close waits for the serialization tail before unlocking.
-      nativeIO(() => openNativeStorage(options)).pipe(Effect.uninterruptible),
+      nativeIO(() => openNativeStorage(options, ownedRoot)).pipe(
+        Effect.uninterruptible,
+      ),
       (storage) => nativeIO(() => storage.close()).pipe(Effect.orDie),
     );
     return {
@@ -73,12 +77,18 @@ export class NativeBuildStateService extends Context.Service<NativeBuildStateSer
   {
     make: Effect.gen(function* () {
       yield* NativeBuildFiles;
-      return yield* openNativeBuildState(yield* NativeStateConfig);
+      const owner = yield* NativeStateOwnership;
+      return yield* openNativeBuildState(
+        yield* NativeStateConfig,
+        owner.stateRoot,
+      );
     }),
   },
 ) {
   static readonly layerWithoutDependencies = Layer.effect(this, this.make);
   static readonly layer = this.layerWithoutDependencies.pipe(
-    Layer.provide(NativeBuildFiles.layer),
+    Layer.provide(
+      Layer.mergeAll(NativeBuildFiles.layer, NativeStateOwnership.layer),
+    ),
   );
 }

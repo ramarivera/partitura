@@ -72,6 +72,7 @@ COPY package.json bun.lock* ./
 RUN bun install --frozen-lockfile
 COPY tsconfig.json biome.json ./
 COPY src ./src
+COPY deploy/mac-build/builder-secret.ts deploy/mac-build/native-build-budget-admin.ts deploy/mac-build/native-build-admin.ts ./deploy/mac-build/
 RUN bun run build
 
 FROM oven/bun:1.3.14
@@ -114,6 +115,11 @@ RUN ln -s /opt/claude/bin/claude /usr/local/bin/claude \
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json /app/bun.lock* ./
 RUN bun install --production --frozen-lockfile
+# Offline packaging check: load the pinned JS wrapper/core and locate the actual WASM.
+RUN /opt/partitura/bin/node --version \
+  && /opt/partitura/bin/node -e 'const fs=require("node:fs"); const path=require("node:path"); const sdk=require("@1password/sdk"); const core=require.resolve("@1password/sdk-core"); if(typeof sdk.createClient!=="function" || !fs.statSync(path.join(path.dirname(core),"core_bg.wasm")).isFile()) process.exit(1)' \
+  && /opt/partitura/bin/node --check /app/dist/native-build-secret-helper.js \
+  && /opt/partitura/bin/node /app/dist/native-build-secret-helper.js </dev/null
 # The gateway owns shared executable inputs. Workers use numeric session ids
 # with no capabilities or privilege escalation; no passwd entry is required.
 RUN chown -Rh root:root /home/bun /app \

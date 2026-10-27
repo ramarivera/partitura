@@ -1,13 +1,26 @@
 import { createHash } from "node:crypto";
 import { basename, dirname } from "node:path";
-import { Context, Effect, Exit, Layer, Queue, Scope, Semaphore } from "effect";
+import {
+  Context,
+  Effect,
+  Exit,
+  Layer,
+  Option,
+  Queue,
+  Scope,
+  Semaphore,
+} from "effect";
 import { BuilderRegistryFiles } from "./builder-registry-files.js";
 import { BuilderRegistryIdentity } from "./builder-registry-identity.js";
 import { BuilderRegistryError } from "./builder-registry-json.js";
-import { parseBuilderRegistry } from "./builder-registry-schema.js";
+import {
+  parseBuilderRegistry,
+  sourceReference,
+} from "./builder-registry-schema.js";
 import { makeBuilderRegistryState } from "./builder-registry-state.js";
 import { BuilderSecretProvider } from "./builder-secret-provider.js";
 import { BuilderRegistryConfig } from "./config-native-build.js";
+import { NativeBuildSecretCache } from "./native-build-secret-cache.js";
 
 export * from "./builder-registry-schema.js";
 export type { BuilderAdmission } from "./builder-registry-state.js";
@@ -21,6 +34,8 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
       const settings = yield* BuilderRegistryConfig;
       const files = yield* BuilderRegistryFiles;
       const provider = yield* BuilderSecretProvider;
+      const secretCache = yield* Effect.serviceOption(NativeBuildSecretCache);
+      let capacityError: string | undefined;
       const identity = yield* BuilderRegistryIdentity;
       const scope = yield* Scope.Scope;
       const state = yield* makeBuilderRegistryState(provider, identity);
@@ -62,7 +77,33 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
             if (digest === nextDigest && state.snapshot().error === undefined)
               return;
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
-            yield* state.publish(snapshot);
+            if (Option.isSome(secretCache)) {
+              const capacity = yield* secretCache.value
+                .capacity(
+                  snapshot.builders
+                    .filter((entry) => entry.enabled)
+                    .map((entry) => ({
+                      source: sourceReference(entry.secretSource),
+                      revision: entry.secretRevision,
+                      builderId: entry.id,
+                      retained: false,
+                    })),
+                )
+                .pipe(
+                  Effect.mapError((error) =>
+                    BuilderRegistryError.new(error.code),
+                  ),
+                );
+              if (!capacity.sufficient) {
+                capacityError = "budget-capacity";
+                return;
+              }
+              capacityError = undefined;
+            }
+            yield* state.publish(
+              snapshot,
+              state.snapshot().desired ? "registry" : "startup",
+            );
             digest = nextDigest;
           }).pipe(Effect.catch((cause) => state.fault(cause))),
         ),
@@ -117,7 +158,7 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
       return {
         ...state,
         reload,
-        snapshot: () => ({ ...state.snapshot(), watchDegraded }),
+        snapshot: () => ({ ...state.snapshot(), watchDegraded, capacityError }),
         // Retain the cause privately without serializing it into admin/log output.
         watchFailure: () => watchFailure,
       };

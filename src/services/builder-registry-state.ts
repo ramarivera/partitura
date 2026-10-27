@@ -41,6 +41,7 @@ interface Preparation {
   readonly current: Current;
 }
 interface Work {
+  readonly trigger: "startup" | "registry";
   readonly ticket: number;
   readonly entry: BuilderEntry;
   readonly credential?: BuilderCredential;
@@ -68,8 +69,13 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     let error: string | undefined,
       stale = false;
     const failures = new Map<string, unknown>();
-    const enqueue = (current: Current, read: boolean) => {
+    const enqueue = (
+      current: Current,
+      read: boolean,
+      trigger: "startup" | "registry" = "registry",
+    ) => {
       pending.set(current.entry.id, {
+        trigger,
         ticket: current.ticket,
         entry: current.entry,
         ...(!read && current.credential
@@ -115,7 +121,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         };
         yield* Effect.gen(function* () {
           const credential =
-            work.credential ?? (yield* provider.resolve(work.entry));
+            work.credential ??
+            (yield* provider.resolve(work.entry, work.trigger));
           const accepted = yield* gate.withPermit(
             Effect.sync(() => {
               const current = live();
@@ -238,6 +245,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     };
     const publish = Effect.fn("BuilderRegistry.publish")(function* (
       snapshot: BuilderRegistrySnapshot,
+      trigger: "startup" | "registry" = "registry",
     ) {
       const retired: Scope.Closeable[] = [];
       const retire = (id: string) => {
@@ -288,7 +296,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
             if (!entry.enabled) {
               current.ticket = ++ticket;
               pending.delete(entry.id);
-            } else if (read) enqueue(current, true);
+            } else if (read) enqueue(current, true, trigger);
           }
           for (const preparation of preparations.values())
             if (!entries.get(preparation.admission.builderId)?.entry.enabled)

@@ -16,6 +16,7 @@ import {
   NativeBuildJobSchema,
   validateNativeBuildDiagnostics,
 } from "../../src/services/native-build-client.js";
+import { runNativeBudgetAdmin } from "./native-build-budget-admin.js";
 
 const MAX_RECORD = 65_536;
 const JOB_FILE = /^[a-f0-9]{32}\.json$/u;
@@ -314,7 +315,7 @@ export async function rollbackLegacyDiskRecords(options: {
   return result;
 }
 
-if (import.meta.main) {
+if (import.meta.main && !process.argv[2]?.startsWith("budget-")) {
   try {
     const [
       command,
@@ -368,3 +369,8 @@ if (import.meta.main) {
     process.exitCode = 1;
   }
 }
+
+export { runNativeBudgetAdmin } from "./native-build-budget-admin.js";
+
+if (import.meta.main && process.argv[2]?.startsWith("budget-"))
+  runNativeBudgetAdmin();
