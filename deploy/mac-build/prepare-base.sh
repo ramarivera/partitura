@@ -92,6 +92,9 @@ fi
 
 source_vm="$tart_home/vms/$source_name"
 base_vm="$tart_home/vms/$base_name"
+# macOS caps Unix socket paths at 103 bytes. Tart keeps its control socket in the
+# VM directory and the stale-socket probe below must reach it after qualification.
+[ "$(printf %s "$base_vm/control.sock" | wc -c)" -le 103 ] || fail 'Tart home path is too long for the VM control socket; use a shorter --tart-home'
 dedicated_vm=
 receipt_base_path=$base_vm
 if [ -n "$dedicated_tart_home" ]; then
