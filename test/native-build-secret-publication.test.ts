@@ -243,3 +243,118 @@ it.effect(
       }),
     ),
 );
+
+for (const action of ["disable", "remove"] as const)
+  it.effect(
+    `failed ${action} supersession retries before the next provider debit`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* secretFixture(path(`retry-${action}`));
+          let broken = false;
+          let reads = 0;
+          const journal: typeof NativeSecretJournal.Service = {
+            ...f.journal,
+            transaction: (update, at) =>
+              broken
+                ? Effect.fail(NativeSecretError.new("journal-repair-required"))
+                : f.journal.transaction(update, at),
+          };
+          const cache = yield* f.openCache(
+            {
+              read: (_source, reserve) =>
+                reserve(4).pipe(
+                  Effect.tap(() => Effect.sync(() => reads++)),
+                  Effect.as(f.record),
+                ),
+            },
+            journal,
+          );
+          const fake = fakeBuilderAdapters();
+          const registry = yield* makeBuilderRegistryState(
+            fake.provider,
+            fake.identity,
+            Date.now,
+            (ids) =>
+              cache
+                .supersede(ids)
+                .pipe(
+                  Effect.mapError((error) =>
+                    BuilderRegistryError.new(error.code),
+                  ),
+                ),
+          );
+          yield* registry.publish(document());
+          yield* registry.awaitIdle();
+          const source = { ...f.source(), builderId: "primary" };
+          const old = yield* cache.accept("human", [source], "org");
+          broken = true;
+          yield* registry.publish(
+            document(action === "remove" ? [] : [entry("primary", false)]),
+          );
+          expect(
+            registry.snapshot().entries.some((item) => item.available),
+          ).toBe(false);
+          expect(cache.progress(old)?.sources[0]?.status).toBe("pending");
+          expect((yield* Effect.flip(cache.tick())).code).toBe(
+            "journal-repair-required",
+          );
+          broken = false;
+          yield* cache.tick();
+          expect(cache.progress(old)?.sources[0]?.status).toBe("superseded");
+          expect(reads).toBe(0);
+          expect(f.journal.snapshot().charges).toEqual([]);
+          // A later explicit disabled-builder refresh is a different operation.
+          const fresh = yield* cache.accept("human", [source], "org");
+          yield* cache.tick();
+          expect(cache.progress(fresh)?.sources[0]?.status).toBe("succeeded");
+          expect(reads).toBe(1);
+        }),
+      ),
+  );
+
+it.effect(
+  "supersession preserves a retained source sharing the obsolete builder's operation",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* secretFixture(path("retained-supersede"));
+        let reads = 0;
+        const cache = yield* f.openCache({
+          read: (_source, reserve) =>
+            reserve(4).pipe(
+              Effect.tap(() => Effect.sync(() => reads++)),
+              Effect.as(f.record),
+            ),
+        });
+        const desired = { ...f.source(1), builderId: "primary" };
+        const retained = {
+          ...f.source(2),
+          builderId: "primary",
+          retained: true,
+        };
+        const id = yield* cache.accept(
+          "human",
+          [desired, retained],
+          "org",
+          true,
+        );
+        yield* cache.supersede(["primary"]);
+        const operation = f.journal
+          .snapshot()
+          .operations.find((item) => item.id === id);
+        expect(
+          operation?.sources.find((work) => work.source === desired.source)
+            ?.status,
+        ).toBe("superseded");
+        expect(
+          operation?.sources.find((work) => work.source === retained.source)
+            ?.status,
+        ).toBe("pending");
+        yield* cache.tick();
+        expect(cache.progress(id)?.done).toBe(true);
+        expect(reads).toBe(1);
+        expect(f.journal.snapshot().charges).toHaveLength(1);
+      }),
+    ),
+);

@@ -1,7 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { Clock, Effect } from "effect";
+import { TestClock } from "effect/testing";
 import {
   createNativeBuildRecovery,
   recoverNativeMetadata,
@@ -438,13 +439,15 @@ it.live(
     ),
 );
 
-it.live(
+it.effect(
   "fresh receiving heartbeats do not spend failures but cannot exceed 750 seconds",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
         const fixture = yield* testAwait(registryFixture(path("heartbeat")));
-        let time = 1_000_000;
+        yield* TestClock.adjust(1_000_000);
+        const clock = yield* Clock.Clock;
+        const now = () => clock.currentTimeMillisUnsafe();
         const job = registryJob(fixture.generation, {
           state: "submitting",
           submissionExpiresAt: 1,
@@ -454,19 +457,28 @@ it.live(
             draft.jobs.push(job);
           }),
         );
-        yield* testAwait(recoverNativeMetadata(fixture.state, time));
-        const broker = memoryBroker(() => time);
+        yield* testAwait(recoverNativeMetadata(fixture.state, now()));
+        const broker = memoryBroker(now);
         broker.settings.busy = true;
         const recovery = createNativeBuildRecovery(
           fixture.state,
           broker.transport,
-          { now: () => time },
+          { now },
         );
-        try {
-          for (let index = 0; index < 51; index++) {
-            yield* testAwait(recovery.tick(job.jobId));
-            time += 15_000;
-          }
+        yield* Effect.gen(function* () {
+          yield* recovery.tick(job.jobId);
+          yield* TestClock.adjust(15_000);
+          yield* recovery.tick(job.jobId);
+          expect(
+            fixture.state.owned("org-a", "session-a", job.jobId).recovery,
+          ).toMatchObject({
+            attempts: 0,
+            state: "pending",
+            lastReason: "busy",
+          });
+          // Jump to the actual boundary instead of fsyncing 51 scheduling ticks.
+          yield* TestClock.adjust(735_000);
+          yield* recovery.tick(job.jobId);
           const result = fixture.state.owned("org-a", "session-a", job.jobId);
           expect(result.recovery.attempts).toBe(0);
           expect(result.recovery.state).toBe("operator-required");
@@ -475,9 +487,7 @@ it.live(
           expect(
             broker.calls.some((call) => call.command.startsWith("run")),
           ).toBe(false);
-        } finally {
-          yield* testAwait(fixture.state.close());
-        }
+        }).pipe(Effect.ensuring(fixture.state.close().pipe(Effect.orDie)));
       }),
     ),
 );

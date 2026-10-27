@@ -294,6 +294,14 @@ export class NativeBuildFleet extends Context.Service<NativeBuildFleet>()(
               undefined,
               { timeout: 12000 },
             );
+            if (health.kind !== "health")
+              return yield* Effect.fail(
+                NativeFleetError.new(
+                  health.kind === "error"
+                    ? (fixedCode(health.code) ?? "fleet-health-unavailable")
+                    : "protocol-mismatch",
+                ),
+              );
             yield* recovery.observe(id, health);
             yield* registry.recordHealth(id, generation.id, health);
           }),

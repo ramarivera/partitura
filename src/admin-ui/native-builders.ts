@@ -8,6 +8,10 @@ export function renderNativeBuildersPage(csrf: string): string {
 const csrf = ${token};
 const base = "/api/admin/native-builders";
 const message = document.getElementById("message");
+const resume = document.createElement("a");
+resume.textContent = "Resume progress";
+resume.hidden = true;
+message.after(resume);
 const show = (value) => {
   message.textContent = JSON.stringify(value, null, 2);
 };
@@ -35,6 +39,17 @@ async function post(path, body) {
   await load();
 }
 async function progress(id) {
+  resume.hidden = true;
+  resume.href = base + "/refreshes/" + encodeURIComponent(id);
+  resume.onclick = async (event) => {
+    event.preventDefault();
+    try {
+      await progress(id);
+      await load();
+    } catch (error) {
+      show({ error: error.message });
+    }
+  };
   for (let i = 0; i < 120; i++) {
     const value = await get(base + "/refreshes/" + encodeURIComponent(id));
     show(value);
@@ -44,8 +59,9 @@ async function progress(id) {
   show({
     operationId: id,
     status: "pending",
-    message: "Still pending. Reload progress explicitly.",
+    message: "Still pending. Use Resume progress to check again.",
   });
+  resume.hidden = false;
 }
 function element(tag, text) {
   const el = document.createElement(tag);

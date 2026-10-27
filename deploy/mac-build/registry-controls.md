@@ -37,7 +37,7 @@ All bodies are limited to 4 KiB with closed schemas. Mutations return 202 and an
 opaque operation ID. Human recovery finishes its bounded round before returning;
 its progress is already terminal. Refresh and health checks run in scoped fibers.
 The page polls progress for at most two minutes, then leaves the operation ID
-visible for a later explicit progress read.
+visible with a Resume progress link for another bounded polling round.
 
 ## Human cleanup decisions
 
@@ -58,8 +58,11 @@ ownership, generation and historical artifact access never change.
 
 Unknown authenticated maintenance markers become private host obligations, with
 no invented tenant or execution record. They use the same bounded cleanup path.
-For a removed builder, a verified current connection to the same installation is
-needed for reconciliation. It can use another logical ID for that same host.
+Reconciliation also requires each selected job or maintenance obligation to
+belong to the endpoint's logical builder. A matching physical host ID doesn't
+permit another logical builder's credentials to clear it. Restore a verified
+current connection under the original logical ID before reconciling a removed
+builder's obligations, or use explicitly approved offline decommission.
 
 `POST /api/admin/native-builders/:id/decommission` additionally requires
 `evidenceReference`, 1–512 characters, and `acknowledgeUnverifiedCleanup: true`.

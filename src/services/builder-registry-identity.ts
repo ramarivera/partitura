@@ -3,11 +3,10 @@ import { BuilderRegistryError } from "./builder-registry-json.js";
 import type { BuilderEntry } from "./builder-registry-schema.js";
 import type { BuilderCredential } from "./builder-secret-provider.js";
 import { nativeTry } from "./native-build-errors.js";
+import { observeNativeMaintenance } from "./native-build-maintenance.js";
 import {
   NativeBuildStateService,
   type NativeGeneration,
-  terminalNativeJob,
-  unresolvedRecovery,
 } from "./native-build-state.js";
 import {
   type BrokerEnvelope,
@@ -60,6 +59,7 @@ export class BuilderRegistryIdentity extends Context.Service<BuilderRegistryIden
                     );
                 yield* transport.materialize(generation, credential.privateKey);
                 const health = yield* transport.envelope(generation, "health");
+                yield* observeNativeMaintenance(state, entry.id, health);
                 return { generation, health } satisfies BuilderIdentityResult;
               }),
             ).pipe(
@@ -76,20 +76,7 @@ export class BuilderRegistryIdentity extends Context.Service<BuilderRegistryIden
               ),
             ),
         ),
-        reserved: (hostId: string) =>
-          state.snapshot().fleet?.retiredHosts.includes(hostId) === true ||
-          state
-            .snapshot()
-            .fleet?.maintenance.some(
-              (item) => item.hostId === hostId && item.state === "pending",
-            ) === true ||
-          state
-            .snapshot()
-            .jobs.some(
-              (job) =>
-                job.verifiedHostId === hostId &&
-                (!terminalNativeJob(job) || unresolvedRecovery(job)),
-            ),
+        reserved: (hostId: string) => state.quarantined(hostId),
       };
     }),
   },

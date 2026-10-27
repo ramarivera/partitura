@@ -88,9 +88,14 @@ it.live(
             expect(
               (yield* fetchApp(request({ unexpected: true }))).status,
             ).toBe(400);
+            const oversized = `{}${" ".repeat(4095)}`;
+            expect(JSON.parse(oversized)).toEqual({});
             expect(
-              (yield* fetchApp(request({ padding: "x".repeat(4096) }))).status,
+              (yield* fetchApp(new Request(request({}), { body: oversized })))
+                .status,
             ).toBe(400);
+            expect(f.journal.snapshot().operations).toEqual([]);
+            expect(f.reads).toEqual([]);
             const accepted = yield* fetchApp(request({}));
             expect(accepted.status).toBe(202);
             expect(accepted.headers.get("cache-control")).toBe("no-store");

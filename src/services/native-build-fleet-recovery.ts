@@ -1,4 +1,4 @@
-import { Context, Effect, Layer } from "effect";
+import { Clock, Context, Effect, Exit, Layer } from "effect";
 import { BuilderRegistry } from "./builder-registry.js";
 import { nativeTry } from "./native-build-errors.js";
 import { opaqueId } from "./native-build-file-io.js";
@@ -8,6 +8,7 @@ import {
   type FleetActor,
   NativeFleetError,
 } from "./native-build-fleet-models.js";
+import { observeNativeMaintenance } from "./native-build-maintenance.js";
 import {
   applyNativeReceipt,
   cleanNativeHealth,
@@ -30,35 +31,12 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
       const registry = yield* BuilderRegistry;
       const state = yield* NativeBuildStateService;
       const transport = yield* NativeBuildTransport;
-      const observe = Effect.fn("NativeBuildFleetRecovery.observe")(function* (
-        builderId: string,
-        health: BrokerEnvelope,
-      ) {
-        if (!health.maintenanceJobId) return;
-        yield* state.transaction((draft) => {
-          if (draft.jobs.some((job) => job.jobId === health.maintenanceJobId))
-            return;
-          draft.fleet ??= emptyFleetMetadata();
-          const fleet = draft.fleet;
-          if (
-            fleet.maintenance.some(
-              (item) =>
-                item.hostId === health.hostId &&
-                item.jobId === health.maintenanceJobId,
-            )
-          )
-            return;
-          if (fleet.maintenance.length >= 256)
-            throw NativeFleetError.new("fleet-capacity", 409);
-          fleet.maintenance.push({
-            id: opaqueId(),
-            builderId,
-            hostId: health.hostId,
-            jobId: health.maintenanceJobId ?? "",
-            state: "pending",
-          });
-        });
-      });
+      const clock = yield* Clock.Clock;
+      const now = () => clock.currentTimeMillisUnsafe();
+      const observe = Effect.fn("NativeBuildFleetRecovery.observe")(
+        (builderId: string, health: BrokerEnvelope) =>
+          observeNativeMaintenance(state, builderId, health),
+      );
       const act = Effect.fn("NativeBuildFleetRecovery.act")(function* (
         actor: FleetActor,
         builderId: string,
@@ -101,8 +79,10 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
         if (
           selected.some(({ job, maintenance }) =>
             job
-              ? job.verifiedHostId !== hostId
-              : !maintenance || maintenance.hostId !== hostId,
+              ? job.verifiedHostId !== hostId || job.builderId !== builderId
+              : !maintenance ||
+                maintenance.hostId !== hostId ||
+                maintenance.builderId !== builderId,
           )
         )
           return yield* Effect.fail(
@@ -144,7 +124,7 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
                 | "failed",
             ) => ({
               id: auditId,
-              at: Date.now(),
+              at: now(),
               actor: actor.sessionHash,
               organizationId: actor.organizationId,
               builderId,
@@ -167,25 +147,25 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
                 : { evidenceReference: input.evidenceReference }),
               ...(epoch === undefined ? {} : { epoch }),
             });
-            const at = Date.now();
-            yield* state.transaction((draft) => {
-              draft.fleet ??= emptyFleetMetadata();
-              const fleet = draft.fleet;
-              if (
-                fleet.starts.some(
-                  (start) => start.hostId === hostId && start.at > at - 60000,
-                )
-              )
-                throw NativeFleetError.new("fleet-rate-limited", 429);
-              fleet.starts = fleet.starts.filter(
-                (start) => start.at > at - 60000,
-              );
-              if (fleet.starts.length >= 256)
-                throw NativeFleetError.new("fleet-capacity", 409);
-              fleet.starts.push({ hostId, at });
-              fleet.audit = [...fleet.audit.slice(-511), audit("pending")];
-            });
             const run = Effect.gen(function* () {
+              const at = now();
+              yield* state.transaction((draft) => {
+                draft.fleet ??= emptyFleetMetadata();
+                const fleet = draft.fleet;
+                if (
+                  fleet.starts.some(
+                    (start) => start.hostId === hostId && start.at > at - 60000,
+                  )
+                )
+                  throw NativeFleetError.new("fleet-rate-limited", 429);
+                fleet.starts = fleet.starts.filter(
+                  (start) => start.at > at - 60000,
+                );
+                if (fleet.starts.length >= 256)
+                  throw NativeFleetError.new("fleet-capacity", 409);
+                fleet.starts.push({ hostId, at });
+                fleet.audit = [...fleet.audit.slice(-511), audit("pending")];
+              });
               if (action === "reconcile") {
                 const generation = current?.identity?.generation;
                 if (!generation)
@@ -284,7 +264,7 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
                       );
                     job.recovery.state = "admin-resolved";
                     job.recovery.resolvedEpoch = epoch ?? null;
-                    job.updatedAt = Date.now();
+                    job.updatedAt = now();
                     if (!terminalNativeJob(job)) job.state = "interrupted";
                     if (action === "decommission")
                       job.failureCode = "abandoned-unverified";
@@ -332,17 +312,21 @@ export class NativeBuildFleetRecovery extends Context.Service<NativeBuildFleetRe
                 orElse: () =>
                   Effect.fail(NativeFleetError.new("fleet-unavailable")),
               }),
-              Effect.tapError(() =>
-                state.transaction((draft) => {
-                  draft.fleet ??= emptyFleetMetadata();
-                  const fleet = draft.fleet;
-                  fleet.audit = [
-                    ...fleet.audit
-                      .filter((item) => item.id !== auditId)
-                      .slice(-511),
-                    audit("failed"),
-                  ];
-                }),
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit)
+                  ? state
+                      .transaction((draft) => {
+                        const pending = draft.fleet?.audit.find(
+                          (item) =>
+                            item.id === auditId && item.outcome === "pending",
+                        );
+                        if (!pending || !draft.fleet) return;
+                        draft.fleet.audit = draft.fleet.audit.map((item) =>
+                          item.id === auditId ? audit("failed") : item,
+                        );
+                      })
+                      .pipe(Effect.uninterruptible)
+                  : Effect.void,
               ),
             );
           }),

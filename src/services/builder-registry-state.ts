@@ -401,10 +401,9 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       );
       yield* launch();
       const flight = workers.get(id);
-      if (forced && flight)
-        yield* Fiber.join(flight).pipe(
-          Effect.onInterrupt(() => Fiber.interrupt(flight)),
-        );
+      // This worker belongs to the registry scope, including when another caller
+      // already started it. A timed-out waiter must not cancel shared resolution.
+      if (forced && flight) yield* Fiber.join(flight);
     });
     const awaitIdle = Effect.fn("BuilderRegistry.awaitIdle")(function* () {
       while (workers.size || pending.size) {
