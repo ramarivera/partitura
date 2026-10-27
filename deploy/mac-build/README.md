@@ -347,30 +347,35 @@ requires recovery after the host returns. The gateway records ownership and
 cancels its interrupted jobs during restart recovery.
 
 Before each new job, the host prunes terminal artifact archives older than seven
-days and the oldest archives needed to leave at most 6 GiB of retained output.
-The next job can add at most 2 GiB, bounding retained archives to 8 GiB. Failed
-jobs remove partial archives immediately. Receipts stay available for status
-queries and record `artifactExpired` when pruning removes their archive. An
-already-open artifact transfer can finish after its archive is unlinked. Pruning
-holds the job lock and never removes a running job's output or VM recovery fences.
+days and the oldest archives to target at most 6 GiB of retained output before
+the next job adds at most 2 GiB. A time-bounded scan can defer pruning beyond
+this 8-GiB target; the sealed free-space floor still gates every build. Failed
+jobs remove partial archives immediately. Retained receipts record
+`artifactExpired` when pruning removes their archive. Registry-only history has
+a separate thirty-day retention policy described below; legacy receipts persist
+until registry-only cutover. An already-open artifact transfer can finish after
+its archive is unlinked. Pruning holds the job lock and never removes a running
+job's output or VM recovery fences.
 
 Failed `run` requests return exit status 1 with a JSON receipt. The gateway
 validates its job, commit and action before retaining the allowlisted `stage`,
 `bootExitCode` and `failureCode` fields. Transport errors and invalid receipts
 remain generic failures. `host-key-unavailable` identifies the known boot-log
 signature in Virtualization.framework; it doesn't identify which account
-prerequisite is missing. `cleanup-required` takes priority and blocks further jobs
-until reconciliation. Raw boot logs stay private. `status` can classify a retained
-boot log for an older failed job without changing the stored receipt or booting a
-VM. Installing this diagnostic support doesn't repair host security state.
+prerequisite is missing. `cleanup-required` takes priority and blocks further
+jobs until reconciliation. Raw boot logs stay private. `status` can classify a
+retained boot log for an older failed job without changing the stored receipt or
+booting a VM. Installing this diagnostic support doesn't repair host security
+state.
 
 ### Registry protocol, source only
 
 The registry broker code adds the following exact commands. They aren't enabled
-on an installed Mac by this PR. Installation and profile changes require separate
-host rollout approval. The existing primary/backup gateway continues to use
-`run`, `status`, `artifact` and `cancel` with their original response shapes under
-the legacy profile. Disk failures use the compatible diagnostics described above.
+on an installed Mac by this PR. Installation and profile changes require
+separate host rollout approval. The existing primary/backup gateway continues to
+use `run`, `status`, `artifact` and `cancel` with their original response shapes
+under the legacy profile. Disk failures use the compatible diagnostics described
+above.
 
 ```text
 health
@@ -382,32 +387,40 @@ artifact <job32hex>
 ```
 
 Commands use single ASCII spaces, with no trailing whitespace, shell quoting or
-evaluation. The maximum command length is 512 characters. PR numbers are positive
-decimal integers of at most eight digits; actions match
-`[a-z][a-z0-9-]{0,63}`. Bundle length is 1 through 1 GiB. `secretBytes` is mandatory
-in `run-v2`, 0 through 65536, and precedes the bundle on stdin. IDs and epoch are
-lowercase hex. Expiry is a positive decimal Unix timestamp in whole seconds,
-strictly after the current time and at most 120 seconds ahead. The broker checks
-it after any lock wait and again before input. Accepted jobs retain their full
-execution timeout. Installed qualification must verify clock skew within thirty
-seconds. Each gateway job has one attempt ID; neither a repeated job nor an
-attempt reused for another job executes again.
+evaluation. The maximum command length is 512 characters. PR numbers are
+positive decimal integers of at most eight digits; actions match
+`[a-z][a-z0-9-]{0,63}`. Bundle length is 1 through 1 GiB. `secretBytes` is
+mandatory in `run-v2`, 0 through 65536, and precedes the bundle on stdin. IDs
+and epoch are lowercase hex. Expiry is a positive decimal Unix timestamp in
+whole seconds, strictly after the host current time. The gateway sets it at most
+120 seconds from command creation; the broker accepts at most 150 seconds ahead
+to allow the qualified thirty-second clock skew. It checks expiry after any lock
+wait and again before input. Accepted jobs retain their full execution timeout.
+Installed qualification must verify clock skew within thirty seconds. Each
+gateway job has one attempt ID; neither a repeated job nor an attempt reused for
+another job executes again.
 
-The original eleven-key installed configuration remains valid and implies
-legacy mode. The extended sealed configuration adds all four fields together:
-`hostId`, a canonical lowercase UUID; `profile`, either `legacy` or
-`registry-only`; `daemonRelockQualified`, a boolean defaulting to false during
-rollout; and `daemonRelockMacOSBuild`, the qualifying build string or an empty
-string while unqualified. An incomplete extension is invalid. Registry-only mode
-refuses legacy `run`; legacy mode refuses `run-v2`. Health and reconciliation
-require an installed host identity. Legacy status/cancel shapes remain unchanged
-even with an identity installed. The installer in this tree still emits the
-original configuration. It doesn't install these new fields or maintenance.
+The original eleven-key installed configuration remains valid and implies legacy
+mode. The extended sealed configuration adds: `hostId`, a canonical lowercase
+UUID; `profile`, either `legacy` or `registry-only`; `daemonRelockQualified`, a
+boolean defaulting to false during rollout; `daemonRelockMacOSBuild`, the
+qualifying build string or an empty string while unqualified; and
+`minimumFreeBytes`, an integer from 50 GiB through 2^63-1. The first four fields
+must appear together. Existing eleven-key and four-field extended configurations
+remain valid and default the disk floor to 50 GiB. Only the sealed configuration
+can raise the execution floor. Registry-only mode refuses legacy `run`; legacy
+mode refuses `run-v2`. Health and reconciliation require an installed host
+identity. Legacy status/cancel shapes remain unchanged even with an identity
+installed. The installer in this tree still emits the original configuration. It
+doesn't install these new fields or maintenance.
 
 Registry JSON is a closed, newline-terminated envelope of at most 4096 UTF-8
 bytes, including `protocolVersion: 2`, installed `hostId` and a fixed `kind`.
 Unknown exceptions produce a fixed `broker-state-unavailable` error, never raw
-host exception details. Artifact responses remain opaque bytes. Main kinds are:
+host exception details. Registry command parse/configuration failures produce a
+versioned `error` with code `broker-request-refused`, without a host identity
+when configuration could not be loaded. Artifact responses remain opaque bytes.
+Main kinds are:
 
 | Kind | Fields and meaning |
 | --- | --- |
@@ -422,66 +435,116 @@ host exception details. Artifact responses remain opaque bytes. Main kinds are:
 | `error` | Fixed `code`. Never treat this as unknown-job or cleanup evidence. |
 
 Health reads atomic runner/fence markers without opening or acquiring
-`runner.lock`, pruning artifacts, scanning history or accessing any keychain API.
-A fresh matching runner is busy; a heartbeat older than sixty seconds is
-uncertain and blocks admission. A separate cleanup fence wins over busy. Busy
-health skips global VM inventory and disk eligibility checks. Idle health checks
+`runner.lock`, pruning artifacts, scanning history or accessing any keychain
+API. A fresh matching runner is busy; a heartbeat older than sixty seconds or in
+the future is uncertain and blocks admission. A backwards clock step makes a
+future maintenance retry due rather than permanently invalidating its marker.
+Health distinguishes `keychain-relock-pending`, `cleanup-required`,
+`runner-stale`, `maintenance-blocked` and `recovery-incomplete`. A separate
+cleanup fence wins over busy. Busy health skips global VM inventory and disk
+eligibility checks. Before the current boot/revision inventory completes, idle
+health reports `inventory-pending` and never admits work. Thereafter it checks
 installed inputs, writable roots, capacity and disk. Disk fields are null while
 those measurements are skipped. `maintenanceJobId`, when present, comes from an
 existing obligation marker and is a private fleet-admin diagnostic.
 
 `run-v2` waits at most five monotonic seconds for the exclusive lock without
 reading stdin. A timeout is identified `host-busy`, with no recovery, receipt or
-epoch change. Under the lock it checks epoch, expiry, tombstone and replay before
-recovery. Successful pre-input recovery rotates the epoch and returns
-`host-reconciled`; the incoming job never continues to receiving. Refusals record
-a small terminal receipt where storage and lock ownership permit. A valid refusal
-can still exist without a receipt when disk storage fails.
+epoch change. Under the lock it checks epoch, expiry, tombstone and replay
+before recovery. Successful pre-input recovery rotates the epoch and returns
+`host-reconciled`; the incoming job never continues to receiving. Refusals
+record a small terminal receipt where storage and lock ownership permit, except
+stale epochs or existing tombstones, which must preserve an unknown recovery
+outcome. A valid refusal can still exist without a receipt when disk storage
+fails.
 
 On a clean host, artifact pruning precedes disk measurement using available-to-
-account `statvfs` bytes on the actual job and Tart roots. Each root needs 50 GiB;
-the job root additionally needs bundle plus secret input headroom before receiving.
-Free bytes from shared APFS storage are never added together. The broker records
-receiving state and a runner marker before reading bytes. Both input streams
-check cancellation at least once per second, with thirty-second secret and
-600-second bundle deadlines. Closed input and termination use the cleanup path.
-After transfer, it checks the 50-GiB floor again and checks capacity before
-persisting unlock-attempt/active-VM fences and accessing any keychain API. Disk
-failures report `host-disk-space-unavailable` with `disk-preflight` or
-`disk-post-transfer`. Recovery operations remain available below the build floor.
+account `statvfs` bytes on the actual job and Tart roots. Each root needs the
+sealed `minimumFreeBytes` floor, defaulting to 50 GiB; the job root additionally
+needs bundle plus secret input headroom before receiving. Free bytes from shared
+APFS storage are never added together. The broker records receiving state and a
+runner marker before reading bytes. Both input streams check cancellation at
+least once per second, with thirty-second secret and 600-second bundle
+deadlines. Closed input and termination use the cleanup path. After transfer, it
+checks that same floor again and checks capacity before persisting
+unlock-attempt/active-VM fences and accessing any keychain API. Disk failures
+report `host-disk-space-unavailable` with `disk-preflight` or
+`disk-post-transfer`. Recovery operations remain available below the build
+floor. A heartbeat write failure conservatively interrupts both legacy and
+registry builds. The runner keeps cleanup fences until VM cleanup and any
+required relock/readback complete; loss of heartbeat storage never permits
+another build to enter.
 
-Registry cancel only writes/fsyncs its tombstone. Reconcile takes the exclusive
-lock, inspects exact `partitura-job-<job32hex>` clones and bounded private state,
-removes abandoned input, terminalizes interrupted receiving/running receipts,
-and preserves terminal execution outcomes. It never deletes general/operator
-VMs. Reconciliation can also clean other abandoned broker jobs, reported in
+Cancel acknowledges a durable tombstone with exit zero even if cleanup fails;
+acknowledgement never proves cleanup. Registry cancel only writes/fsyncs its
+tombstone. Legacy cancel can reconcile multiple abandoned jobs under the lock,
+retaining their fences on failure. Reconcile takes the exclusive lock, inspects
+exact `partitura-job-<job32hex>` clones and bounded private state, removes
+abandoned input, terminalizes interrupted receiving/running receipts, and
+preserves terminal execution outcomes. It never deletes general/operator VMs.
+Reconciliation can also clean other abandoned broker jobs, reported in
 `reconciledJobs`. It durably records the whole cleanup set before deleting
 anything. If unlock might have happened, success requires keychain lock plus
-locked-state readback. That recovery API call runs in an owned child with a
-deadline. Epoch rotation precedes durable fence removal. Failed validation,
+locked-state readback. That recovery API call runs in an exec helper from the
+sealed broker source, with isolated Python, closed inherited descriptors, a new
+process session, no SSH stdio and a deadline. The local helper entry point is
+refused through the SSH forced-command route. Clone layout validation follows
+[pinned Tart 2.41.1
+VMDirectory.swift](https://github.com/cirruslabs/tart/blob/2.41.1/Sources/tart/VMDirectory.swift)
+and has a source-derived fixture. Actual installed Mac qualification is
+separate. Epoch rotation precedes durable fence removal. Failed validation,
 deletion, readback or state writes retain the safety fence.
 
 The fixed local invocation is `broker.py local-maintenance`. It is rejected
 through `SSH_ORIGINAL_COMMAND` and whenever SSH environment markers are present.
 A future root-owned LaunchDaemon can invoke it as the dedicated build account.
 The code inventories private receipt/owned-clone directories once per boot or
-broker revision, capped at 1024 entries per directory and 64 cleanup jobs.
+broker revision. Boot identity uses `kern.bootsessionuuid`; revision is the
+sealed broker source SHA-256. Root history size never refuses a build. Each
+inventory scan has a ten-second budget and discovers at most 58 cleanup jobs,
+leaving room for existing markers in the 64-job recovery record. Incomplete
+inventories retain an admission fence and continue in bounded batches.
 Subsequent idle minute passes read markers and return without taking the lock or
-scanning history. If `run-v2` wins the boot/migration race, it performs that same
-bounded inventory under the lock before input, reconciling and refusing the
-incoming job if debris exists. With an obligation, maintenance tries the lock nonblocking and leaves
-live owners alone. A cleanup pass has a 120-second deadline and retries failures
-with exponential backoff from sixty seconds to fifteen minutes. Malformed,
-linked, foreign or oversized inventories block admission for host-admin repair.
+scanning history, except when periodic history GC is due. If `run-v2` wins the
+boot race, it performs the same inventory under the lock before input. With an
+obligation, maintenance tries the lock nonblocking and leaves live owners alone.
+
+Each cleanup pass has a 120-second deadline. Transient IO failures retry with
+exponential backoff from sixty seconds to fifteen minutes, including retries of
+the first boot inventory. Pending backoff or a maintenance block returns
+nonzero. Validated malformed, linked, foreign or unsafe objects set
+`maintenance-blocked` with a fixed reason and require host-admin repair.
+Ordinary IO failures and large history never manufacture that operator-only
+flag.
+
+After repairing the unsafe object through an approved host procedure, request
+explicit authenticated `reconcile <job>` for the affected obligation. It
+revalidates inventory under the exclusive lock and clears `maintenance-blocked`
+only after a complete inventory, cleanup, required relock/readback and epoch
+rotation. Larger inventories can need several bounded reconciliation rounds;
+partial progress retains the inventory/admin fence. Never clear the flag by hand
+or interpret cancellation acknowledgement as repair. Design section 8.4's
+human-admin reconciliation route will invoke this broker operation in a later
+slice; that gateway route isn't implemented here.
+
+Registry-only terminal receipts without retained artifacts or input, tombstones
+and attempt markers expire after thirty days. GC validates private state,
+protects current obligations and rotates the admission epoch durably before
+removing at most 64 entries per pass. It runs daily, or after a minute while a
+full batch remains. Scans are time bounded; skipped artifacts remain subject to
+the authoritative free-space check. Legacy commands have no epoch or expiry, so
+legacy receipts, tombstones and attempt identities remain until the approved
+registry-only cutover. Removing the lifetime entry cap lets an upgraded legacy
+host keep building without reopening old commands to replay.
 
 Daemon relock is unqualified by default. Such a pass can remove VM/input debris
-but retains `keychain-relock-pending` and the epoch if unlock might have happened.
-A later authenticated SSH reconcile or pre-input `run-v2` recovery completes
-relock/readback. Even a sealed qualification becomes ineffective after a macOS
-build change. These fake-only tests don't qualify Security.framework behavior,
-cross-session relock, power-loss cleanup, sshd keepalives or a LaunchDaemon.
-Installing and qualifying those remains a separate approved rollout.
-
+but retains `keychain-relock-pending` and the epoch if unlock might have
+happened. A later authenticated SSH reconcile or pre-input `run-v2` recovery
+completes relock/readback. Even a sealed qualification becomes ineffective after
+a macOS build change. These fake-only tests don't qualify Security.framework
+behavior, cross-session relock, power-loss cleanup, sshd keepalives or a
+LaunchDaemon. Installing and qualifying those remains a separate approved
+rollout.
 ## Acceptance
 
 On recent macOS hosts, creating the dedicated Unix account and installing a

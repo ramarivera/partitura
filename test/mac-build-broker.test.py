@@ -86,6 +86,16 @@ class BrokerTests(unittest.TestCase):
         self.keychain = self.keychain_patch.start().return_value
         self.keychain.state.return_value = 'locked'
         self.addCleanup(self.keychain_patch.stop)
+        def fake_relock(_config, _deadline):
+            try:
+                self.keychain.lock()
+                if self.keychain.state() != 'locked':
+                    raise broker.KeychainError('relock-state')
+            finally:
+                self.keychain.close()
+        self.relock_patch = patch.object(broker, 'relock_keychain', side_effect=fake_relock)
+        self.relock_patch.start()
+        self.addCleanup(self.relock_patch.stop)
         self.capacity_patch = patch.object(broker, 'verify_vm_capacity')
         self.capacity_patch.start()
         self.addCleanup(self.capacity_patch.stop)
@@ -109,6 +119,38 @@ class BrokerTests(unittest.TestCase):
 
     def trace(self):
         return [json.loads(line) for line in (self.root / 'trace').read_text().splitlines()]
+
+    def old_history(self, count=2200, aged=False):
+        modified = time.time() - 30 * 24 * 60 * 60 - 10
+        for index in range(1, count + 1):
+            job = f'{index:032x}'
+            directory = self.root / job
+            directory.mkdir(mode=0o700)
+            receipt = directory / 'receipt.json'
+            receipt.write_text(json.dumps(dict(job=job, commit='d'*40, action='archive', state='failed', cause='TimeoutError')))
+            cancel = self.root / (job + '.cancel')
+            cancel.touch(mode=0o600)  # Slice-1 tombstones were empty files.
+            attempt = self.root / ('attempt-' + f'{index + count:032x}')
+            attempt.write_text(job + '\n')
+            if aged:
+                for path in (receipt, cancel, attempt):
+                    os.utime(path, (modified, modified))
+
+    def test_legacy_upgrade_with_thousands_of_receipts_and_empty_tombstones_keeps_building(self):
+        self.old_history(aged=True)
+        code, receipt = self.invoke()
+        self.assertEqual((code, receipt['state']), (0, 'succeeded'))
+        self.assertTrue((self.root / f'{1:032x}' / 'receipt.json').exists())
+        broker.prune_history(self.config)
+        # Legacy input has no epoch/expiry, so replay IDs survive until cutover.
+        self.assertTrue((self.root / (f'{1:032x}' + '.cancel')).exists())
+
+    def test_inventory_identity_uses_boot_session_uuid_and_source_revision(self):
+        identity = '20FAF704-1AF9-4791-B023-A07843B00547'
+        with patch.object(broker.subprocess, 'run', return_value=type('Result', (), {'stdout': (identity + '\n').encode()})()) as run:
+            self.assertEqual(broker.boot_id(), identity.lower())
+        self.assertEqual(run.call_args.args[0], ['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'])
+        self.assertEqual(broker.BROKER_REVISION, broker.hashlib.sha256(SOURCE.read_bytes()).hexdigest())
 
     def test_capacity_inventory_counts_operator_and_other_frontends(self):
         from types import SimpleNamespace
@@ -165,8 +207,7 @@ class BrokerTests(unittest.TestCase):
     def test_crash_recovery_locks_without_reading_credential_and_keeps_fence_on_error(self):
         (self.root / 'active-vm').write_text(self.job + '\n')
         self.keychain.lock.side_effect = broker.KeychainError('lock:-1')
-        with self.assertRaises(broker.KeychainError):
-            broker.cancel_job(self.config, self.job)
+        broker.cancel_job(self.config, self.job)  # Acknowledges the durable tombstone.
         self.assertTrue((self.root / 'active-vm').exists())
         self.keychain.unlock.assert_not_called()
         self.keychain.close.assert_called_once()
@@ -488,6 +529,7 @@ class BrokerTests(unittest.TestCase):
         self.assertFalse((self.root / 'trace').exists())
 
     def test_crash_fence_blocks_new_job_and_cancel_reconciles_exact_orphan(self):
+        shutil.copytree(self.root / 'vms' / self.config['base'], self.root / 'vms' / ('partitura-job-' + self.job))
         (self.root / 'active-vm').write_text(self.job+'\n')
         with self.assertRaisesRegex(ValueError, 'crash recovery'):
             self.invoke()
@@ -540,6 +582,7 @@ class BrokerTests(unittest.TestCase):
 class RegistryBrokerTests(unittest.TestCase):
     tearDown = BrokerTests.tearDown
     trace = BrokerTests.trace
+    old_history = BrokerTests.old_history
 
     def setUp(self):
         BrokerTests.setUp(self)
@@ -547,18 +590,9 @@ class RegistryBrokerTests(unittest.TestCase):
         self.epoch = broker.initialize_epoch(self.config)
         self.attempt = 'e'*32
         self.request = ('run-v2', self.job, 'd'*40, '12', 'archive', 6, 0, self.epoch, self.attempt, int(time.time()) + 100)
-        self.relock_patch = patch.object(broker, 'relock_keychain', side_effect=self.fake_relock)
-        self.relock_patch.start()
-        self.addCleanup(self.relock_patch.stop)
         self.boot_patch = patch.object(broker, 'boot_id', return_value='fixture-boot')
         self.boot_patch.start()
         self.addCleanup(self.boot_patch.stop)
-
-    def fake_relock(self, _config, _deadline):
-        self.keychain.lock()
-        if self.keychain.state() != 'locked':
-            raise broker.KeychainError('relock-state')
-        self.keychain.close()
 
     def invoke(self, request=None, prefix=b''):
         reader, writer = os.pipe()
@@ -611,12 +645,16 @@ class RegistryBrokerTests(unittest.TestCase):
         config = dict(self.config, tartSha256=broker.hashlib.sha256(self.tart.read_bytes()).hexdigest(), keychainPath='/fixture/keychain', keychainCredentialPath='/fixture/credential')
         legacy = {key: value for key, value in config.items() if key not in ('hostId', 'profile', 'daemonRelockQualified', 'daemonRelockMacOSBuild')}
         with patch.object(broker, 'CONFIG', path), patch.object(broker, 'sealed', side_effect=Path), patch.object(broker, 'validate_keychain_paths'):
-            for value in (legacy, config, dict(config, profile='legacy')):
+            for value in (legacy, config, dict(config, profile='legacy'), dict(config, minimumFreeBytes=broker.DISK_FLOOR), dict(config, minimumFreeBytes=2 * broker.DISK_FLOOR)):
                 path.write_text(json.dumps(value))
                 self.assertEqual(broker.load_config(), value)
             for value in (dict(legacy, profile='registry-only'), dict(config, hostId='not-a-host'), dict(config, profile='mixed'), dict(config, daemonRelockQualified=True), dict(config, daemonRelockQualified=1)):
                 path.write_text(json.dumps(value))
                 with self.assertRaisesRegex(ValueError, 'configuration|identity|qualification'):
+                    broker.load_config()
+            for floor in (True, '53687091200', broker.DISK_FLOOR - 1, 2**63):
+                path.write_text(json.dumps(dict(config, minimumFreeBytes=floor)))
+                with self.assertRaisesRegex(ValueError, 'invalid installed disk floor'):
                     broker.load_config()
 
     def test_remote_cannot_invoke_local_maintenance(self):
@@ -629,6 +667,7 @@ class RegistryBrokerTests(unittest.TestCase):
             maintenance.assert_not_called()
 
     def test_health_is_zero_argument_and_never_touches_lock_keychain_or_history(self):
+        broker.record_maintenance(self.root, 'fixture-boot')
         with patch.object(broker, 'run_lock', side_effect=AssertionError('health took lock')), patch.object(broker, 'inventory_obligations', side_effect=AssertionError('health scanned history')), patch.object(broker, 'prune_artifacts', side_effect=AssertionError('health pruned')):
             code, result = self.wire('health')
         self.assertEqual(code, 0)
@@ -653,7 +692,7 @@ class RegistryBrokerTests(unittest.TestCase):
         result = self.wire('health')[1]
         self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['maintenanceJobId'], self.job)
-        self.assertEqual(result['reasons'], ['recovery-required'])
+        self.assertEqual(result['reasons'], ['runner-stale'])
         self.assertTrue((self.root / 'runner.json').exists())
 
     def test_idle_maintenance_is_lock_free_and_does_not_rotate_epoch(self):
@@ -707,14 +746,25 @@ class RegistryBrokerTests(unittest.TestCase):
         self.assertEqual(broker.admission_epoch(self.config), self.epoch)
 
     def test_expiry_is_checked_after_wait_and_before_receive(self):
-        request = (*self.request[:9], int(time.time()) + 1)
-        with broker.run_lock(self.config, 0):
-            # A fixed time models a request expiring while the bounded wait runs.
-            with patch.object(broker.time, 'monotonic', side_effect=[0, 6]):
-                self.assertEqual(self.invoke(request)[1]['code'], 'host-busy')
-        with patch.object(broker.time, 'time', return_value=request[9] + 1), patch.object(broker, 'receive') as receive:
-            self.assertEqual(self.invoke(request)[1]['code'], 'submission-expired')
-            receive.assert_not_called()
+        now = int(time.time())
+        request = (*self.request[:9], now + 1)
+        held = threading.Event()
+        with patch.object(broker.time, 'time', return_value=now) as clock:
+            def release_after_expiry():
+                with broker.run_lock(self.config, 0) as acquired:
+                    self.assertTrue(acquired)
+                    held.set()
+                    time.sleep(0.3)
+                    clock.return_value = now + 2
+            owner = threading.Thread(target=release_after_expiry)
+            owner.start()
+            self.assertTrue(held.wait(2))
+            try:
+                with patch.object(broker, 'receive') as receive:
+                    self.assertEqual(self.invoke(request)[1]['code'], 'submission-expired')
+                    receive.assert_not_called()
+            finally:
+                owner.join(2)
 
     def test_expiry_is_rechecked_after_preparation_before_input(self):
         def delayed_prune(_root):
@@ -730,7 +780,7 @@ class RegistryBrokerTests(unittest.TestCase):
             self.assertEqual(self.invoke(stale)[1]['code'], 'stale-epoch')
         self.assertTrue((self.root / 'runner.json').exists())
         self.assertEqual(broker.admission_epoch(self.config), self.epoch)
-        future = (*self.request[:1], 'b'*32, *self.request[2:9], int(time.time()) + 121)
+        future = (*self.request[:1], 'b'*32, *self.request[2:9], int(time.time()) + 151)
         self.assertEqual(self.invoke(future)[1]['code'], 'submission-expired')
 
     def test_attempt_replay_with_different_job_never_executes(self):
@@ -983,7 +1033,7 @@ class RegistryBrokerTests(unittest.TestCase):
             self.assertEqual(self.maintenance(), 1)
         self.keychain.lock.assert_not_called()
         with patch.object(broker, 'run_lock', side_effect=AssertionError('backoff took lock')):
-            self.assertEqual(self.maintenance(), 0)
+            self.assertEqual(self.maintenance(), 1)
         self.assertEqual(broker.admission_epoch(self.config), self.epoch)
         self.assertTrue(self.config['daemonRelockQualified'])  # No sealed-setting rewrite.
 
@@ -1005,19 +1055,20 @@ class RegistryBrokerTests(unittest.TestCase):
         self.assertNotEqual(broker.admission_epoch(self.config), self.epoch)
         self.assertFalse((self.root / 'cleanup-required').exists())
 
-    def test_relock_helper_bounds_its_own_child_and_checks_actual_locked_state(self):
-        proof = self.root / 'relock-proof'
-        self.keychain.lock.side_effect = lambda: proof.write_text('lock called')
-        real_relock_keychain(self.config, time.monotonic() + 2)
-        self.assertEqual(proof.read_text(), 'lock called')
+    def test_relock_helper_execs_sealed_script_without_lock_or_ssh_stdio_and_checks_locked_state(self):
+        self.assertEqual(broker.keychain_relock_entry(self.config), 0)
         self.keychain.state.return_value = 'unlocked'
-        with self.assertRaisesRegex(broker.KeychainError, 'relock-failed'):
-            real_relock_keychain(self.config, time.monotonic() + 2)
-        self.keychain.lock.side_effect = lambda: time.sleep(10)
-        start = time.monotonic()
+        with self.assertRaisesRegex(broker.KeychainError, 'relock-state'):
+            broker.keychain_relock_entry(self.config)
+        with patch.object(broker, 'sealed', side_effect=Path), patch.object(broker, 'owned') as owned:
+            real_relock_keychain(self.config, time.monotonic() + 30)
+        args, kwargs = owned.call_args
+        self.assertEqual(args[0], [broker.sys.executable, '-I', str(SOURCE), 'local-relock'])
+        self.assertTrue(kwargs['close_fds'])
+        self.assertEqual((kwargs['stdin'], kwargs['stdout'], kwargs['stderr']), (broker.subprocess.DEVNULL,)*3)
+        self.assertNotIn('SSH_CONNECTION', args[1])
         with self.assertRaisesRegex(TimeoutError, 'relock deadline'):
-            real_relock_keychain(self.config, start + 0.2)
-        self.assertLess(time.monotonic() - start, 1)
+            real_relock_keychain(self.config, time.monotonic() - 1)
 
     def test_migration_inventory_is_capped_and_unowned_objects_require_host_admin(self):
         malformed = self.root / 'vms' / 'partitura-job-operator'
@@ -1026,8 +1077,8 @@ class RegistryBrokerTests(unittest.TestCase):
         self.assertTrue(malformed.exists())
         self.assertTrue((self.root / 'maintenance-blocked').exists())
         self.assertFalse(self.wire('health')[1]['accepting'])
-        with patch.object(broker, 'MAX_INVENTORY', 1):
-            with self.assertRaisesRegex(ValueError, 'oversized job inventory'):
+        with patch.object(broker, 'HISTORY_PASS_SECONDS', 0):
+            with self.assertRaises(broker.InventoryPending):
                 broker.inventory_obligations(self.config)
 
     def test_reconcile_refuses_linked_clone_without_touching_target(self):
@@ -1085,7 +1136,7 @@ class RegistryBrokerTests(unittest.TestCase):
             self.assertEqual((self.root / 'unlock-attempt').read_text(), self.job + '\n')
             self.assertEqual((self.root / 'active-vm').read_text(), self.job + '\n')
             self.assertEqual(json.loads((self.root / 'runner.json').read_text())['stage'], 'unlock')
-            self.assertEqual(json.loads((self.root / self.job / 'receipt.json').read_text())['state'], 'receiving')
+            self.assertEqual(json.loads((self.root / self.job / 'receipt.json').read_text())['state'], 'running')
             return self.keychain
         factory.side_effect = construct
         self.assertEqual(self.invoke()[0], 0)
@@ -1150,6 +1201,211 @@ class RegistryBrokerTests(unittest.TestCase):
             return original(path, text)
         with patch.object(broker, 'durable_write', side_effect=fail_marker), patch.object(broker, 'receive', side_effect=AssertionError('read before durable marker')):
             self.assertEqual(self.invoke(request)[1]['failureCode'], 'receive-interrupted')
+
+    def test_registry_upgrade_thousands_of_receipts_and_markers_does_not_block_inventory_or_build(self):
+        self.old_history(aged=True)
+        self.assertEqual(broker.inventory_obligations(self.config), set())
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertFalse((self.root / 'maintenance-blocked').exists())
+        self.assertEqual(self.maintenance(), 0)
+        request = (self.request[0], 'b'*32, *self.request[2:7], broker.admission_epoch(self.config), 'f'*32, self.request[9])
+        self.assertEqual(self.invoke(request)[0], 0)
+
+    def test_registry_history_gc_rotates_before_expiring_receipts_tombstones_and_attempts(self):
+        self.old_history(count=3, aged=True)
+        original = broker.durable_remove
+        def remove(path):
+            self.assertNotEqual(broker.admission_epoch(self.config), self.epoch)
+            original(path)
+        with patch.object(broker, 'durable_remove', side_effect=remove):
+            broker.prune_history(self.config)
+        for index in range(1, 4):
+            self.assertFalse((self.root / f'{index:032x}').exists())
+            self.assertFalse((self.root / (f'{index:032x}' + '.cancel')).exists())
+            self.assertFalse((self.root / ('attempt-' + f'{index + 3:032x}')).exists())
+        self.assertEqual(self.invoke()[1]['code'], 'stale-epoch')
+        self.assertEqual(self.wire('status ' + self.job)[1]['kind'], 'unknown-job')
+
+    def test_history_gc_is_batched_and_preserves_live_obligations_and_artifact_leases(self):
+        self.old_history(count=100, aged=True)
+        protected = f'{1:032x}'
+        self.marker(job=protected)
+        artifact_job = self.root / f'{2:032x}'
+        (artifact_job / 'artifacts.tar').write_bytes(b'old but still retained')
+        broker.prune_history(self.config)
+        self.assertTrue((self.root / protected / 'receipt.json').exists())
+        self.assertTrue((artifact_job / 'artifacts.tar').exists())
+        remaining = [p for p in self.root.iterdir() if p.name.endswith('.cancel') or p.name.startswith('attempt-') or broker.re.fullmatch(broker.JOB, p.name)]
+        self.assertEqual(len(remaining), 300 - 64)
+        self.assertLessEqual(json.loads((self.root / 'history-gc.json').read_text())['nextAt'], time.time() + 60)
+
+    def test_transient_first_inventory_failure_backs_off_and_retries_without_permanent_flag(self):
+        with patch.object(broker, 'inventory_obligations', side_effect=OSError('one-off EIO')):
+            self.assertEqual(self.invoke()[1]['code'], 'cleanup-required')
+        self.assertFalse((self.root / 'maintenance-blocked').exists())
+        previous = json.loads((self.root / 'maintenance.json').read_text())
+        self.assertFalse(previous['inventoryComplete'])
+        with patch.object(broker, 'inventory_obligations', side_effect=AssertionError('ignored backoff')):
+            self.assertEqual(self.maintenance(), 1)
+        with patch.object(broker.time, 'time', return_value=previous['nextAt'] + 1):
+            self.assertEqual(self.maintenance(), 0)
+        self.assertFalse((self.root / 'inventory-required').exists())
+        self.assertEqual(self.wire('health')[1]['status'], 'ready')
+
+    def test_local_transient_inventory_failure_retries_at_recorded_next_at(self):
+        with patch.object(broker, 'inventory_obligations', side_effect=OSError('one-off IO')):
+            self.assertEqual(self.maintenance(), 1)
+        first = json.loads((self.root / 'maintenance.json').read_text())
+        with patch.object(broker, 'run_lock', side_effect=AssertionError('ignored boot backoff')):
+            self.assertEqual(self.maintenance(), 1)
+        with patch.object(broker.time, 'time', return_value=first['nextAt'] + 1):
+            self.assertEqual(self.maintenance(), 0)
+        self.assertFalse((self.root / 'maintenance-blocked').exists())
+
+    def test_operator_block_requires_repaired_full_inventory_and_explicit_reconcile(self):
+        malformed = self.root / 'vms' / 'partitura-job-operator'
+        malformed.mkdir()
+        self.assertEqual(self.maintenance(), 1)
+        self.assertEqual(self.maintenance(), 1)
+        self.assertEqual(self.reconcile()[1]['kind'], 'cleanup-required')
+        self.assertTrue((self.root / 'maintenance-blocked').exists())
+        malformed.rmdir()  # Fake host-admin repair, not a production host action.
+        self.assertEqual(self.reconcile()[1]['kind'], 'reconciled-unknown')
+        self.assertFalse((self.root / 'maintenance-blocked').exists())
+        self.assertEqual(self.wire('health')[1]['status'], 'ready')
+
+    def test_more_than_one_cleanup_batch_makes_progress_without_oversized_operator_block(self):
+        for index in range(1, 130):
+            self.clone(f'{index:032x}')
+        def destroy(config, job, deadline=None):
+            shutil.rmtree(Path(config['tartHome']) / 'vms' / ('partitura-job-' + job))
+        with patch.object(broker, 'destroy_vm', side_effect=destroy):
+            self.assertEqual(self.maintenance(), 1)
+            with patch.object(broker, 'inventory_obligations', side_effect=AssertionError('ignored boot backoff')):
+                self.assertEqual(self.invoke()[1]['code'], 'cleanup-required')
+            for _ in range(5):
+                code, result = self.reconcile()
+                if code == 0:
+                    break
+        self.assertEqual((code, result['kind']), (0, 'reconciled-terminal'))
+        self.assertFalse((self.root / 'maintenance-blocked').exists())
+        self.assertFalse((self.root / 'inventory-required').exists())
+        self.assertEqual(list((self.root / 'vms').iterdir()), [self.root / 'vms' / self.config['base']])
+        self.assertEqual(self.wire('health')[1]['status'], 'ready')
+
+    def test_legacy_cancel_acknowledges_multiple_pending_jobs_even_when_relock_fails(self):
+        self.config['profile'] = 'legacy'
+        self.clone()
+        self.clone('b'*32)
+        broker.durable_write(self.root / 'active-vm', self.job + '\n')
+        self.assertEqual(self.maintenance(), 1)
+        self.assertEqual(set(json.loads((self.root / 'recovery.json').read_text())['jobs']), {self.job, 'b'*32})
+        self.keychain.lock.side_effect = broker.KeychainError('lock failed')
+        code, result = self.wire('cancel ' + self.job)
+        self.assertEqual((code, result), (0, dict(job=self.job, state='cancellation-requested')))
+        self.assertTrue((self.root / 'cleanup-required').exists())
+        self.keychain.lock.side_effect = None
+        self.assertEqual(self.wire('cancel ' + self.job)[0], 0)
+        self.assertFalse((self.root / 'recovery.json').exists())
+        self.assertFalse((self.root / 'cleanup-required').exists())
+
+    def test_expiry_accepts_qualified_thirty_second_clock_skew(self):
+        request = (*self.request[:9], int(time.time()) + 125)
+        self.assertEqual(self.invoke(request)[0], 0)
+
+    def test_configured_sealed_disk_floor_is_reported_and_enforced(self):
+        self.config['minimumFreeBytes'] = 120 * 1024**3
+        broker.record_maintenance(self.root, 'fixture-boot')
+        result = self.wire('health')[1]
+        self.assertEqual((result['accepting'], result['hostFloorBytes']), (False, self.config['minimumFreeBytes']))
+        self.assertEqual(self.invoke()[1]['failureCode'], 'host-disk-space-unavailable')
+        broker.LoginKeychain.assert_not_called()
+
+    def test_backwards_clock_step_keeps_runner_reconcilable_and_maintenance_retryable(self):
+        self.marker()
+        broker.record_maintenance(self.root, 'fixture-boot', failures=5)
+        now = time.time()
+        with patch.object(broker.time, 'time', return_value=now - 120):
+            self.assertEqual(self.wire('health')[1]['reasons'], ['runner-stale'])
+            previous, _ = broker.maintenance_state(self.root, 'fixture-boot')
+            self.assertEqual(previous['nextAt'], 0)
+            self.assertEqual(self.reconcile()[1]['kind'], 'reconciled-unknown')
+        self.assertEqual(self.wire('health')[1]['status'], 'ready')
+
+    def test_health_distinguishes_pending_daemon_relock_from_failed_ssh_cleanup(self):
+        self.clone()
+        self.assertEqual(self.maintenance(), 1)
+        self.assertFalse((self.root / 'cleanup-required').exists())
+        self.assertEqual(self.wire('health')[1]['reasons'], ['keychain-relock-pending'])
+        self.keychain.lock.side_effect = broker.KeychainError('failed SSH relock')
+        self.assertEqual(self.reconcile()[1]['kind'], 'cleanup-required')
+        self.assertEqual(self.wire('health')[1]['reasons'], ['cleanup-required'])
+
+    def test_health_never_admits_before_successful_current_boot_inventory(self):
+        self.clone('b'*32)
+        with patch.object(broker, 'inventory_obligations', side_effect=AssertionError('health inventory')), patch.object(broker, 'run_lock', side_effect=AssertionError('health lock')):
+            self.assertEqual(self.wire('health')[1]['reasons'], ['inventory-pending'])
+        self.assertFalse((self.root / 'runner.lock').exists())
+        broker.record_maintenance(self.root, 'older-boot')
+        self.assertEqual(self.wire('health')[1]['reasons'], ['inventory-pending'])
+
+    def test_slice_one_prefixed_fences_and_pending_receipt_files_upgrade_safely(self):
+        directory = self.root / self.job
+        directory.mkdir()
+        (directory / 'receipt.json.new').write_text('{partial')
+        (self.root / (self.job + '.cancel')).touch(mode=0o600)
+        broker.durable_write(self.root / 'cleanup-required', 'partitura-job-' + self.job + '\n')
+        self.assertEqual(self.reconcile()[1]['kind'], 'reconciled-unknown')
+        self.assertFalse(directory.exists())
+        self.keychain.lock.assert_called_once()
+
+    def test_delayed_tombstoned_or_stale_submission_preserves_unknown_recovery_result(self):
+        self.reconcile()
+        self.assertEqual(self.invoke()[1]['code'], 'stale-epoch')
+        self.assertEqual(self.wire('status ' + self.job)[1]['kind'], 'unknown-job')
+        request = (*self.request[:7], broker.admission_epoch(self.config), *self.request[8:])
+        self.assertEqual(self.invoke(request)[1]['code'], 'cancelled')
+        self.assertEqual(self.wire('status ' + self.job)[1]['kind'], 'unknown-job')
+
+    def test_vm_era_crash_is_not_classified_as_receive_interrupted(self):
+        directory = self.root / self.job
+        directory.mkdir()
+        broker.record(directory, job=self.job, commit='d'*40, action='archive', state='receiving')
+        self.clone()
+        self.assertEqual(self.reconcile()[1]['kind'], 'reconciled-terminal')
+        receipt = json.loads((directory / 'receipt.json').read_text())
+        self.assertEqual(receipt['failureCode'], 'execution-interrupted')
+
+    def test_disk_stages_require_disk_failure_in_both_directions(self):
+        directory = self.root / self.job
+        directory.mkdir()
+        for fields in (dict(stage='disk-post-transfer'), dict(stage='capacity', failureCode='host-disk-space-unavailable')):
+            broker.record(directory, job=self.job, state='failed', **fields)
+            self.assertEqual(self.wire('status ' + self.job)[1]['kind'], 'error')
+        with patch.object(broker, 'require_disk', side_effect=[None, InterruptedError('SIGHUP')]):
+            self.job = 'b'*32
+            request = (self.request[0], self.job, *self.request[2:])
+            receipt = self.invoke(request)[1]
+        self.assertNotEqual(receipt.get('stage'), 'disk-post-transfer')
+
+    def test_pinned_tart_directory_layout_is_accepted_without_accepting_arbitrary_files(self):
+        clone = self.clone()
+        for name in ('state.vzvmsave', 'manifest.json', 'overlay.asif', '.explicitly-pulled'):
+            (clone / name).write_bytes(b'pinned Tart metadata fixture')
+        self.assertTrue(broker.verify_owned_clone(self.config, self.job))
+        (clone / 'unexpected').write_bytes(b'unknown')
+        with self.assertRaisesRegex(ValueError, 'unsafe owned clone'):
+            broker.verify_owned_clone(self.config, self.job)
+
+    def test_uninitialized_epoch_and_invalid_registry_requests_have_typed_responses(self):
+        (self.root / 'admission-epoch').unlink()
+        self.assertEqual(self.wire('health')[1]['reasons'], ['inventory-pending'])
+        self.assertRegex(broker.admission_epoch(self.config), '^' + broker.JOB + '$')
+        for command in ('health extra', 'run-v2 invalid', 'reconcile invalid', 'health'):
+            output = io.StringIO()
+            with patch.dict(os.environ, SSH_ORIGINAL_COMMAND=command), patch.object(broker, 'load_config', side_effect=ValueError('private config detail')), contextlib.redirect_stdout(output):
+                self.assertEqual(broker.cli(), 1)
+            self.assertEqual(json.loads(output.getvalue()), dict(protocolVersion=2, kind='error', code='broker-request-refused'))
 
 
 if __name__ == '__main__':
