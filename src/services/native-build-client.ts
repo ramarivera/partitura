@@ -15,7 +15,20 @@ import {
 import { isAbsolute, join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
+import {
+  FailedReceiptSchema,
+  type NativeBuildJob as Job,
+  NativeBuildJobSchema,
+  validateNativeBuildDiagnostics,
+} from "./native-build-legacy-receipt.js";
+
+export {
+  NativeBuildJobSchema,
+  validateNativeBuildDiagnostics,
+} from "./native-build-legacy-receipt.js";
+
+import { legacyReceiptRefresh } from "./native-build-legacy-status.js";
 import { workerIdentityCommand } from "./worker-security.js";
 
 export interface NativeBuildConfig {
@@ -33,107 +46,6 @@ export interface NativeBuildRequest {
   readonly action: string;
   /** Gateway-selected job inputs. Never accepted from model tool arguments. */
   readonly secretFiles?: Readonly<Record<string, string>>;
-}
-const FailureFields = {
-  failureCode: Schema.optionalKey(
-    Schema.Literals([
-      "host-key-unavailable",
-      "cleanup-required",
-      "unlock-failed",
-      "host-capacity-unavailable",
-      "host-disk-space-unavailable",
-      "workflow-failed",
-    ]),
-  ),
-  stage: Schema.optionalKey(
-    Schema.Literals([
-      "capacity",
-      "disk-preflight",
-      "disk-post-transfer",
-      "unlock",
-      "clone",
-      "boot",
-      "workflow",
-      "artifact",
-    ]),
-  ),
-  bootExitCode: Schema.optionalKey(
-    Schema.Number.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(-255),
-      Schema.isLessThanOrEqualTo(255),
-    ),
-  ),
-  workflowExitCode: Schema.optionalKey(
-    Schema.Number.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(-255),
-      Schema.isLessThanOrEqualTo(255),
-    ),
-  ),
-};
-const ArtifactFields = {
-  artifactSha256: Schema.optionalKey(
-    Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
-  ),
-  artifactBytes: Schema.optionalKey(
-    Schema.Number.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(0),
-      Schema.isLessThanOrEqualTo(2147483648),
-    ),
-  ),
-};
-// A failed workflow may carry the repository's own logs as its artifact.
-const FailedReceiptSchema = Schema.Struct({
-  ...FailureFields,
-  ...ArtifactFields,
-  state: Schema.Literal("failed"),
-});
-export const NativeBuildJobSchema = Schema.Struct({
-  ...FailureFields,
-  job: Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u)),
-  sessionId: Schema.String,
-  commit: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
-  action: Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,63}$/u)),
-  state: Schema.Literals([
-    "starting",
-    "running",
-    "succeeded",
-    "failed",
-    "interrupted",
-  ]),
-  ...ArtifactFields,
-});
-type Job = {
-  -readonly [K in keyof typeof NativeBuildJobSchema.Type]: (typeof NativeBuildJobSchema.Type)[K];
-};
-
-/** Shared by receipt ingress, persisted records and the offline rollback tool. */
-export function validateNativeBuildDiagnostics(
-  failure: Omit<typeof FailedReceiptSchema.Type, "state">,
-) {
-  if (
-    (failure.failureCode === "host-key-unavailable" &&
-      failure.stage !== "boot") ||
-    (failure.failureCode === "unlock-failed" && failure.stage !== "unlock") ||
-    (failure.failureCode === "host-capacity-unavailable" &&
-      failure.stage !== "capacity") ||
-    (failure.failureCode === "host-disk-space-unavailable") !==
-      (failure.stage === "disk-preflight" ||
-        failure.stage === "disk-post-transfer") ||
-    (failure.bootExitCode !== undefined && failure.stage !== "boot") ||
-    (failure.failureCode === "workflow-failed" &&
-      failure.stage !== "workflow") ||
-    (failure.workflowExitCode !== undefined &&
-      failure.failureCode !== "workflow-failed") ||
-    ((failure.artifactSha256 !== undefined ||
-      failure.artifactBytes !== undefined) &&
-      (failure.failureCode !== "workflow-failed" ||
-        failure.artifactSha256 === undefined ||
-        failure.artifactBytes === undefined))
-  )
-    throw new Error("Inconsistent native build failure diagnostic");
 }
 
 const MAX_BUNDLE = 1024 * 1024 * 1024;
@@ -425,18 +337,45 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       pruneFailure = error;
     }
   };
+  const receipts = legacyReceiptRefresh({
+    read: async (id, signal) =>
+      (
+        await remote(`status ${id}`, {
+          timeout: 10_000,
+          signal,
+          acceptFailedReceipt: true,
+        })
+      ).output,
+    save,
+    retain: retainArtifact,
+    current: (job) => jobs.get(job.job) === job && !retiringJobs.has(job.job),
+  });
   // Durable ownership survives a gateway crash. Cancel old jobs before serving
   // new requests; never reassign another session's in-flight native build.
   for (const file of await readdir(config.scratchRoot)) {
     if (!/^[a-f0-9]{32}\.json$/u.test(file)) continue;
     await privatePath(join(config.scratchRoot, file), false);
-    const job: Job = Schema.decodeUnknownSync(NativeBuildJobSchema)(
-      JSON.parse(await readFile(join(config.scratchRoot, file), "utf8")),
-    );
-    if (job.state === "failed") validateNativeBuildDiagnostics(job);
-    if (job.job !== file.slice(0, 32)) {
-      throw new Error("Invalid persisted native build ownership");
+    let job: Job;
+    try {
+      job = Schema.decodeUnknownSync(NativeBuildJobSchema)(
+        JSON.parse(await readFile(join(config.scratchRoot, file), "utf8")),
+      );
+      if (job.state === "failed") validateNativeBuildDiagnostics(job);
+      if (job.job !== file.slice(0, 32))
+        throw new Error("Invalid persisted native build ownership");
+    } catch {
+      await rename(
+        join(config.scratchRoot, file),
+        join(config.scratchRoot, `${file}.invalid`),
+      );
+      await Effect.runPromise(
+        Effect.logWarning("Invalid native build record quarantined", {
+          code: "native-record-invalid",
+        }),
+      );
+      continue;
     }
+    if (job.state === "failed" && !job.failureCode) receipts.track(job.job);
     jobs.set(job.job, job);
     if (job.state === "starting" || job.state === "running") {
       await remote(`cancel ${job.job}`);
@@ -564,7 +503,10 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
               signal: abort.signal,
               acceptFailedReceipt: true,
             },
-          );
+          ).catch((error: unknown) => {
+            receipts.track(job.job);
+            throw error;
+          });
           const response: unknown = JSON.parse(result.output);
           if (
             typeof response !== "object" ||
@@ -584,6 +526,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
             if (!result.inputComplete && failure.stage !== "disk-preflight")
               throw new Error("Invalid native pre-input refusal");
             Object.assign(job, failure);
+            receipts.confirm(job.job);
             return;
           }
           if (
@@ -622,7 +565,9 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     },
     status: async (sessionId: string, jobId: string) => {
       await pruneBestEffort();
-      return { ...ownedJob(sessionId, jobId) };
+      const job = ownedJob(sessionId, jobId);
+      if (job.state === "failed" && !job.failureCode) receipts.poll(job);
+      return { ...job };
     },
     artifact: async (sessionId: string, jobId: string) => {
       if (retiringJobs.has(jobId)) await pruneTerminalJobs();
@@ -701,6 +646,8 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
     cancel: async (sessionId: string, jobId: string) => {
       await pruneBestEffort();
       const job = ownedJob(sessionId, jobId);
+      if (receipts.confirmed(job))
+        return { ...job, cancellationRequested: false };
       const pending = active.get(job.job);
       pending?.abort.abort();
       try {
@@ -708,8 +655,10 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       } finally {
         await pending?.task;
       }
+      return { ...job, cancellationRequested: true };
     },
     close: async () => {
+      await receipts.close();
       const pending = [...active.entries()];
       await Promise.all(
         pending.map(async ([id, handle]) => {

@@ -44,7 +44,7 @@ describe("SessionAuthority repository age identities", () => {
             return job;
           },
           status: async () => job,
-          cancel: async () => {},
+          cancel: async () => ({ ...job, cancellationRequested: true }),
           close: async () => {},
           artifact: async () => {
             throw new Error("No fixture artifact");

@@ -169,9 +169,16 @@ it.live(
                 builder: "primary",
                 path: join(cwd, ".omp-home", "native-build", `${data.job}.tar`),
               });
-              expect(
-                (yield* call("native_build_cancel", { job: data.job })).isError,
-              ).not.toBe(true);
+              const cancelled = yield* call("native_build_cancel", {
+                job: data.job,
+              });
+              expect(cancelled.isError).not.toBe(true);
+              expect(cancelled.details).toMatchObject({
+                job: data.job,
+                builder: "primary",
+                state: "succeeded",
+                cancellationRequested: false,
+              });
               expect(live.state.snapshot().jobs).toHaveLength(2);
             }),
           {
