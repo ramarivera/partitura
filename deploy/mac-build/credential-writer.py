@@ -12,7 +12,7 @@ import termios
 CONFIG = Path('/Library/Partitura/NativeBuild/config.json')
 
 
-def dedicated_home():
+def dedicated_home(bootstrap=False):
     account = pwd.getpwuid(os.getuid())
     home = Path(account.pw_dir)
     if os.getuid() == 0 or home != Path('/Users') / account.pw_name or os.environ.get('HOME') != str(home):
@@ -20,6 +20,11 @@ def dedicated_home():
     info = home.lstat()
     if home.resolve() != home or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError('dedicated home must be owned mode 0700')
+    # Fresh one-shot setup initializes the keychain before the fenced installer
+    # transaction can apply/read back its settings. This only writes the caller's
+    # own private credential. An installed config always retains its binding.
+    if bootstrap and not os.path.lexists(CONFIG):
+        return home
     for path in (CONFIG, *CONFIG.parents):
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
@@ -71,9 +76,9 @@ def publish(home, password):
         temporary.unlink(missing_ok=True)
 
 
-def main():
+def main(bootstrap=False):
     os.umask(0o077)
-    home = dedicated_home()
+    home = dedicated_home(bootstrap=True) if bootstrap else dedicated_home()
     if os.path.lexists(home / '.partitura-native-login.password'):
         raise ValueError('new credential path already exists; refusing overwrite')
     first = second = bytearray()
@@ -99,7 +104,9 @@ def main():
 
 if __name__ == '__main__':
     try:
-        sys.exit(main())
+        if sys.argv[1:] not in ([], ['--bootstrap']):
+            raise ValueError('unsupported credential initialization option')
+        sys.exit(main(bootstrap=sys.argv[1:] == ['--bootstrap']))
     except (OSError, ValueError, KeyError, termios.error):
         print('Credential initialization stopped. No password is printed; do not repeat automatically.', file=sys.stderr)
         sys.exit(1)

@@ -19,6 +19,64 @@ spec.loader.exec_module(host_setup)
 
 
 class NativeHostSetupTests(unittest.TestCase):
+    def test_root_identity_journal_survives_reruns_and_refuses_conflicts(self):
+        loader = importlib.util.spec_from_file_location('native_identity', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / 'installation.json'
+            config = dict(hostId='12345678-1234-1234-1234-123456789abc')
+            actual_lstat = Path.lstat
+            def root_metadata(path):
+                info = actual_lstat(path)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+            def installed(path):
+                return path.read_bytes() if path == journal and path.exists() else None
+            with patch.object(launcher, 'IDENTITY_PATH', journal), patch.object(launcher, 'read_installed', side_effect=installed), patch.object(Path, 'lstat', root_metadata):
+                launcher.ensure_identity(config, 'builder')
+                first = journal.read_bytes()
+                launcher.ensure_identity(config, 'builder')
+                self.assertEqual(journal.read_bytes(), first)
+                self.assertEqual(journal.stat().st_mode & 0o777, 0o444)
+                with self.assertRaisesRegex(ValueError, 'identity journal differs'):
+                    launcher.ensure_identity(dict(config, hostId='aaaaaaaa-1234-1234-1234-123456789abc'), 'builder')
+                with self.assertRaisesRegex(ValueError, 'identity journal differs'):
+                    launcher.ensure_identity(config, 'other-account')
+                self.assertEqual(journal.read_bytes(), first)
+
+    def test_root_apply_checks_exact_predecessor_and_every_payload(self):
+        loader = importlib.util.spec_from_file_location('native_predecessor', ROOT / 'deploy/mac-build/native_host.py')
+        launcher = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(launcher)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broker, writer, plist, tart = [root / name for name in ('broker', 'writer', 'plist', 'tart')]
+            manifest_path = root / 'manifest'
+            for path in (broker, writer, tart):
+                path.write_bytes(path.name.encode())
+                path.chmod(0o555)
+            manifest = dict(schema=1, files={str(path): dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), mode=0o555) for path in (broker, writer, tart)})
+            payload = json.dumps(manifest).encode()
+            pin = hashlib.sha256(payload).hexdigest()
+            real_lstat = Path.lstat
+            def root_metadata(path):
+                info = real_lstat(path)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+            with patch.object(launcher, 'MANIFEST_PATH', manifest_path), patch.object(launcher, 'TART_TARGET', str(tart)), patch.object(launcher, 'PLIST_TARGET', str(plist)), patch.object(launcher, 'WRITER_TARGET', str(writer)), patch.object(launcher, 'STAGED_FILES', {str(broker): 'broker', str(writer): 'writer', str(plist): 'plist'}), patch.object(launcher, 'read_installed', return_value=payload), patch.object(Path, 'lstat', root_metadata):
+                launcher.verify_predecessor({}, pin)
+                for invalid in ('', 'f' * 64):
+                    with self.assertRaisesRegex(ValueError, 'exact predecessor'):
+                        launcher.verify_predecessor({}, invalid)
+                plist.write_bytes(b'unmanaged')
+                with self.assertRaisesRegex(ValueError, 'unmanaged installation target'):
+                    launcher.verify_predecessor({}, pin)
+                plist.unlink()
+                broker.chmod(0o755)
+                broker.write_bytes(b'changed')
+                broker.chmod(0o555)
+                with self.assertRaisesRegex(ValueError, 'payload differs'):
+                    launcher.verify_predecessor({}, pin)
+
     def test_qualification_mount_check_is_portable_and_fails_on_awk_errors(self):
         source = (ROOT / "deploy/mac-build/qualify-base.sh").read_text()
         check = source[source.index("mount_check=$("):source.index("\nprintf 'PARTITURA_NATIVE_BASE_QUALIFIED")]
@@ -82,6 +140,7 @@ class NativeHostSetupTests(unittest.TestCase):
             manifest = json.dumps({'schema': 1, 'files': entries}).encode()
             (stage / 'managed-files.json').write_bytes(manifest)
             pin = hashlib.sha256(manifest).hexdigest()
+            (stage / 'provision.py').write_bytes((ROOT / 'deploy/mac-build/provision.py').read_bytes())
             snapshot = launcher.verified_payloads(stage, pin, 'a'*64)
             self.assertEqual(snapshot['broker.py'], b'broker.py')
             (stage / 'broker.py').write_bytes(b'tampered')
@@ -136,6 +195,8 @@ class NativeHostSetupTests(unittest.TestCase):
                 "x11forwarding no",
                 "permittty no",
                 "permituserenvironment no",
+                "clientaliveinterval 15",
+                "clientalivecountmax 3",
             ]
         )
         calls = []

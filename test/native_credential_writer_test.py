@@ -1,5 +1,6 @@
 """Credential publication and real TTY echo checks without host changes."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import pty
@@ -19,6 +20,20 @@ spec.loader.exec_module(writer)
 
 
 class CredentialWriterTests(unittest.TestCase):
+    def test_bootstrap_allows_only_private_own_home_and_preserves_installed_binding(self):
+        account = SimpleNamespace(pw_dir='/Users/builder', pw_name='builder')
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            def metadata(path):
+                return SimpleNamespace(st_mode=0o40700, st_uid=502) if path == Path('/Users/builder') else SimpleNamespace(st_mode=0o100444, st_uid=0)
+            with patch.object(writer, 'CONFIG', config), patch.object(writer.pwd, 'getpwuid', return_value=account), patch.object(writer.os, 'getuid', return_value=502), patch.dict(os.environ, HOME='/Users/builder'), patch.object(Path, 'resolve', return_value=Path('/Users/builder')), patch.object(Path, 'lstat', metadata):
+                self.assertEqual(writer.dedicated_home(bootstrap=True), Path('/Users/builder'))
+                with self.assertRaises(FileNotFoundError):
+                    writer.dedicated_home()
+                config.write_text(json.dumps(dict(keychainCredentialPath='/Users/other/.partitura-native-login.password', keychainPath='/Users/other/Library/Keychains/login.keychain-db')))
+                with self.assertRaisesRegex(ValueError, 'configured dedicated account'):
+                    writer.dedicated_home(bootstrap=True)
+
     def test_home_mismatch_is_rejected_before_any_config_or_secret_read(self):
         account = SimpleNamespace(pw_dir='/Users/partitura-build', pw_name='partitura-build')
         with patch.object(writer.pwd, 'getpwuid', return_value=account), patch.object(writer.os, 'getuid', return_value=502), patch.dict(os.environ, HOME='/Users/operator'):

@@ -3,7 +3,6 @@
   "host": "generic-mac-host",
   "account": "partitura-build",
   "guest_user": "partitura",
-  "authorized_key": "",
   "source": {
     "partitura_repository": "/Users/operator/dev/partitura",
     "broker_commit": "REVIEWED_PARTITURA_COMMIT",
@@ -39,5 +38,14 @@
     "root": "/Users/partitura-build/dev/agentic-scratchpads/partitura/native-build",
     "tart_home": "/Volumes/Builds/partitura/tart"
   },
-  "predecessor_manifest_sha256": ""
+  "predecessor_manifest_sha256": "",
+  "authorized_keys": [],
+  "broker": {
+    "host_id": "",
+    "protocol": 2,
+    "profile": "legacy",
+    "minimum_free_bytes": 53687091200,
+    "daemon_relock_qualified": false,
+    "daemon_relock_macos_build": ""
+  }
 }

@@ -8,6 +8,7 @@ Subcommands (each runs with the identity provision-host.sh gives it):
   keychain  build account: create its login keychain once
 """
 import argparse
+import uuid
 import errno
 import fnmatch
 import glob
@@ -35,6 +36,151 @@ SSHD_BACKUPS = Path('/Library/Partitura/NativeBuild/sshd-backup')
 CREDENTIAL = '.partitura-native-login.password'
 KEYCHAIN = 'Library/Keychains/login.keychain-db'
 
+# Security.framework settings only. No password read or unlock API is used.
+# ABI: Apple's SecKeychainSettings / SEC_KEYCHAIN_SETTINGS_VERS1.
+KEYCHAIN_POLICY_SCRIPT = r'''
+import ctypes as C
+import json
+import os
+from pathlib import Path
+import pwd
+import stat
+import sys
+
+home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+if os.getuid() == 0 or home != Path('/Users') / pwd.getpwuid(os.getuid()).pw_name:
+    raise SystemExit('policy requires the dedicated account')
+path = home / 'Library/Keychains/login.keychain-db'
+for ancestor in (path.parent, *path.parent.parents):
+    if ancestor.is_symlink():
+        raise SystemExit('unsafe keychain ancestor')
+mode = sys.argv[1]
+if not os.path.lexists(path):
+    if mode == 'snapshot':
+        print('null')
+        raise SystemExit(0)
+    raise SystemExit('keychain is not initialized')
+info = path.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+    raise SystemExit('unsafe dedicated keychain')
+class Settings(C.Structure):
+    _fields_ = [('version', C.c_uint32), ('lockOnSleep', C.c_ubyte), ('useLockInterval', C.c_ubyte), ('lockInterval', C.c_uint32)]
+security = C.CDLL('/System/Library/Frameworks/Security.framework/Security')
+cf = C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+ref = C.c_void_p
+security.SecKeychainOpen.argtypes = [C.c_char_p, C.POINTER(ref)]
+security.SecKeychainOpen.restype = C.c_int32
+security.SecKeychainCopySettings.argtypes = [ref, C.POINTER(Settings)]
+security.SecKeychainCopySettings.restype = C.c_int32
+security.SecKeychainSetSettings.argtypes = [ref, C.POINTER(Settings)]
+security.SecKeychainSetSettings.restype = C.c_int32
+security.SecKeychainSetUserInteractionAllowed.argtypes = [C.c_ubyte]
+security.SecKeychainSetUserInteractionAllowed.restype = C.c_int32
+cf.CFRelease.argtypes = [ref]
+cf.CFRelease.restype = None
+handle = ref()
+def checked(code):
+    if code:
+        raise SystemExit('keychain policy API failed')
+checked(security.SecKeychainSetUserInteractionAllowed(False))
+checked(security.SecKeychainOpen(os.fsencode(path), C.byref(handle)))
+try:
+    current = Settings(1, 0, 0, 0)
+    checked(security.SecKeychainCopySettings(handle, C.byref(current)))
+    if mode == 'snapshot':
+        print(json.dumps(dict(lockOnSleep=bool(current.lockOnSleep), useLockInterval=bool(current.useLockInterval), lockInterval=current.lockInterval)))
+    else:
+        expected = dict(lockOnSleep=True, useLockInterval=True, lockInterval=300)
+        if mode == 'restore':
+            expected = json.loads(sys.argv[2])
+            if set(expected) != {'lockOnSleep', 'useLockInterval', 'lockInterval'} or type(expected['lockOnSleep']) is not bool or type(expected['useLockInterval']) is not bool or type(expected['lockInterval']) is not int or not 0 <= expected['lockInterval'] <= 2**32 - 1:
+                raise SystemExit('invalid policy snapshot')
+        elif mode not in ('apply', 'check'):
+            raise SystemExit('invalid policy mode')
+        if mode != 'check':
+            desired = Settings(1, expected['lockOnSleep'], expected['useLockInterval'], expected['lockInterval'])
+            checked(security.SecKeychainSetSettings(handle, C.byref(desired)))
+            checked(security.SecKeychainCopySettings(handle, C.byref(current)))
+        actual = dict(lockOnSleep=bool(current.lockOnSleep), useLockInterval=bool(current.useLockInterval), lockInterval=current.lockInterval)
+        if actual != expected:
+            raise SystemExit('keychain policy readback differs')
+finally:
+    cf.CFRelease(handle)
+'''
+
+INSTALL_GUARD_SCRIPT = r'''
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import uuid
+
+root = Path(sys.argv[1])
+if not root.is_absolute() or root.resolve() != root:
+    raise SystemExit('unsafe runtime root')
+info = root.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+    raise SystemExit('unsafe runtime root')
+descriptor = os.open(root / 'runner.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+info = os.fstat(descriptor)
+if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    raise SystemExit('unsafe runner lock')
+fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+fences = ('active-vm', 'cleanup-required', 'unlock-attempt', 'keychain-relock-pending', 'runner.json', 'recovery.json', 'maintenance-blocked', 'inventory-required')
+def marker(name):
+    fd = os.open(root / name, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 128:
+            raise SystemExit('unsafe installation marker')
+        return stream.read(129)
+existing = {name for name in fences if os.path.lexists(root / name)}
+resume = existing == {'cleanup-required', 'maintenance-blocked'} and marker('maintenance-blocked') == 'installation-incomplete\n'
+if resume:
+    job = marker('cleanup-required').strip()
+    import re
+    resume = re.fullmatch('[a-f0-9]{32}', job) and not os.path.lexists(root / job)
+if existing and not resume:
+    raise SystemExit('drain and reconcile existing native jobs before installation')
+tart = Path(sys.argv[2])
+if tart.resolve() != tart or (tart / 'vms').is_symlink() or any(item.name.startswith('partitura-job-') for item in (tart / 'vms').iterdir()):
+    raise SystemExit('drain owned clones before installation')
+def sync():
+    fd = os.open(root, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+def write(name, value):
+    path = root / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync()
+if not resume:
+    write('cleanup-required', uuid.uuid4().hex + '\n')
+    write('maintenance-blocked', 'installation-incomplete\n')
+print('ready', flush=True)
+if sys.stdin.readline() != 'commit\n':
+    raise SystemExit('installation incomplete; admission remains fenced')
+# Every policy/profile change invalidates commands queued before installation.
+epoch = root / 'admission-epoch'
+pending = root / ('.installation-epoch-' + uuid.uuid4().hex)
+write(pending.name, uuid.uuid4().hex + '\n')
+pending.replace(epoch)
+sync()
+# A new host or upgraded broker must complete its bounded boot inventory.
+if not os.path.lexists(root / 'inventory-required'):
+    write('inventory-required', 'installation\n')
+for name in ('cleanup-required', 'maintenance-blocked'):
+    (root / name).unlink()
+    sync()
+'''
+
 
 def render_settings(args):
     """Write settings.json and managed-files.json for a fresh host install."""
@@ -51,12 +197,22 @@ def render_settings(args):
                             capture_output=True, text=True, env=hs.git_environment()).stdout.strip()
     receipt = json.loads(Path(args.receipt).read_text())
     root = Path(args.root_dir)
+    out = Path(args.out)
+    installed = hs.read_root_json(hs.ROOT_CONFIG) or {}
+    identity = hs.read_root_json(hs.ROOT_IDENTITY) or {}
+    cached = {}
+    if not installed and not identity and (out / 'settings.json').exists():
+        cached = json.loads((out / 'settings.json').read_text()).get('broker', {})
+    host_id = args.host_id or identity.get('hostId') or installed.get('hostId') or cached.get('host_id') or str(uuid.uuid4())
+    old = dict(host_id=host_id, protocol=2, profile=installed.get('profile', 'legacy'), minimum_free_bytes=installed.get('minimumFreeBytes', hs.MINIMUM_FREE_BYTES), daemon_relock_qualified=installed.get('daemonRelockQualified', False), daemon_relock_macos_build=installed.get('daemonRelockMacOSBuild', ''))
+    policy = dict(old, **{key: value for key, value in dict(profile=args.profile, minimum_free_bytes=args.minimum_free_bytes, daemon_relock_qualified=args.daemon_relock_qualified, daemon_relock_macos_build=args.daemon_relock_macos_build).items() if value is not None})
     names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
     blobs = {name: show(name) for name in names}
     digest = {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()}
     settings = {
         'account': args.account,
-        'authorized_key': args.authorized_key,
+        'authorized_keys': args.authorized_key,
+        'broker': policy,
         'base': {
             'dedicated_path': receipt['basePath'],
             'mise_binary': args.mise_binary,
@@ -74,7 +230,7 @@ def render_settings(args):
         'enabled': True,
         'guest_user': args.guest_user,
         'host': args.host,
-        'predecessor_manifest_sha256': '',
+        'predecessor_manifest_sha256': args.predecessor_manifest_sha256,
         'runtime': {'root': args.runtime_root, 'tart_home': args.tart_home},
         'source': {
             'partitura_repository': str(root / 'checkout'),
@@ -95,13 +251,12 @@ def render_settings(args):
             'source_app': args.tart_app,
         },
     }
-    config = hs.validate_settings(settings)
+    config = hs.resolve_broker_policy(hs.validate_settings(settings))
     manifest = hs.expected_managed_manifest(
         hs.expected_host_files(config, tuple(blobs[name] for name in names)), config)
     settings['tart'] = dict(settings['tart'], source_app=str(root / 'tart.app'))
     hs.validate_settings(settings)
     data = json.dumps(settings, sort_keys=True, indent=2).encode() + b'\n'
-    out = Path(args.out)
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     (out / 'settings.json').write_bytes(data)
     (out / 'managed-files.json').write_bytes(manifest)
@@ -349,8 +504,20 @@ def main(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     render = commands.add_parser('settings')
     for name in ('clone', 'receipt', 'root-dir', 'tart-app', 'tart-sha256', 'mise-binary', 'source-path',
-                 'host', 'account', 'guest-user', 'authorized-key', 'runtime-root', 'tart-home', 'out'):
+                 'host', 'account', 'guest-user', 'runtime-root', 'tart-home', 'out'):
         render.add_argument(f'--{name}', required=True)
+    render.add_argument('--authorized-key', action='append', required=True)
+    render.add_argument('--host-id')
+    render.add_argument('--profile', choices=('legacy', 'registry-only'))
+    render.add_argument('--minimum-free-bytes', type=int)
+    qualification = render.add_mutually_exclusive_group()
+    qualification.add_argument('--daemon-relock-qualified', action='store_true', default=None)
+    qualification.add_argument('--daemon-relock-unqualified', action='store_false', dest='daemon_relock_qualified')
+    render.add_argument('--daemon-relock-macos-build')
+    render.add_argument('--predecessor-manifest-sha256', default='')
+    commands.add_parser('validate-keys').add_argument('keys', nargs='+')
+    commands.add_parser('policy-script')
+    commands.add_parser('keychain-policy').add_argument('mode', choices=('check', 'apply'))
     for name in ('sshd', 'password'):
         sub = commands.add_parser(name)
         sub.add_argument('--account', required=True)
@@ -359,6 +526,17 @@ def main(argv=None):
     commands.add_parser('keychain')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'validate-keys':
+            spec = importlib.util.spec_from_file_location('public_keys', Path(__file__).with_name('host_setup.py'))
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            helper.validate_authorized_keys(args.keys, True)
+            return 0
+        if args.command == 'policy-script':
+            print(KEYCHAIN_POLICY_SCRIPT)
+            return 0
+        if args.command == 'keychain-policy':
+            return subprocess.run([sys.executable, '-I', '-c', KEYCHAIN_POLICY_SCRIPT, args.mode], check=False).returncode
         if args.command == 'settings':
             render_settings(args)
             return 0

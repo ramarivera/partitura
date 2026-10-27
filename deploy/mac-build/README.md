@@ -186,7 +186,12 @@ against the hashes pinned in the script, plus Tart's signing team. It also check
   103-byte Unix socket limit;
 - build storage is a dedicated volume with ownership enabled and 120 GB free,
   never the system disk or a Time Machine destination's container;
-- the internal disk has 5 GiB free and Remote Login is on.
+- the internal disk meets the sealed floor, initially 50 GiB, and Remote Login is on.
+
+After base preparation, staging and final readback measure available-to-account
+bytes on both actual runtime roots with `statvfs`. Each root must satisfy the
+sealed floor. APFS free-space values are never added together. The external
+120 GiB provisioning requirement/reserve is separate from this runtime floor.
 
 Add `--apply` to provision. It creates the build volume and account, prepares and
 qualifies the base VM, installs the broker and restricted SSH policy from a
@@ -196,17 +201,89 @@ account there. It keeps the previous file outside `sshd_config.d`, because that
 directory's include would load a backup. It restores the file if `sshd -t`
 fails. The credential writer reads the new password; root then sets the account
 password from that saved credential over a private pseudo-terminal, so the
-secret never appears in a process argument or environment. Last, it creates the
-build keychain from that credential. It doesn't test the unlock: on macOS 27 an
+secret never appears in a process argument or environment. It initializes the
+build keychain before the managed-file transaction so the automatic-lock policy
+can be applied and read back while admission remains fenced. The credential
+writer has an explicit fresh-host `--bootstrap` mode for this ordering. It
+still requires the caller's own canonical private home and never bypasses an
+existing installed account binding. It doesn't test the unlock: on macOS 27 an
 unlock run through `sudo -u` from the operator's session fails even when the
 keychain is right, while the broker's own SSH session unlocks it. The first
 build is the proof, and the broker stops with `unlock-failed` before cloning.
-To recreate the keychain after that, delete the `keychain-created` marker the
-run printed (`sudo rm <inputs>/keychain-created`) and rerun with `--apply`; it
-keeps the old keychain beside the new one. The run ends by printing the base hash and the host
-key line for the gateway's `known_hosts`. Every step is skipped when its result
-already exists, so a rerun after fixing a reported cause continues where it
-stopped.
+Existing credential/keychain pairs are preserved, including installations made
+by the previous one-shot installer. No rerun deletes or replaces a keychain.
+An installed host missing its keychain stops for explicit repair instead of treating a key update as fresh
+password/keychain initialization.
+Password initialization uses root-private stable state under
+`/Library/Partitura/NativeBuild/provisioning`, independent of the source commit.
+A missing credential beside an existing keychain stops for explicit host repair.
+Old `keychain-created` markers never skip new policy/readback checks.
+
+Every run verifies `lockOnSleep`, `useLockInterval` and a
+300-second lock interval through Security.framework, applying it transactionally
+when needed, without unlocking or
+passing the saved password through argv or env. This timeout is defense in depth;
+it never clears a cleanup fence. If it breaks a real Tart workflow, stop rollout
+and resolve the access window explicitly. Installer success still requires the
+first separately approved broker-session build to prove unlock. Daemon relock
+qualification is separate.
+
+For an approved key/policy update on an installed host, use the same entry point
+with `--policy-only --apply`, the existing account/base/Tart-home selections and
+one or two `--authorized-key` flags. This path skips volume/account/base/password/
+keychain creation and doesn't require the original source VM. The installed
+qualified-base receipt remains mandatory. Retain all existing public keys for
+the first overlap update. Removing the retiring key is a second approved update
+after historical work is drained/reconciled. Key comments don't define identity;
+duplicate key blobs and more than two keys are refused.
+
+The old single `--authorized-key` flag and old settings `authorized_key` remain
+valid. New settings use `authorized_keys`, with one or two unique public keys
+when enabled and an empty list when disabled. Supplying both forms is invalid.
+The `broker` settings carry `protocol: 2`, `host_id`, `profile`,
+`minimum_free_bytes`, `daemon_relock_qualified` and `daemon_relock_macos_build`.
+The protocol is fixed by this broker revision; the other fields become the
+extended sealed broker config. Fresh installs default to `legacy`, 50 GiB and
+unqualified daemon relock. Existing settings without `broker` preserve the
+installed profile, floor and qualification instead of resetting them.
+
+`--host-id` supplies an independently recorded UUID or the one-shot renderer
+proposes a UUID once and retains it across rerenders. Root apply persists it in
+root-owned, non-writable `installation.json` before any managed-file change.
+The root journal and installed config must agree with supplied identity/account/
+runtime roots. Conflicts stop; key rotation never mints another identity. A new
+profile can be supplied with `--profile`, but changing it requires a separate
+approved drain/cutover. This slice's rollout keeps both Macs in `legacy`.
+
+Upgrades that add the maintenance plist require
+`--predecessor-manifest-sha256 REVIEWED_SHA256`. Independently review and record
+the installed root-owned `managed-files.json` and its exact payloads first.
+Only the complete previous target set without the plist, or the older exact set
+without both plist and credential writer, is accepted. Unknown targets, changed
+payloads and unexpected new files stop the upgrade. Subsequent same-target
+updates use the validated root-owned manifest normally. The generated, staged
+and installed manifest covers the same seven managed targets, including Tart.
+The immutable identity journal is separate installation state.
+
+Root apply takes the existing runner lock nonblocking as the dedicated account,
+refuses outstanding fences/owned clones, and writes durable admission fences
+before replacing anything. The transaction inherits the guard pipe so loss of
+its wrapper cannot release runner.lock while file replacement is still alive.
+The old daemon is stopped before code changes. The
+transaction snapshots all managed files, the prior daemon load state and existing
+keychain settings. It installs the plist last and checks launchd after bootstrap;
+any failure restores files/settings and the prior load state. It never loads two
+maintenance instances. Admission remains fenced through successful transaction
+readback; commit rotates the epoch and requests bounded boot inventory. Health
+cannot become ready until that inventory finishes, normally on the next minute
+pass. A failed transaction leaves an `installation-incomplete` fence. Repair the
+reported cause and rerun the same approved stage/apply; only this exact installer
+fence pair is resumable automatically. Other safety fences require authenticated
+broker reconciliation or explicit host repair, never manual flag deletion.
+
+The run ends with stable identity/profile, base hash and the host-key line for
+the gateway's `known_hosts`. No installer action changes a gateway transport or
+its independently verified host-key pins.
 
 The source VM must be a clean Tart VM laid out as `<tart home>/vms/<name>`,
 with its tree hash computed by `host_setup.tree_sha256()`. Copy it from an
@@ -501,7 +578,11 @@ deletion, readback or state writes retain the safety fence.
 
 The fixed local invocation is `broker.py local-maintenance`. It is rejected
 through `SSH_ORIGINAL_COMMAND` and whenever SSH environment markers are present.
-A future root-owned LaunchDaemon can invoke it as the dedicated build account.
+The installer installs `/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist`,
+root-owned mode 0644, invoking it as the dedicated build account at boot and
+every sixty seconds with a fixed interpreter/script and empty environment.
+The dedicated account alone receives ClientAliveInterval 15 and
+ClientAliveCountMax 3 in its existing Match User block.
 The code inventories private receipt/owned-clone directories once per boot or
 broker revision. Boot identity uses `kern.bootsessionuuid`; revision is the
 sealed broker source SHA-256. There's no entry-count admission limit. Each
@@ -566,8 +647,8 @@ happened. A later authenticated SSH reconcile or pre-input `run-v2` recovery
 completes relock/readback. Even a sealed qualification becomes ineffective after
 a macOS build change. These fake-only tests don't qualify Security.framework
 behavior, cross-session relock, power-loss cleanup, sshd keepalives or a
-LaunchDaemon. Installing and qualifying those remains a separate approved
-rollout.
+LaunchDaemon. Host installation and qualification require a separate approved
+rollout. Code merge performs neither.
 ## Acceptance
 
 On recent macOS hosts, creating the dedicated Unix account and installing a
@@ -611,11 +692,48 @@ across accounts. More than one existing guest or an unqualified hypervisor stops
 the job with `host-capacity-unavailable` before keychain access. Unrelated VM
 starts can still race this check; the broker never stops another account's VM.
 
-Adding the writer to an existing installation requires the exact approved
-`predecessor_manifest_sha256` in host settings. The stager checks every old
-payload against that frozen manifest. Unknown target sets, changed payloads and
-an unexpected writer stop the migration. New installs use an empty predecessor
-pin. Source settings also pin `credential_writer_sha256`.
+Adding managed targets to an existing installation requires the exact approved
+`predecessor_manifest_sha256` in host settings as described above. Source
+settings continue to pin `credential_writer_sha256` and installer bytes; the
+root launcher additionally pins the settings-only provision helper.
+
+### Approved host qualification
+
+Perform these steps only with explicit host rollout approval, one Mac at a time.
+First deploy slice 1's compatible gateway disk decoder. Quiesce native starts,
+drain legacy jobs and reconcile all cleanup obligations. Independently measure
+available-to-account space on the actual job and Tart roots after base preparation.
+Keep the MacBook disabled if either root is below its sealed floor. Review the
+predecessor manifest/payloads and the proposed settings and identity before the
+one-shot legacy-profile upgrade. The installer changes root-managed broker,
+keys/config/sshd files, identity state, launchd registration and keychain settings;
+Remote Login admission remains scoped and never enables the service globally.
+
+Read back the exact managed manifest, effective SSH policy for the build account
+and an unrelated operator account, launchd identity/load state and keychain
+settings. Verify both restricted public keys separately during a planned overlap.
+Record the installed macOS build from `/usr/bin/sw_vers -buildVersion`. Neither
+successful settings readback nor a sudo-session unlock qualifies daemon relock.
+
+On an approved isolated qualification host/account using a dedicated test login
+keychain and a fake repository task, exercise the installed broker under real
+sshd so it unlocks the test keychain. Interrupt that owned test run after its
+unlock marker, then let the installed LaunchDaemon clean VM/input state. In the
+daemon's security context, require SecKeychainLock followed by
+SecKeychainGetStatus reporting locked. Confirm locked state again through a new,
+independent sshd session. Also qualify locked-at-boot, killed-run and power-loss
+cleanup, and a workflow long enough to cross the 300-second auto-lock interval.
+Do not borrow the operator's login keychain or clear fences to force a pass.
+Until this evidence exists, retain `daemon_relock_qualified: false`; pending
+relock must be completed by authenticated SSH reconciliation. These are host
+acceptance procedures, not operations this PR performs or new SSH verbs.
+
+Only after reviewing that evidence approve a second settings update using
+`--daemon-relock-qualified --daemon-relock-macos-build BUILD`. That assertion
+records qualification, it doesn't run or replace it. A current-build mismatch
+makes the broker's effective qualification false and retains the conservative
+fallback. `--daemon-relock-unqualified` explicitly revokes the assertion. An OS
+upgrade needs fresh qualification and a separately approved settings update.
 
 After approved installation, verify account and SSH restrictions, exact installed
 hashes/modes, base provenance and qualification, no host shares, a generic

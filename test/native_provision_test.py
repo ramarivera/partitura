@@ -1,5 +1,6 @@
 """One-shot host provisioning helpers: sshd admission, password entry, settings."""
 import contextlib
+import ctypes
 import hashlib
 import io
 import importlib.util
@@ -11,6 +12,8 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('provision', ROOT / 'deploy/mac-build/provision.py')
@@ -237,6 +240,156 @@ class RenderSettingsTests(unittest.TestCase):
             manifest = json.loads((out / 'managed-files.json').read_text())
             entry = manifest['files']['/Library/Partitura/NativeBuild/tart.app/Contents/MacOS/tart']
             self.assertEqual(entry['mode'], 0o755)
+            first_id = settings['broker']['host_id']
+            self.assertEqual(settings['broker']['profile'], 'legacy')
+            self.assertEqual(settings['broker']['minimum_free_bytes'], 53687091200)
+            self.assertFalse(settings['broker']['daemon_relock_qualified'])
+            self.assertIn('/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist', manifest['files'])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(module.main(argv), 0)
+            self.assertEqual(json.loads((out / 'settings.json').read_text())['broker']['host_id'], first_id)
+            # Fresh rendering and staging use precisely the same bytes/targets.
+            hs_spec = importlib.util.spec_from_file_location('render_stage', ROOT / 'deploy/mac-build/host_setup.py')
+            hs = importlib.util.module_from_spec(hs_spec)
+            hs_spec.loader.exec_module(hs)
+            names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
+            blobs = tuple(subprocess.run(['/usr/bin/git', '-C', str(ROOT), 'show', 'HEAD:deploy/mac-build/' + name], check=True, capture_output=True).stdout for name in names)
+            stage = base / 'stage'
+            def ditto(argv, **kwargs):
+                import shutil
+                shutil.copytree(argv[-2], argv[-1])
+            with patch.object(hs.os, 'uname', return_value=SimpleNamespace(sysname='Darwin')), patch.object(hs, 'checked_source_blobs', return_value=blobs), patch.object(hs, 'checked_provision_blob', return_value=(ROOT / 'deploy/mac-build/provision.py').read_bytes()), patch.object(hs, 'verify_tart_source', return_value=tart.parents[2]), patch.object(hs, 'verify_qualified_base'), patch.object(hs, 'verify_account'), patch.object(hs, 'verify_private_runtime'), patch.object(hs, 'verify_runtime_capacity'), patch.object(hs, 'sshd_effective'), patch.object(hs.subprocess, 'run', side_effect=ditto):
+                # Source Tart mode is identical in the root copy.
+                settings['tart']['source_app'] = str(tart.parents[2])
+                hs.stage(settings, stage)
+            self.assertEqual((stage / 'managed-files.json').read_bytes(), (out / 'managed-files.json').read_bytes())
+            config = hs.resolve_broker_policy(hs.validate_settings(settings))
+            managed = hs.expected_host_files(config, blobs)
+            self.assertEqual(hs.expected_managed_manifest(managed, config), (stage / 'managed-files.json').read_bytes())
+            for target, (payload, _) in managed.items():
+                name = 'sshd_config' if target == hs.ROOT_SSHD_DROPIN else 'maintenance.plist' if target == hs.ROOT_PLIST else target.name
+                self.assertEqual((stage / name).read_bytes(), payload)
+
+
+class KeychainPolicyTests(unittest.TestCase):
+    def test_install_guard_fences_until_commit_and_failed_install_can_resume(self):
+        import fcntl
+        import select
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, tart = root / 'runtime', root / 'tart'
+            runtime.mkdir(mode=0o700)
+            (tart / 'vms').mkdir(parents=True)
+            command = [sys.executable, '-I', '-c', module.INSTALL_GUARD_SCRIPT, str(runtime), str(tart)]
+            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0])
+                self.assertEqual(child.stdout.readline(), b'ready\n')
+                self.assertEqual((runtime / 'maintenance-blocked').read_text(), 'installation-incomplete\n')
+                with (runtime / 'runner.lock').open('rb') as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # The root installer inherits the pipe's write end. Losing its
+                # wrapper must not release runner.lock before that child exits.
+                transaction = subprocess.Popen([sys.executable, '-c', 'import sys; print("ready", flush=True); sys.stdin.read()'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, pass_fds=(child.stdin.fileno(),))
+                try:
+                    self.assertTrue(select.select([transaction.stdout], [], [], 5)[0])
+                    self.assertEqual(transaction.stdout.readline(), b'ready\n')
+                    child.stdin.close()
+                    child.stdin = None
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        child.wait(timeout=0.1)
+                    with (runtime / 'runner.lock').open('rb') as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    transaction.communicate(b'', timeout=5)
+                failed = child.communicate(timeout=5)
+                self.assertNotEqual(child.returncode, 0, failed)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=5)
+            self.assertTrue((runtime / 'cleanup-required').exists())
+            retry = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+            self.assertFalse((runtime / 'cleanup-required').exists())
+            self.assertFalse((runtime / 'maintenance-blocked').exists())
+            self.assertRegex((runtime / 'admission-epoch').read_text(), r'^[a-f0-9]{32}\n$')
+            self.assertTrue((runtime / 'inventory-required').exists())
+            refused = subprocess.run(command, input=b'commit\n', capture_output=True, timeout=5)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn(b'drain and reconcile', refused.stderr)
+
+    def policy(self, mode, state, ignore_set=False, snapshot=None):
+        class Api:
+            def __init__(self, call): self.call = call
+            def __call__(self, *args): return self.call(*args)
+        def copy(handle, pointer):
+            for key, value in state.items(): setattr(pointer._obj, key, value)
+            return 0
+        def update(handle, pointer):
+            if not ignore_set:
+                state.update({key: getattr(pointer._obj, key) for key in state})
+            return 0
+        security = SimpleNamespace(SecKeychainSetUserInteractionAllowed=Api(lambda allowed: 0), SecKeychainOpen=Api(lambda path, handle: 0), SecKeychainCopySettings=Api(copy), SecKeychainSetSettings=Api(update))
+        cf = SimpleNamespace(CFRelease=Api(lambda handle: None))
+        info = SimpleNamespace(st_mode=0o100600, st_uid=1000, st_nlink=1)
+        argv = ['policy', mode] + ([json.dumps(snapshot)] if snapshot is not None else [])
+        with patch('sys.argv', argv), patch('os.getuid', return_value=1000), patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir='/Users/builder', pw_name='builder')), patch.object(Path, 'is_symlink', return_value=False), patch.object(Path, 'lstat', return_value=info), patch('os.path.lexists', return_value=True), patch.object(ctypes, 'CDLL', side_effect=[security, cf]), contextlib.redirect_stdout(io.StringIO()) as printed:
+            exec(module.KEYCHAIN_POLICY_SCRIPT, {})
+        return printed.getvalue()
+
+    def test_settings_apply_readback_restore_without_unlock_or_credentials(self):
+        old = dict(lockOnSleep=False, useLockInterval=False, lockInterval=7200)
+        state = dict(old)
+        snapshot = json.loads(self.policy('snapshot', state))
+        self.policy('apply', state)
+        self.assertEqual(state, dict(lockOnSleep=1, useLockInterval=1, lockInterval=300))
+        self.policy('check', state)
+        self.policy('restore', state, snapshot=snapshot)
+        self.assertEqual(state, old)
+        with self.assertRaisesRegex(SystemExit, 'readback differs'):
+            self.policy('apply', state, ignore_set=True)
+        with self.assertRaisesRegex(SystemExit, 'readback differs'):
+            self.policy('check', state)
+
+    def test_policy_only_branch_preserves_existing_password_and_keychain(self):
+        source = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()
+        lifecycle = source.split('step "5a initialize missing fresh-host credentials"', 1)[1].split('case $rc in', 1)[0]
+        # Execute the real shell branch with fake commands. Any lifecycle call
+        # beyond metadata inspection/directory creation fails this regression.
+        for policy_only in (0, 1):
+            script = '''set -euo pipefail
+account=builder; INSTALL=/sealed; policy_only=$1
+step() { :; }; die() { echo "$*" >&2; exit 1; }
+sudo() {
+  case "$1" in
+    install|test) return 0 ;;
+    *) echo "unexpected credential mutation: $*" >&2; return 97 ;;
+  esac
+}
+''' + lifecycle
+            result = subprocess.run(['/bin/bash', '-c', script, '--', str(policy_only)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('password is unchanged', result.stdout)
+        self.assertNotIn('delete-keychain', source)
+        self.assertNotIn('$ROOT/password-set', source)
+        self.assertIn('if [ "$policy_only" -eq 0 ]; then\nstep "2', source)
+        self.assertLess(source.index('step "4'), source.index('step "5'))
+        self.assertIn('MIN_INTERNAL_KB=$((50 * 1024 * 1024))', source)
+        self.assertIn('MIN_STORAGE_KB=$((120 * 1024 * 1024))', source)
+
+    def test_one_shot_floor_flag_matches_the_sealed_config_range(self):
+        source = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()
+        block = source.split('if [ -n "$minimum_free_bytes" ]; then', 1)[1].split('\nfi', 1)[0]
+        script = 'set -euo pipefail; minimum_free_bytes=$1; PY=("$2"); die() { exit 2; }; ' + block + '\nprintf "%s" "$MIN_INTERNAL_KB"'
+        for floor, accepted in ((53687091200, True), (2**63 - 1, True), (53687091199, False), (2**63, False), ('abc', False)):
+            with self.subTest(floor=floor):
+                result = subprocess.run(['/bin/bash', '-c', script, '--', str(floor), sys.executable], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if accepted:
+                    self.assertEqual(int(result.stdout), (floor + 1023) // 1024)
 
 
 if __name__ == '__main__':

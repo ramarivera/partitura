@@ -4,6 +4,7 @@ import importlib.util
 import json
 import hashlib
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import stat
@@ -21,7 +22,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 ED25519_BLOB = (11).to_bytes(4, "big") + b"ssh-ed25519" + b"x" * 32
 VALID_KEY = "ssh-ed25519 " + base64.b64encode(ED25519_BLOB).decode() + " test-key"
-SCRATCH = Path.home() / "dev/agentic-scratchpads/partitura/native-host-setup-tests"
+SCRATCH = Path(os.environ.get("TMPDIR", str(Path.home() / "dev/agentic-scratchpads/partitura/native-host-setup-tests")))
 SCRATCH.mkdir(parents=True, mode=0o700, exist_ok=True)
 scratch_metadata = SCRATCH.lstat()
 if not stat.S_ISDIR(scratch_metadata.st_mode) or scratch_metadata.st_uid != os.getuid() or stat.S_IMODE(scratch_metadata.st_mode) != 0o700:
@@ -75,6 +76,83 @@ class PartituraNativeHostTest(unittest.TestCase):
             },
         }
 
+    def enabled_settings(self):
+        config = json.loads(json.dumps(self.settings))
+        config.update(enabled=True, authorized_key=VALID_KEY)
+        for field in ('sha256', 'source_sha256', 'mise_sha256'):
+            config['base'][field] = 'a' * 64
+        for field in ('native_host_sha256', 'install_host_sha256'):
+            config['source'][field] = 'b' * 64
+        return config
+
+    def test_one_or_two_keys_normalize_without_comment_identity(self):
+        config = self.enabled_settings()
+        self.assertEqual(MODULE.validate_settings(config)['authorized_keys'], [VALID_KEY])
+        second = 'ssh-ed25519 ' + base64.b64encode(ED25519_BLOB[:-1] + b'y').decode()
+        config.pop('authorized_key')
+        config['authorized_keys'] = [VALID_KEY, second]
+        normalized = MODULE.validate_settings(config)
+        lines = MODULE.expected_host_files(normalized, (b'1',) * 6)[MODULE.ROOT_AUTHORIZED_KEYS][0].decode().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0].split(' ssh-ed25519 ')[0], lines[1].split(' ssh-ed25519 ')[0])
+        for keys, error in (([], 'one or two'), ([VALID_KEY] * 3, 'one or two'), ([VALID_KEY, VALID_KEY.rsplit(' ', 1)[0] + ' another-comment'], 'duplicate')):
+            config['authorized_keys'] = keys
+            with self.assertRaisesRegex(MODULE.NativeHostError, error):
+                MODULE.validate_settings(config)
+        config['authorized_keys'] = [VALID_KEY]
+        config['authorized_key'] = VALID_KEY
+        with self.assertRaisesRegex(MODULE.NativeHostError, 'exactly one'):
+            MODULE.validate_settings(config)
+
+    def test_legacy_settings_preserve_installed_identity_profile_and_floor(self):
+        config = MODULE.validate_settings(self.enabled_settings())
+        installed = dict(MODULE.make_broker_config(config), hostId='12345678-1234-1234-1234-123456789abc', profile='registry-only', minimumFreeBytes=60 * 1024**3, daemonRelockQualified=True, daemonRelockMacOSBuild='27A123')
+        def read(path):
+            return installed if path == MODULE.ROOT_CONFIG else None
+        with patch.object(MODULE, 'read_root_json', side_effect=read):
+            resolved = MODULE.resolve_broker_policy(config)
+            self.assertEqual(MODULE.make_broker_config(resolved), installed)
+            self.assertEqual(resolved['broker']['protocol'], 2)
+            changed = dict(resolved, broker=dict(resolved['broker'], host_id='aaaaaaaa-1234-1234-1234-123456789abc'))
+            with self.assertRaisesRegex(MODULE.NativeHostError, 'conflicting'):
+                MODULE.resolve_broker_policy(changed)
+        with patch.object(MODULE, 'read_root_json', return_value=None):
+            with self.assertRaisesRegex(MODULE.NativeHostError, 'stable host identity'):
+                MODULE.resolve_broker_policy(config)
+        # Existing eleven-field configs still validate and upgrade to legacy.
+        installed = MODULE.make_broker_config(config)
+        with patch.object(MODULE, 'read_root_json', side_effect=lambda path: installed if path == MODULE.ROOT_CONFIG else dict(schema=1, account=config['account'], hostId='12345678-1234-1234-1234-123456789abc')):
+            resolved = MODULE.resolve_broker_policy(config)
+            self.assertEqual(resolved['broker']['profile'], 'legacy')
+            self.assertFalse(resolved['broker']['daemon_relock_qualified'])
+
+    def test_launchdaemon_is_fixed_dedicated_account_and_ssh_policy_is_scoped(self):
+        plist = plistlib.loads(MODULE.maintenance_plist('builder'))
+        self.assertEqual(plist['UserName'], 'builder')
+        self.assertEqual(plist['StartInterval'], 60)
+        self.assertTrue(plist['RunAtLoad'])
+        self.assertEqual(plist['ProgramArguments'][-3:], ['-I', str(MODULE.ROOT_BROKER), 'local-maintenance'])
+        self.assertIn('-i', plist['ProgramArguments'])
+        ssh = MODULE.sshd_dropin('builder')
+        self.assertTrue(ssh.startswith('Match User builder\n'))
+        self.assertIn('    ClientAliveInterval 15\n', ssh)
+        self.assertIn('    ClientAliveCountMax 3\n', ssh)
+        self.assertNotIn('Match all', ssh)
+
+    def test_capacity_checks_actual_roots_without_summing_free_space(self):
+        config = dict(account='builder', broker=dict(minimum_free_bytes=50), runtime=dict(root='/actual/jobs', tart_home='/actual/tart'))
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv)
+            script = argv[argv.index('-c') + 1]
+            with patch('sys.argv', ['capacity', '50', '/actual/jobs', '/actual/tart']), patch('os.statvfs', side_effect=lambda path: SimpleNamespace(f_bavail=40 if path.endswith('jobs') else 100, f_frsize=1)):
+                with self.assertRaisesRegex(SystemExit, 'below sealed'):
+                    exec(script, {})
+            return subprocess.CompletedProcess(argv, 0, stdout="")
+        with patch.object(MODULE, 'account_python', return_value=['python']):
+            MODULE.verify_runtime_capacity(config, run)
+        self.assertEqual(calls[0][-3:], ['50', '/actual/jobs', '/actual/tart'])
+
     def test_validation_accepts_a_second_generic_host_and_rejects_invalid_keys(self):
         config = json.loads(json.dumps(self.settings))
         config["host"] = "second-mac-host"
@@ -91,7 +169,7 @@ class PartituraNativeHostTest(unittest.TestCase):
             MODULE.validate_settings(config)
 
         config = json.loads(json.dumps(self.settings))
-        config["authorized_key"] = "not-a-key"
+        config["authorized_key"] = VALID_KEY
         with self.assertRaisesRegex(MODULE.NativeHostError, "keep authorized_key empty"):
             MODULE.validate_settings(config)
 
@@ -311,6 +389,8 @@ class PartituraNativeHostTest(unittest.TestCase):
                 "x11forwarding no",
                 "permittty no",
                 "permituserenvironment no",
+                "clientaliveinterval 15",
+                "clientalivecountmax 3",
             ]
         )
 
@@ -421,7 +501,46 @@ class PartituraNativeHostTest(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.NativeHostError, 'predecessor payload'):
                     MODULE.check_existing_files(files, config, manifest_path=manifest_path, tart_inspector=inspector)
 
+    def test_plist_migration_accepts_only_exact_historical_target_sets(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            root = Path(directory)
+            broker, writer, plist, unknown = [root / name for name in ('broker', 'writer', 'plist', 'unknown')]
+            executable = root / 'tart.app/Contents/MacOS/tart'
+            executable.parent.mkdir(parents=True)
+            for path in (broker, writer, executable):
+                path.write_bytes(path.name.encode())
+                path.chmod(0o555)
+            config = json.loads(json.dumps(self.settings))
+            config['tart'].update(source_app=str(executable.parents[2]), installed_app=str(executable.parents[2]), sha256=MODULE.sha256_file(executable))
+            files = {broker: (b'new-broker', 0o555), writer: (b'writer', 0o555), plist: (b'plist', 0o644)}
+            manifest_path = root / 'manifest'
+            actual_lstat = Path.lstat
+            def root_owned(path):
+                metadata = actual_lstat(path)
+                return SimpleNamespace(st_mode=metadata.st_mode, st_uid=0)
+            for prior_set, accepted in (({broker, writer, executable}, True), ({broker, executable}, True), ({broker, plist, executable}, False), ({broker, writer, executable, unknown}, False)):
+                with self.subTest(prior=prior_set):
+                    if writer.exists(): writer.unlink()
+                    if writer in prior_set:
+                        writer.write_bytes(b'writer')
+                        writer.chmod(0o555)
+                    manifest = dict(schema=1, files={str(path): dict(sha256=MODULE.sha256_file(path) if path.exists() else 'a' * 64, mode=0o555) for path in prior_set})
+                    manifest_path.write_text(json.dumps(manifest))
+                    config['predecessor_manifest_sha256'] = MODULE.sha256_file(manifest_path)
+                    with patch.object(MODULE, 'ROOT_WRITER', writer), patch.object(MODULE, 'ROOT_PLIST', plist), patch.object(MODULE, 'ROOT_TART_APP', executable.parents[2]), patch.object(MODULE, 'read_managed_manifest', return_value=manifest), patch.object(Path, 'lstat', autospec=True, side_effect=root_owned):
+                        if accepted:
+                            self.assertTrue(MODULE.check_existing_files(files, config, manifest_path=manifest_path, tart_inspector=lambda _: (MODULE.sha256_file(executable), 0o555)))
+                        else:
+                            with self.assertRaisesRegex(MODULE.NativeHostError, 'frozen predecessor target set'):
+                                MODULE.check_existing_files(files, config, manifest_path=manifest_path)
+
     def test_failed_update_restores_all_managed_files_and_retry_passes_preflight(self):
+        for failure in ('sshd', 'policy', 'bootstrap', 'readback'):
+            for was_loaded in (False, True):
+                with self.subTest(failure=failure, was_loaded=was_loaded):
+                    self.exercise_install_rollback(failure, was_loaded)
+
+    def exercise_install_rollback(self, failure, was_loaded):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -435,6 +554,7 @@ class PartituraNativeHostTest(unittest.TestCase):
             installed_executable = installed_app / "Contents/MacOS/tart"
             stage = Path(directory) / "stage"
             shims = Path(directory) / "shims"
+            (host / "Library/LaunchDaemons").mkdir(parents=True)
             native_root.mkdir(parents=True)
             dropin.parent.mkdir(parents=True)
             source_executable.parent.mkdir(parents=True)
@@ -469,7 +589,7 @@ class PartituraNativeHostTest(unittest.TestCase):
                 MODULE, "ROOT_BROKER", native_root / "broker.py"
             ), patch.object(MODULE, "ROOT_WRITER", native_root / "credential-writer.py"), patch.object(MODULE, "ROOT_CONFIG", native_root / "config.json"), patch.object(
                 MODULE, "ROOT_AUTHORIZED_KEYS", native_root / "authorized_keys"
-            ), patch.object(MODULE, "ROOT_SSHD_DROPIN", dropin):
+            ), patch.object(MODULE, "ROOT_SSHD_DROPIN", dropin), patch.object(MODULE, "ROOT_PLIST", host / "Library/LaunchDaemons/net.partitura.native-build-maintenance.plist"):
                 files = MODULE.expected_host_files(config, (broker_blob, runner_blob, qualifier_blob, b"launcher", b"installer", b"writer"))
                 expected_manifest = MODULE.expected_managed_manifest(files, config)
 
@@ -477,6 +597,8 @@ class PartituraNativeHostTest(unittest.TestCase):
                 staged = stage / target.name
                 staged.write_bytes(payload)
                 staged.chmod(mode)
+            (stage / "maintenance.plist").write_bytes(files[host / "Library/LaunchDaemons/net.partitura.native-build-maintenance.plist"][0])
+            (stage / "provision.py").write_bytes((ROOT / "deploy/mac-build/provision.py").read_bytes())
             (stage / "sshd_config").write_bytes(files[dropin][0])
             (stage / "sshd_config").chmod(0o600)
             (stage / "managed-files.json").write_bytes(expected_manifest)
@@ -508,6 +630,11 @@ class PartituraNativeHostTest(unittest.TestCase):
             manifest_path.write_bytes(old_manifest)
             manifest_path.chmod(0o444)
 
+            daemon_state = Path(directory) / "daemon-state"
+            if was_loaded:
+                daemon_state.write_text('loaded')
+            policy_state = Path(directory) / "policy-state"
+            policy_state.write_text('old')
             fixture_state = Path(directory) / "sshd-state"
             fail_once = Path(directory) / "fail-live-sshd-once"
             fail_once.touch()
@@ -562,7 +689,7 @@ elif name == "sshd":
         count = int(Path({str(fixture_state)!r}).read_text()) if Path({str(fixture_state)!r}).exists() else 0
         count += 1
         Path({str(fixture_state)!r}).write_text(str(count))
-        if count == 2 and Path({str(fail_once)!r}).exists():
+        if count == 2 and {failure!r} == "sshd" and Path({str(fail_once)!r}).exists():
             Path({str(fail_once)!r}).unlink()
             sys.exit(1)
     elif "-T" in args:
@@ -577,14 +704,44 @@ elif name == "sshd":
             "x11forwarding no",
             "permittty no",
             "permituserenvironment no",
+            "clientaliveinterval 15",
+            "clientalivecountmax 3",
         ]))
-elif name not in ("codesign", "chown"):
+elif name == "launchctl":
+    state = Path({str(daemon_state)!r})
+    if args[0] == 'list':
+        if state.exists(): print('123 0 net.partitura.native-build-maintenance')
+    elif args[0] == 'print':
+        if {failure!r} == 'readback' and Path({str(policy_state)!r}).read_text() == 'new' and Path({str(fail_once)!r}).exists():
+            Path({str(fail_once)!r}).unlink()
+            sys.exit(1)
+        sys.exit(0 if state.exists() else 113)
+    elif args[0] == 'bootout':
+        state.unlink()
+    elif args[0] == 'bootstrap':
+        if state.exists(): raise SystemExit('two daemon instances')
+        state.write_text('loaded')
+        if {failure!r} == 'bootstrap' and Path({str(fail_once)!r}).exists():
+            Path({str(fail_once)!r}).unlink()
+            sys.exit(1)
+elif name == "sudo":
+    state = Path({str(policy_state)!r})
+    mode = args[-1]
+    if mode == 'snapshot': print(state.read_text())
+    elif mode == 'apply':
+        state.write_text('new')
+        if {failure!r} == 'policy' and Path({str(fail_once)!r}).exists():
+            Path({str(fail_once)!r}).unlink()
+            sys.exit(1)
+    elif args[-2] == 'restore': state.write_text(args[-1])
+    else: raise SystemExit('unexpected policy mode')
+elif name not in ("codesign", "chown", "plutil"):
     raise SystemExit(f"unexpected fixture command: {{name}} {{args}}")
 '''
             shim = shims / "fixture-command"
             shim.write_text(shim_source)
             shim.chmod(0o755)
-            for command in ("install", "ditto", "shasum", "stat", "sshd", "codesign", "chown"):
+            for command in ("install", "ditto", "shasum", "stat", "sshd", "codesign", "chown", "plutil", "launchctl", "sudo"):
                 (shims / command).symlink_to(shim)
 
             for old_path, new_path in (
@@ -597,6 +754,9 @@ elif name not in ("codesign", "chown"):
                 ("/usr/bin/stat", str(shims / "stat")),
                 ("/usr/sbin/sshd", str(shims / "sshd")),
                 ("/usr/sbin/chown", str(shims / "chown")),
+                ("/usr/bin/plutil", str(shims / "plutil")),
+                ("/bin/launchctl", str(shims / "launchctl")),
+                ("/usr/bin/sudo", str(shims / "sudo")),
             ):
                 installer = installer.replace(old_path, new_path)
 
@@ -611,6 +771,8 @@ elif name not in ("codesign", "chown"):
             failed_update = run_installer()
             self.assertNotEqual(failed_update.returncode, 0, failed_update.stdout + failed_update.stderr)
             self.assertEqual(installed_executable.read_bytes(), old_tart)
+            self.assertEqual(daemon_state.exists(), was_loaded)
+            self.assertEqual(policy_state.read_text(), "old")
 
             managed_paths = set(files) | {manifest_path, installed_executable}
             original_lstat = Path.lstat
@@ -644,6 +806,8 @@ elif name not in ("codesign", "chown"):
             retry = run_installer()
             self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
             self.assertEqual(installed_executable.read_bytes(), new_tart)
+            self.assertTrue(daemon_state.exists())
+            self.assertEqual(policy_state.read_text(), "new")
             self.assertFalse(retry_preflight(), "successful retry should match the new manifest")
 
     def test_installer_validates_live_sshd_and_restores_the_dropin_on_failure(self):
