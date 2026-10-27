@@ -9,6 +9,7 @@ import { GitHubApp } from "./services/github-app.js";
 import { LinearGateway } from "./services/linear-gateway.js";
 import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
 import { McpOAuth } from "./services/mcp-oauth.js";
+import { NativeBuildServicesLive } from "./services/native-build-assembly.js";
 import { NixEnvironment } from "./services/nix-environment.js";
 import { OAuth } from "./services/oauth.js";
 import { ActivityProjector } from "./services/projector.js";
@@ -42,7 +43,7 @@ const sqliteClientLayer = Layer.unwrap(
   }),
 );
 
-export const GatewayServicesLive = Layer.mergeAll(
+export const GatewayCoreServicesLive = Layer.mergeAll(
   TokenCrypto.layer,
   AdminSessionRepo.layer,
   AgentSettingsRepo.layer,
@@ -70,8 +71,10 @@ export const GatewayServicesLive = Layer.mergeAll(
   Retention.layer,
   Workspace.layer,
   Admin.layer,
-).pipe(
-  Layer.provideMerge(sqliteClientLayer),
+).pipe(Layer.provideMerge(sqliteClientLayer));
+
+export const GatewayServicesLive = GatewayCoreServicesLive.pipe(
+  Layer.provideMerge(NativeBuildServicesLive),
   Layer.provideMerge(GatewayConfig.layer),
 );
 

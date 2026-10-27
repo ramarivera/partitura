@@ -1,8 +1,8 @@
-# Internal registry engine, slice 4
+# Registry engine
 
-The engine is source-only. Both production legacy slots still use
-`createNativeBuildClient`. Registry loading, provider reads, scheduling and
-conductor/tool assembly belong to later slices. Never expose the engine's
+Slice 8 assembles this engine only when `NATIVE_BUILD_REGISTRY_FILE` is set.
+Unset keeps both original legacy slot clients. See
+[the cutover and rollback runbook](registry-cutover.md) before deployment. Never expose the engine's
 internal `status` record directly to agent tools. Its host identity, generation,
 epoch, attempt and recovery details need a coarse projection before production
 wiring: ordinary agents see only a logical builder ID with available or
@@ -10,7 +10,7 @@ unavailable, plus their own jobs. Host IDs, source IDs, disk, busy and health
 detail, credential paths and other orgs' jobs require gateway-admin authority.
 
 The modules expose Effect 4 services with named methods and layers. Assembly
-provides `NativeStateConfig`, `NativeTransportConfig` and `NativeEngineConfig`,
+provides `NativeStateConfig`, `NativeTransportConfig` and registry submission gates,
 and shares one scope across state, transport and engine. Scope exit interrupts
 job fibers, aborts/drains transfer pipelines, reaps process groups, removes tmpfs
 credentials and releases the state lock. Manual `close` is available for an

@@ -29,6 +29,7 @@ import {
 import { LinearGateway } from "../src/services/linear-gateway.js";
 import { McpOAuth } from "../src/services/mcp-oauth.js";
 import { NativeBuildFleet } from "../src/services/native-build-fleet.js";
+import { NativeBuildJobs } from "../src/services/native-build-jobs.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
@@ -425,6 +426,7 @@ export const createAuthorityFixture = () => {
         | undefined;
       readonly withLinearGateway?: boolean;
       readonly nativeFleet?: NativeBuildFleet["Service"];
+      readonly nativeJobs?: NativeBuildJobs["Service"];
       readonly githubApp?: GitHubAppTokenService;
       readonly workerUid?: string;
       readonly workerIdentityRepo?: WorkerIdentityRepo["Service"];
@@ -513,6 +515,9 @@ export const createAuthorityFixture = () => {
           Layer.succeed(RpcWorker, mockRpcWorker),
           Layer.succeed(NixEnvironment, mockNixEnvironment),
           linearGatewayOverride,
+          ...(options?.nativeJobs
+            ? [Layer.succeed(NativeBuildJobs, options.nativeJobs)]
+            : []),
           ...(options?.nativeFleet
             ? [Layer.succeed(NativeBuildFleet, options.nativeFleet)]
             : []),

@@ -53,11 +53,21 @@ export interface NativeEngineOptions {
     NativeOperationError,
     Scope.Scope
   >;
-  /** Future registry admission checks, immediately before dispatch. */
+  /** Admission safety checks, immediately before dispatch. */
   readonly canSubmit: (job: NativeRegistryJob) => boolean;
+  /** Serialize the durable submitting transition with registry publication. No SSH inside this gate. */
+  readonly submit?: (
+    job: NativeRegistryJob,
+    persist: Effect.Effect<NativeRegistryJob, NativeOperationError>,
+  ) => Effect.Effect<NativeRegistryJob, NativeOperationError>;
+  /** Assembly already completed local recovery before constructing consumers. */
+  readonly metadataRecovered?: boolean;
+  readonly preparationSignal?: (
+    job: NativeRegistryJob,
+  ) => AbortSignal | undefined;
 }
 
-/** Internal engine only. Neither legacy production slot routes through here. */
+/** Registry engine. Legacy slots retain their independent implementation. */
 export const createRegistryNativeBuildClient = Effect.fn(
   "RegistryNativeBuildClient.make",
 )(function* (
@@ -68,7 +78,7 @@ export const createRegistryNativeBuildClient = Effect.fn(
   const now = options.now ?? Date.now;
   const scope = yield* Scope.Scope;
   const files = yield* NativeBuildFiles.make;
-  yield* recoverNativeMetadata(state, now());
+  if (!options.metadataRecovered) yield* recoverNativeMetadata(state, now());
   const recovery = createNativeBuildRecovery(state, transport, { now });
   const active = new Map<string, Fiber.Fiber<void, never>>();
   const failures = new Map<string, NativeOperationError>();
@@ -222,7 +232,7 @@ export const createRegistryNativeBuildClient = Effect.fn(
               }),
           );
           yield* state.prune();
-          const bundlePath = yield* Effect.scoped(
+          const preparation = Effect.scoped(
             Effect.gen(function* () {
               const reservation = yield* Effect.acquireRelease(
                 state.reserve(job, "source.bundle", nativeLimits.bundle),
@@ -245,10 +255,29 @@ export const createRegistryNativeBuildClient = Effect.fn(
               return reservation.path;
             }),
           );
+          const signal = options.preparationSignal?.(job);
+          const bundlePath = yield* signal
+            ? Effect.raceFirst(
+                preparation,
+                Effect.callback<never, NativeOperationError>((resume) => {
+                  const abort = () =>
+                    resume(
+                      Effect.fail(
+                        NativeOperationError.new("native-submission-closed"),
+                      ),
+                    );
+                  if (signal.aborted) abort();
+                  else signal.addEventListener("abort", abort, { once: true });
+                  return Effect.sync(() =>
+                    signal.removeEventListener("abort", abort),
+                  );
+                }),
+              )
+            : preparation;
           yield* Effect.addFinalizer(() =>
             state.remove(bundlePath).pipe(Effect.orDie, Effect.asVoid),
           );
-          const submitted = yield* state.transaction((draft) => {
+          const persistSubmission = state.transaction((draft) => {
             const current = draft.jobs.find((j) => j.jobId === job.jobId);
             if (
               current?.state !== "starting" ||
@@ -261,6 +290,9 @@ export const createRegistryNativeBuildClient = Effect.fn(
             current.updatedAt = now();
             return current;
           });
+          const submitted = yield* options.submit
+            ? options.submit(job, persistSubmission)
+            : persistSubmission;
           const file = yield* Effect.acquireRelease(
             nativeIO(() =>
               open(bundlePath, constants.O_RDONLY | constants.O_NOFOLLOW),

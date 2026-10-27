@@ -70,6 +70,7 @@ export const fleetFixture = Effect.fn("Test.fleetFixture")(function* (
         ),
     }),
     Effect.provideService(NativeBuildSecretCache, cache),
+    Effect.provideService(NativeBuildStateService, f.native.state),
     Effect.provide(BuilderRegistryFiles.layer),
   );
   const write = (builders = [entry()]) =>

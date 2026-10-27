@@ -57,7 +57,9 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     now: () => number = Date.now,
     supersede: (
       ids: readonly string[],
+      captured?: readonly string[],
     ) => Effect.Effect<void, BuilderRegistryError> = () => Effect.void,
+    captureSupersede?: (ids: readonly string[]) => readonly string[],
   ) {
     const scope = yield* Scope.Scope;
     const gate = yield* Semaphore.make(1);
@@ -239,7 +241,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
         }
     });
     const reason = (current: Current): string | undefined => {
-      if (stale || !desired) return "registry-admission-closed";
+      if (stale || error || !desired) return "registry-admission-closed";
       if (!current.entry.enabled) return "builder-disabled";
       if (current.duplicate) return "duplicate-host";
       if (current.recheck || !current.identity || current.error)
@@ -271,6 +273,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
     ) {
       const retired: Scope.Closeable[] = [];
       const obsolete: string[] = [];
+      let obsoleteOperations: readonly string[] | undefined;
       const cancelOld: Deferred.Deferred<void>[] = [];
       const retire = (id: string) => {
         const lease = leases.get(id);
@@ -299,6 +302,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
               })
               .map((old) => old.entry.id),
           );
+          obsoleteOperations = captureSupersede?.(obsolete);
           for (const id of obsolete) {
             const cancel = cancellations.get(id);
             if (cancel) cancelOld.push(cancel);
@@ -353,7 +357,7 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       );
       // Safety state is published before best-effort provider cleanup.
       if (obsolete.length)
-        yield* supersede(obsolete).pipe(
+        yield* supersede(obsolete, obsoleteOperations).pipe(
           Effect.catch((error) =>
             Effect.logWarning(
               "Native provider supersession could not be persisted",
@@ -547,6 +551,28 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
       );
     });
     return {
+      needsRefresh: (id: string, generationId: string) => {
+        const current = entries.get(id);
+        if (current?.identity?.generation.id === generationId) {
+          current.error = "needs-refresh";
+          current.retryAt = 0;
+        }
+      },
+      enabled: (id: string) =>
+        !stale && !error && entries.get(id)?.entry.enabled === true,
+      matchesSource: (source: {
+        builderId: string;
+        source: string;
+        revision: number;
+      }) => {
+        const entry = entries.get(source.builderId)?.entry;
+        return (
+          desired === undefined ||
+          (!!entry &&
+            sourceReference(entry.secretSource) === source.source &&
+            entry.secretRevision === source.revision)
+        );
+      },
       // Private control-plane access. HTTP and tools must project sanitized fields.
       current: (id: string) => {
         const current = entries.get(id);
@@ -635,10 +661,8 @@ export const makeBuilderRegistryState = Effect.fn("BuilderRegistry.state")(
           Effect.sync(() => {
             error = cause.code;
             failures.set("registry", cause);
-            if (cause.code === "registry-mount-stale") {
-              stale = true;
-              for (const item of preparations.values()) item.controller.abort();
-            }
+            if (cause.code === "registry-mount-stale") stale = true;
+            for (const item of preparations.values()) item.controller.abort();
           }),
         ),
       ),

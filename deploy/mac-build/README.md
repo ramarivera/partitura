@@ -859,8 +859,12 @@ app using the selected Xcode SDK, then validates it without launching it or
 opening a simulator. Python can use the qualified Command Line Tools selection;
 the test compiler uses the global Xcode selection for its iOS SDK.
 
-## Internal registry engine, slice 4
+## Registry mode and deliberate rollback
 
-See [the internal engine and offline import contract](registry-engine.md) for
-Effect scope ownership, recovery, credential restoration and resumable imports.
-Production legacy slot callers remain unchanged.
+Legacy primary/backup remains the default. Setting `NATIVE_BUILD_REGISTRY_FILE`
+selects the assembled registry engine and never silently falls back to legacy.
+Code merge does not authorize cutover. Follow the separately approved
+[cutover/import/downgrade/rollback sequence](registry-cutover.md) and its
+[unexecuted deployment overlay](registry.compose.example.yaml).
+See [the engine and offline import contract](registry-engine.md) for Effect scope
+ownership, recovery, credential restoration and resumable imports.

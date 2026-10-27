@@ -47,6 +47,12 @@ export class BuilderRegistryIdentity extends Context.Service<BuilderRegistryIden
           ) =>
             Effect.scoped(
               Effect.gen(function* () {
+                yield* transport.restore(credential.transport.source, [
+                  credential.privateKey,
+                  ...(credential.retiringPrivateKey
+                    ? [credential.retiringPrivateKey]
+                    : []),
+                ]);
                 const generation = yield* state.addGeneration(
                   entry.id,
                   credential.transport,

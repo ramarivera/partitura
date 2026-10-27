@@ -25,6 +25,7 @@ import {
 } from "./native-build-secret-models.js";
 import { NativeSecretError } from "./native-build-secret-protocol.js";
 import { NativeSecretSourceReader } from "./native-build-secret-reader.js";
+import { makeNativeSecretSupersession } from "./native-build-secret-supersession.js";
 
 export type SecretTrigger = "startup" | "registry" | "human" | "agent";
 export const sourceKey = (source: Pick<SecretSource, "source" | "revision">) =>
@@ -77,53 +78,45 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
       });
       const dispatch = yield* Semaphore.make(1);
       const cache = new Map<string, BuilderCredential>();
-      // Remember exactly the obsolete operations across journal EIO. A later
-      // explicit refresh for a disabled builder must not inherit this fence.
-      const obsolete = new Set<string>();
-      const obsoleteKey = (operation: SecretOperation, work: SecretWork) =>
-        `${operation.id}:${work.builderId}:${sourceKey(work)}`;
-      const flushObsolete = Effect.fn("NativeBuildSecretCache.flushObsolete")(
-        function* () {
-          if (!obsolete.size) return;
-          const selected = new Set(obsolete);
-          yield* journal.transaction((data, at) => {
-            for (const operation of data.operations)
-              for (const work of operation.sources)
-                if (
-                  selected.has(obsoleteKey(operation, work)) &&
-                  work.status === "pending"
-                ) {
-                  work.status = "superseded";
-                  work.completedAt = at;
-                }
-          }, now());
-          for (const key of selected) obsolete.delete(key);
-        },
-      );
+      const supersession = makeNativeSecretSupersession(journal, now);
       let cycleRecorded = false;
       // A crash after dispatch is ambiguous and already charged. Only startup may retry.
-      yield* journal.transaction((data, at) => {
-        for (const operation of data.operations)
-          for (const work of operation.sources)
-            if (work.status === "running") {
-              work.status =
-                operation.kind === "startup" &&
-                work.attempts < 8 &&
-                work.deadline > at
-                  ? "pending"
-                  : "failed";
-              work.code = "provider-unavailable";
-              work.nextFit = Math.max(at, data.cooldowns[work.source] ?? 0);
-              if (operation.kind === "startup" && work.status === "failed")
-                data.startupStops[sourceKey(work)] = {
-                  code: work.code,
-                  createdAt: work.createdAt,
-                  deadline: work.deadline,
-                  attempts: work.attempts,
-                  nextFit: work.nextFit,
-                };
-            }
-      }, now());
+      let normalized = false;
+      const normalizeRestored = Effect.fn(
+        "NativeBuildSecretCache.normalizeRestored",
+      )(function* () {
+        if (normalized) return;
+        yield* journal.transaction((data, at) => {
+          for (const operation of data.operations)
+            for (const work of operation.sources)
+              if (work.status === "running") {
+                work.status =
+                  operation.kind === "startup" &&
+                  work.attempts < 8 &&
+                  work.deadline > at
+                    ? "pending"
+                    : "failed";
+                work.code = "provider-unavailable";
+                work.nextFit = Math.max(at, data.cooldowns[work.source] ?? 0);
+                if (operation.kind === "startup" && work.status === "failed")
+                  data.startupStops[sourceKey(work)] = {
+                    code: work.code,
+                    createdAt: work.createdAt,
+                    deadline: work.deadline,
+                    attempts: work.attempts,
+                    nextFit: work.nextFit,
+                  };
+              }
+        }, now());
+        normalized = true;
+      });
+      yield* normalizeRestored().pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Native provider journal unavailable at startup", {
+            code: error.code,
+          }),
+        ),
+      );
       const progress = (id: string) => {
         const snapshot = journal.snapshot();
         const operation = snapshot.operations.find((item) => item.id === id);
@@ -329,7 +322,8 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         () =>
           dispatch.withPermit(
             Effect.gen(function* () {
-              yield* flushObsolete();
+              yield* normalizeRestored();
+              yield* supersession.flush();
               const expired = new Map<
                 string,
                 { builderId: string; code: string; nextFit: number }
@@ -358,7 +352,11 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                     }
                 const candidates = data.operations.flatMap((operation) =>
                   operation.sources
-                    .filter((work) => work.status === "pending")
+                    .filter(
+                      (work) =>
+                        work.status === "pending" &&
+                        !supersession.held(operation, work),
+                    )
                     .map((work) => ({ operation, work })),
                 );
                 const queue = runnable(candidates);
@@ -395,7 +393,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                   .find((op) => op.id === operation.id)
                   ?.sources.find((candidate) => sourceKey(candidate) === key);
                 if (
-                  obsolete.has(obsoleteKey(operation, work)) &&
+                  supersession.blocked(operation, work) &&
                   selectedWork?.status !== "running"
                 )
                   throw NativeSecretError.new("provider-operation-superseded");
@@ -405,7 +403,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                     if (
                       sourceKey(candidate) !== key ||
                       (candidate.status === "pending" &&
-                        obsolete.has(obsoleteKey(op, candidate))) ||
+                        supersession.blocked(op, candidate)) ||
                       !(
                         candidate.status === "pending" ||
                         (reading &&
@@ -469,7 +467,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                               op.sources.some(
                                 (candidate) =>
                                   sourceKey(candidate) === key &&
-                                  !obsolete.has(obsoleteKey(op, candidate)) &&
+                                  !supersession.blocked(op, candidate) &&
                                   candidate.status === "pending",
                               ),
                           ),
@@ -585,17 +583,11 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
         Effect.ensuring(notify()),
       );
       const supersede = Effect.fn("NativeBuildSecretCache.supersede")(
-        function* (builderIds: readonly string[]) {
-          const ids = new Set(builderIds);
-          for (const operation of journal.snapshot().operations)
-            for (const work of operation.sources)
-              if (
-                !work.retained &&
-                ids.has(work.builderId) &&
-                work.status === "pending"
-              )
-                obsolete.add(obsoleteKey(operation, work));
-          yield* flushObsolete();
+        function* (
+          builderIds: readonly string[],
+          captured?: readonly string[],
+        ) {
+          yield* supersession.supersede(builderIds, captured);
           yield* Queue.offer(wake, undefined);
           yield* notify();
         },
@@ -629,7 +621,11 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
               const pending = journal
                 .snapshot()
                 .operations.flatMap((operation) =>
-                  operation.sources.filter((work) => work.status === "pending"),
+                  operation.sources.filter(
+                    (work) =>
+                      work.status === "pending" &&
+                      !supersession.held(operation, work),
+                  ),
                 );
               const next = Math.min(
                 ...runnable(pending.map((work) => ({ work }))).map(
@@ -654,6 +650,17 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
           ),
         );
       return {
+        captureSupersede: supersession.capture,
+        observeDesired: supersession.observeDesired,
+        revalidatePending: Effect.fn(
+          "NativeBuildSecretCache.revalidatePending",
+        )(function* (sources: readonly SecretSource[]) {
+          // Revalidation must see the normalized pending state, including a retry after startup EIO.
+          yield* normalizeRestored();
+          yield* supersession.revalidate(sources);
+          yield* Queue.offer(wake, undefined);
+          yield* notify();
+        }),
         accept,
         tick,
         wait,
@@ -671,6 +678,21 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                 NativeSecretError.new("provider-operation-invalid"),
               ),
             );
+            const before = journal.snapshot();
+            const needed = new Set([
+              ...checked.map(sourceKey),
+              ...before.operations.flatMap((op) =>
+                op.sources.filter((work) => !terminal(work)).map(sourceKey),
+              ),
+            ]);
+            if (
+              [
+                ...Object.keys(before.successes),
+                ...Object.keys(before.startupStops),
+                ...cache.keys(),
+              ].every((key) => needed.has(key))
+            )
+              return;
             const retained = yield* journal.transaction((data) => {
               const keys = new Set([
                 ...checked.map(sourceKey),
@@ -682,12 +704,7 @@ export class NativeBuildSecretCache extends Context.Service<NativeBuildSecretCac
                 if (!keys.has(key)) delete data.successes[key];
               for (const key of Object.keys(data.startupStops))
                 if (!keys.has(key)) delete data.startupStops[key];
-              data.operations = data.operations.filter(
-                (op) =>
-                  !op.sources.every(
-                    (work) => terminal(work) && !keys.has(sourceKey(work)),
-                  ),
-              );
+              // Keep bounded progress history until accept evicts it. Pruning secrets must not erase a caller's operation receipt.
               return keys;
             }, now());
             for (const key of cache.keys())

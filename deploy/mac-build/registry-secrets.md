@@ -1,9 +1,9 @@
 # Registry credential provider and operator tools
 
-Slice 6 supplies the isolated provider and its internal operation service. The
-conductor doesn't assemble it, production starts still use the legacy clients,
-and no fleet item has been read or written to qualify this implementation.
-Fleet HTTP/UI and agent controls belong to slice 7; assembly belongs to slice 8.
+The conductor assembles the isolated provider and operation service in registry
+mode only. Legacy mode keeps its original clients and starts no SDK helper.
+No fleet item has been read or written to qualify this implementation. See
+[the cutover and rollback runbook](registry-cutover.md) before enabling registry mode.
 
 ## Qualification and packaging
 
@@ -71,8 +71,11 @@ Reservation also marks the attempt running in that transaction. Disable, removal
 or revision changes supersede only work still pending. An already-charged read,
 including one whose helper is finishing initialization, proceeds and consumes its
 reserved budget. Its obsolete result cannot publish into the desired registry.
-This prevents charging an attempt that is then cancelled before its item get.
+This avoids charging an attempt and then cancelling it before the item read.
 Failed pending-work supersession is fenced in memory and retried before dispatch.
+On restart, persisted non-retained work stays held until a valid registry snapshot
+revalidates its builder, source and revision. Invalid or unreadable desired state
+cannot dispatch that work. Retained recovery refreshes remain independent.
 
 Agent attempts additionally have 5 source reads per rolling day per org. Explicit
 submissions share 10/min/org, and refresh-all is limited globally to once per 5 min.
@@ -142,3 +145,12 @@ invokes a bearer refresh endpoint or claims an item edit was automatically notic
 
 Image deployment, runtime token/vault provisioning, item reads/writes, registry
 assembly and cutover all require their separate secret/host/deployment approvals.
+
+On restart, completed refresh receipts contain no credential bytes. Enabled-source
+startup resolution or retained-source startup resolution restores the keys through
+the budgeted startup path, including a refresh that completed before installation.
+Retained startup waits for a valid registry snapshot so it cannot duplicate the
+desired source read while the registry is unreadable. Valid snapshots and recovery
+obligation changes prune unused success bindings and in-memory snapshots. Pending
+operations stay protected, and an unreadable registry suspends pruning. Bounded
+operation receipts remain available until the normal operation-history eviction.

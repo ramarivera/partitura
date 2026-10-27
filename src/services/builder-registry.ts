@@ -22,12 +22,15 @@ import { makeBuilderRegistryState } from "./builder-registry-state.js";
 import { BuilderSecretProvider } from "./builder-secret-provider.js";
 import { BuilderRegistryConfig } from "./config-native-build.js";
 import { NativeBuildSecretCache } from "./native-build-secret-cache.js";
+import { neededNativeSources } from "./native-build-source-inventory.js";
+import { NativeBuildStateService } from "./native-build-state.js";
+import { NativeBuildTransport } from "./native-build-transport.js";
 
 export * from "./builder-registry-schema.js";
 export type { BuilderAdmission } from "./builder-registry-state.js";
 
 /** Local file polling supplies correctness. Watch events only reduce latency.
- * This layer is deliberately absent from GatewayServicesLive until slice 8. */
+ * Registry mode assembles this layer before tool and ingress consumers. */
 export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
   "BuilderRegistry",
   {
@@ -36,6 +39,7 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
       const files = yield* BuilderRegistryFiles;
       const provider = yield* BuilderSecretProvider;
       const secretCache = yield* Effect.serviceOption(NativeBuildSecretCache);
+      const nativeState = yield* Effect.serviceOption(NativeBuildStateService);
       let capacityError: string | undefined;
       const identity = yield* BuilderRegistryIdentity;
       const scope = yield* Scope.Scope;
@@ -43,16 +47,71 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
         provider,
         identity,
         Date.now,
-        (ids) =>
+        (ids, captured) =>
           Option.isSome(secretCache)
             ? secretCache.value
-                .supersede(ids)
+                .supersede(ids, captured)
                 .pipe(
                   Effect.mapError((error) =>
                     BuilderRegistryError.new(error.code),
                   ),
                 )
             : Effect.void,
+        Option.isSome(secretCache)
+          ? secretCache.value.captureSupersede
+          : undefined,
+      );
+      if (Option.isSome(secretCache))
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            secretCache.value.observeDesired(state.matchesSource),
+          ),
+          (unsubscribe) => Effect.sync(unsubscribe),
+        );
+      const transport = yield* Effect.serviceOption(NativeBuildTransport);
+      if (Option.isSome(transport))
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            transport.value.observeAuthentication(state.needsRefresh),
+          ),
+          (unsubscribe) => Effect.sync(unsubscribe),
+        );
+      const revalidatePending = Effect.fn("BuilderRegistry.revalidatePending")(
+        function* () {
+          if (Option.isNone(secretCache)) return;
+          const desired = state.snapshot().desired;
+          if (!desired) return;
+          yield* secretCache.value
+            .retainNeeded(
+              neededNativeSources(desired, Option.getOrUndefined(nativeState)),
+            )
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Native provider retention unavailable", {
+                  code: error.code,
+                }),
+              ),
+            );
+          yield* secretCache.value
+            .revalidatePending(
+              desired.builders
+                .filter((entry) => entry.enabled)
+                .map((entry) => ({
+                  source: sourceReference(entry.secretSource),
+                  revision: entry.secretRevision,
+                  builderId: entry.id,
+                  retained: false,
+                })),
+            )
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning(
+                  "Native provider pending validation unavailable",
+                  { code: error.code },
+                ),
+              ),
+            );
+        },
       );
       const reloadGate = yield* Semaphore.make(1);
       const hints = yield* Queue.dropping<void>(1);
@@ -93,20 +152,18 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
               digest === nextDigest &&
               state.snapshot().error === undefined &&
               !capacityError
-            )
+            ) {
+              yield* revalidatePending();
               return;
+            }
             const snapshot = yield* parseBuilderRegistry(bytes, settings);
             const blocked = new Set<string>();
             if (Option.isSome(secretCache)) {
               const capacity = yield* secretCache.value.capacity(
-                snapshot.builders
-                  .filter((entry) => entry.enabled)
-                  .map((entry) => ({
-                    source: sourceReference(entry.secretSource),
-                    revision: entry.secretRevision,
-                    builderId: entry.id,
-                    retained: false,
-                  })),
+                neededNativeSources(
+                  snapshot,
+                  Option.getOrUndefined(nativeState),
+                ),
               );
               if (!capacity.sufficient) {
                 capacityError = "budget-capacity";
@@ -132,6 +189,7 @@ export class BuilderRegistry extends Context.Service<BuilderRegistry>()(
               state.snapshot().desired ? "registry" : "startup",
               blocked,
             );
+            yield* revalidatePending();
             digest = nextDigest;
           }).pipe(Effect.catch((cause) => state.fault(cause))),
         ),
