@@ -260,8 +260,12 @@ def verify_runtime_capacity(config: dict, run=subprocess.run) -> None:
     script = safe_read(helper)
     if sha256_bytes(script) != CAPACITY_SHA256:
         raise NativeHostError('capacity.py differs from the pinned helper')
-    result = run([*account_python(config['account']), '-c', script.decode(), str(config['broker']['minimum_free_bytes']), config['runtime']['root'], config['runtime']['tart_home']], check=True, capture_output=True, text=True, timeout=15, cwd='/')
+    result = run([*account_python(config['account']), '-c', script.decode(), str(config['broker']['minimum_free_bytes']), config['runtime']['root'], config['runtime']['tart_home']], check=False, capture_output=True, text=True, timeout=15, cwd='/')
+    # Print the measured values before refusing, so a below-floor install shows why.
     print(result.stdout, end='')
+    if result.returncode != 0:
+        detail = (result.stderr.strip().splitlines() or [''])[-1]
+        raise NativeHostError('runtime job/Tart root below sealed free-space floor' + (f' ({detail})' if detail else ''))
 
 
 def verify_host_policy(config: dict, run=subprocess.run) -> bool:

@@ -1,3 +1,4 @@
+import io
 from native_host_contract_support import *
 
 class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
@@ -148,6 +149,11 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
             MODULE.verify_runtime_capacity(config, run)
         with patch.object(MODULE, 'CAPACITY_SHA256', '0' * 64), self.assertRaisesRegex(MODULE.NativeHostError, 'pinned helper'):
             MODULE.verify_runtime_capacity(config, run)
+        refused = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1, stdout='runtime capacity: [{"availableBytes":30}]\n', stderr='')
+        with patch.object(MODULE, 'account_python', return_value=['python']), patch('sys.stdout', new_callable=io.StringIO) as printed:
+            with self.assertRaisesRegex(MODULE.NativeHostError, 'below sealed free-space floor'):
+                MODULE.verify_runtime_capacity(config, refused)
+        self.assertIn('"availableBytes":30', printed.getvalue())
         provision = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()
         self.assertIn('"$MB/broker/partitura_broker/capacity.py" "$((MIN_INTERNAL_KB * 1024))" /System/Volumes/Data', provision)
         self.assertNotIn('df -k /System/Volumes/Data', provision)
