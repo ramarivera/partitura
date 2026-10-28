@@ -119,3 +119,46 @@ identity, tenant and terminal outcome. Never project unfinished work into termin
 state. Quarantine corrupt/unprojectable records outside legacy scratch and report
 all affected IDs. Install an old-emitting broker profile before accepting work on
 that older decoder. Registry records are never inputs to this projection.
+
+## Packaged offline import
+
+The root-only `dist/operator/native-build-import-operator.js` command assembles
+that library with a read-only gateway database and a protected original-owner
+snapshot. It makes no network requests. Stop the gateway first, preserve backups,
+and use the same state/scratch/tmpfs roots as the intended gateway.
+
+Run from `/` using the protected image's Bun and a clean launch environment:
+
+```sh
+env -i PATH=/usr/bin:/bin /usr/local/bin/bun --config=/dev/null --no-env-file \
+  /app/dist/operator/native-build-import-operator.js \
+  --config /run/partitura-import/plan.json --gateway-stopped
+```
+
+The config and owner snapshot must be root-owned mode 0400 or 0600 under private
+0700 directories. Config has closed fields `databasePath`, `ownerSnapshotPath`,
+`stateRoot`, `scratchRoot`, `cacheRoot`, `otherRoots`, `bytesPerBuilder`,
+`bytesTotal`, `suffix`, and `slots`. Each of the one or two slots has `builderId`,
+`legacyRoot`, `privateKeyPath`, and `transport`. Transport is the explicit
+`source`, `hostId`, `hostname`, `sshUser`, `port`, and `hostKeys` record used by
+the engine. Supply every legacy and worker root in `otherRoots`. No inline key,
+SSH config parser or provider token is accepted.
+
+The owner snapshot uses `{ "originalOwners": { "<job-id>": { "sessionId": "...",
+"organizationId": "...", "pullRequest": 123, "repositoryId": "...", "commit": "<40-hex>" } }, "unresolved": [] }`. Prepare
+it while quiesced from durable session bindings and independently verified
+repository/PR identity. A worker's claimed PR number alone is not verification.
+The command cross-checks current durable session and repository ownership,
+the original job commit, and any surviving native-start activity. Expired activity
+does not erase independently verified PR bindings in this protected snapshot.
+Contradictory or ambiguous PR evidence, changed tenants/repositories, unresolved owners,
+unsafe database files and active runs refuse migration. The stopped-gateway flag
+is an operator acknowledgement; the native state lock cannot stop a separate
+legacy gateway from accepting work.
+
+Output contains only matched-job and slot counts. Repeated matches are counted
+again on a resume; the count does not mean newly created jobs. A later-slot failure can leave
+earlier imports committed. Preserve state and retry the same inputs; existing
+per-job identity, original-byte checks and artifact copy checkpoints make retries
+resumable. Originals are never rewritten. Provider journal initialization remains
+a separate, approved allocation operation.

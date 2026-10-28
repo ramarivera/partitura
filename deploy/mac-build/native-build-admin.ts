@@ -101,7 +101,7 @@ export function validateRollbackLaunchContext(context: {
     throw new Error("unsafe-rollback-launch");
 }
 
-async function protectedCodePath(path: string) {
+export async function protectedCodePath(path: string) {
   if (!isAbsolute(path) || (await realpath(path)) !== path)
     throw new Error("unsafe-rollback-code");
   for (let current = path; ; current = dirname(current)) {
