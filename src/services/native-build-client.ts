@@ -82,7 +82,10 @@ async function privatePath(path: string, directory: boolean) {
 }
 
 /** Gateway-owned SSH only. No worker receives the transport key or host target. */
-export async function createNativeBuildClient(config: NativeBuildConfig) {
+export async function createNativeBuildClient(
+  config: NativeBuildConfig,
+  makeReceiptRefresh = legacyReceiptRefresh,
+) {
   const terminalRetentionMs =
     config.terminalRetentionMs ?? DEFAULT_TERMINAL_RETENTION_MS;
   if (!Number.isSafeInteger(terminalRetentionMs) || terminalRetentionMs < 1)
@@ -337,7 +340,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       pruneFailure = error;
     }
   };
-  const receipts = legacyReceiptRefresh({
+  const receipts = makeReceiptRefresh({
     read: async (id, signal) =>
       (
         await remote(`status ${id}`, {

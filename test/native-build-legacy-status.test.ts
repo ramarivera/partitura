@@ -47,7 +47,7 @@ it("only success or a pre-ownership disk refusal proves cancel can be suppressed
 });
 
 it.live(
-  "uncertain status refresh is single-flight, nonblocking and bounded by backoff and four attempts",
+  "offline status refresh is single-flight, nonblocking and bounded by backoff and four failures",
   () =>
     Effect.promise(async () => {
       let at = 0,
