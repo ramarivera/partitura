@@ -16,7 +16,11 @@ export async function nativeDirectory(path: string, create = false) {
   if (!isAbsolute(path))
     throw NativeOperationError.new("unsafe-native-directory");
   if (create) await mkdir(path, { mode: 0o700 });
-  if ((await realpath(path)) !== path)
+  await trustedNativeDirectory(path, true);
+}
+
+async function trustedNativeDirectory(path: string, privateRoot: boolean) {
+  if (!isAbsolute(path) || (await realpath(path)) !== path)
     throw NativeOperationError.new("unsafe-native-directory");
   for (let current = path; ; current = dirname(current)) {
     const file = await open(
@@ -31,8 +35,11 @@ export async function nativeDirectory(path: string, create = false) {
         !info.isDirectory() ||
         info.nlink === 0 ||
         (info.uid !== 0 && info.uid !== process.getuid?.()) ||
-        ((info.mode & (current === path ? 0o077 : 0o022)) !== 0 && !sticky) ||
+        ((info.mode & (current === path && privateRoot ? 0o077 : 0o022)) !==
+          0 &&
+          !sticky) ||
         (current === path &&
+          privateRoot &&
           (info.uid !== process.getuid?.() || (info.mode & 0o777) !== 0o700))
       )
         throw NativeOperationError.new("unsafe-native-directory");
@@ -178,10 +185,20 @@ export function missingNativeFile(error: unknown) {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
-export async function disjointNativeRoots(roots: readonly string[]) {
+export async function disjointNativeRoots(
+  privateRoots: readonly string[],
+  excludedRoots: readonly string[] = [],
+) {
+  const roots = [...privateRoots, ...excludedRoots];
   const identities = [];
-  for (const root of roots) {
+  for (const root of privateRoots) {
     await nativeDirectory(root);
+    identities.push(await lstat(root));
+  }
+  // Excluded worker parents must be traversable by separate worker UIDs. They
+  // remain canonical, trusted and non-writable by workers; no content is read.
+  for (const root of excludedRoots) {
+    await trustedNativeDirectory(root, false);
     identities.push(await lstat(root));
   }
   for (let a = 0; a < roots.length; a++)

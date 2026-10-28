@@ -243,3 +243,21 @@ it.live("verified PR bindings survive expired action events", () =>
     }),
   ),
 );
+
+it.live(
+  "offline import accepts the gateway's traversable excluded workspace parent",
+  () =>
+    run("import-cli-worker-parent", (f) =>
+      Effect.gen(function* () {
+        const workers = path("excluded-workspaces");
+        yield* Effect.promise(() => chmod(workers, 0o755));
+        expect(
+          yield* executeNativeImport(
+            { ...f.plan, otherRoots: [...f.plan.otherRoots, workers] },
+            true,
+            f.f.options.filesystem,
+          ),
+        ).toEqual({ matchedJobs: 1, slots: 1 });
+      }),
+    ),
+);

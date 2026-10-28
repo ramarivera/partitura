@@ -109,5 +109,3 @@ export const runNativeBudgetAdmin = () => {
     process.exitCode = 1;
   });
 };
-
-if (import.meta.main) runNativeBudgetAdmin();
