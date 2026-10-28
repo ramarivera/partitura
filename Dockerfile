@@ -72,7 +72,7 @@ COPY package.json bun.lock* ./
 RUN bun install --frozen-lockfile
 COPY tsconfig.json biome.json ./
 COPY src ./src
-COPY deploy/mac-build/builder-secret.ts deploy/mac-build/native-build-budget-admin.ts deploy/mac-build/native-build-admin.ts ./deploy/mac-build/
+COPY deploy/mac-build/builder-secret.ts deploy/mac-build/native-build-budget-admin.ts deploy/mac-build/native-build-admin.ts deploy/mac-build/native-build-import.ts deploy/mac-build/native-build-import-config.ts deploy/mac-build/native-build-import-operator.ts ./deploy/mac-build/
 RUN bun run build
 
 FROM oven/bun:1.3.14
