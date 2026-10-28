@@ -15,16 +15,16 @@ import {
   openNativeBuildState,
 } from "../../src/services/native-build-state.js";
 import { createNativeBuildTransport } from "../../src/services/native-build-transport.js";
-import {
-  protectedCodePath,
-  validateRollbackLaunchContext,
-} from "./native-build-admin.js";
 import { importLegacyNativeSlot } from "./native-build-import.js";
 import {
   decodeNativeImportPlan,
   NativeImportOwners,
   type NativeImportPlan,
 } from "./native-build-import-config.js";
+import {
+  protectedCodePath,
+  validateRollbackLaunchContext,
+} from "./native-build-operator-launch.js";
 
 /** Current ownership comes from a read-only, consistent durable DB snapshot.
  * A protected original snapshot alone is never enough to import a tenant job. */

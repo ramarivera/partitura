@@ -112,12 +112,17 @@ export const importLegacyNativeSlot = Effect.fn(
     );
   // The legacy root is normally also an excluded root from state assembly.
   // Dedupe that list only: equality with a registry-owned root must still refuse.
-  yield* files.disjointRoots([
-    state.options.stateRoot,
-    state.options.scratchRoot,
-    state.options.cacheRoot,
-    ...new Set([input.scratchRoot, ...(state.options.otherRoots ?? [])]),
-  ]);
+  yield* files.disjointRoots(
+    [
+      state.options.stateRoot,
+      state.options.scratchRoot,
+      state.options.cacheRoot,
+      input.scratchRoot,
+    ],
+    [...new Set(state.options.otherRoots ?? [])].filter(
+      (root) => root !== input.scratchRoot,
+    ),
+  );
   const key = (yield* files.file(
     input.privateKeyPath,
     [0o400, 0o600],

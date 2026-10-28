@@ -48,8 +48,8 @@ export class NativeBuildFiles extends Context.Service<NativeBuildFiles>()(
           }),
       ),
       disjointRoots: Effect.fn("NativeBuildFiles.disjointRoots")(
-        (roots: readonly string[]) =>
-          nativeIO(() => io.disjointNativeRoots(roots)),
+        (...args: Parameters<typeof io.disjointNativeRoots>) =>
+          nativeIO(() => io.disjointNativeRoots(...args)),
       ),
       syncDirectory: Effect.fn("NativeBuildFiles.syncDirectory")(
         (path: string) =>
@@ -89,8 +89,8 @@ export const writeNativeStream = Effect.fn(
 );
 export const disjointNativeRoots = Effect.fn(
   "NativeBuildFiles.disjointNativeRoots",
-)((roots: readonly string[]) =>
-  NativeBuildFiles.use((files) => files.disjointRoots(roots)),
+)((...args: Parameters<typeof io.disjointNativeRoots>) =>
+  NativeBuildFiles.use((files) => files.disjointRoots(...args)),
 );
 export const lockNativeState = Effect.fn("NativeBuildFiles.lockNativeState")(
   (root: string) => NativeBuildFiles.use((files) => files.lock(root)),

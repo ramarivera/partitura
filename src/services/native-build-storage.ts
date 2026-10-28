@@ -50,12 +50,10 @@ export async function openNativeStorage(
       await nativeDirectory(root);
     }
   }
-  await disjointNativeRoots([
-    stateRoot,
-    scratchRoot,
-    cacheRoot,
-    ...(options.otherRoots ?? []),
-  ]);
+  await disjointNativeRoots(
+    [stateRoot, scratchRoot, cacheRoot],
+    options.otherRoots,
+  );
   const filesystem = options.filesystem ?? statfs;
   if ((await filesystem(cacheRoot)).type !== 0x01021994)
     throw NativeOperationError.new("native-cache-requires-tmpfs");
