@@ -2,6 +2,8 @@ import { Effect, Schema } from "effect";
 import {
   FailedReceiptSchema,
   type NativeBuildJob,
+  RunningReceiptSchema,
+  SucceededReceiptSchema,
   validateNativeBuildDiagnostics,
 } from "./native-build-legacy-receipt.js";
 
@@ -55,8 +57,7 @@ export const legacyReceiptRefresh = (deps: {
       if (closed || !retry) return;
       const flight = flights.get(job.job);
       if (flight) return flight.task;
-      if (retry.failures >= 4 || now() < retry.next || now() >= retry.expiresAt)
-        return;
+      if (retry.failures >= 4 || now() < retry.next) return;
       // A live broker may still be building long after the SSH run was lost.
       // Successful non-terminal reads back off without spending the error budget.
       let backoff = 30_000;
@@ -79,14 +80,20 @@ export const legacyReceiptRefresh = (deps: {
           )
             throw new Error("Invalid native build receipt identity");
           if ("state" in response && response.state === "running") {
-            retry.failures = 0;
+            Schema.decodeUnknownSync(RunningReceiptSchema)(response);
+            // Late requests may still fetch a terminal receipt. A running reply
+            // after the deadline exhausts polling without changing job status.
+            retry.failures = now() >= retry.expiresAt ? 4 : 0;
             return;
           }
-          const failure =
-            Schema.decodeUnknownSync(FailedReceiptSchema)(response);
-          validateNativeBuildDiagnostics(failure);
+          const receipt =
+            "state" in response && response.state === "succeeded"
+              ? Schema.decodeUnknownSync(SucceededReceiptSchema)(response)
+              : Schema.decodeUnknownSync(FailedReceiptSchema)(response);
+          if (receipt.state === "failed")
+            validateNativeBuildDiagnostics(receipt);
           if (!deps.current(job)) return;
-          const updated = { ...job, ...failure };
+          const updated = { ...job, ...receipt };
           await deps.save(updated);
           Object.assign(job, updated);
           confirm(job.job);
