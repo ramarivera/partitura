@@ -73,6 +73,38 @@ it.effect(
     ),
 );
 
+it.effect(
+  "fixed IDs preserve current and retiring keys without trailing newlines",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* secretFixture(path("roundtrip-no-newline"));
+        const key = f.native.key.replace(/\n$/u, "");
+        const record = {
+          ...f.record,
+          privateKeyB64: Buffer.from(key).toString("base64"),
+          retiringPrivateKeyB64: Buffer.from(key).toString("base64"),
+        };
+        const decoded = yield* normalizeBuilderItem(
+          {
+            ...createBuilderItem(f.settings.vaultId, record),
+            id: "b".repeat(26),
+          },
+          f.settings.vaultId,
+          "b".repeat(26),
+          "example.test",
+        );
+        expect(decoded).toEqual(record);
+        expect(Buffer.from(decoded.privateKeyB64, "base64").toString()).toBe(
+          key,
+        );
+        expect(
+          Buffer.from(decoded.retiringPrivateKeyB64, "base64").toString(),
+        ).toBe(key);
+      }),
+    ),
+);
+
 for (const bad of [
   "generated-id",
   "missing",

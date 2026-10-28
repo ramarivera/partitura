@@ -421,7 +421,7 @@ export function validateNativeTransport(
   if (Buffer.byteLength(key) > 32768)
     throw NativeOperationError.new("invalid-native-key");
   const match =
-    /^-----BEGIN OPENSSH PRIVATE KEY-----\n([A-Za-z0-9+/=\n]+)-----END OPENSSH PRIVATE KEY-----\n$/u.exec(
+    /^-----BEGIN OPENSSH PRIVATE KEY-----\n([A-Za-z0-9+/=\n]+)-----END OPENSSH PRIVATE KEY-----\n?$/u.exec(
       key,
     );
   if (!match?.[1]) throw NativeOperationError.new("invalid-native-key");

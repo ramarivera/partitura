@@ -136,7 +136,12 @@ export const createNativeBuildTransport = Effect.fn(
         const rendered = yield* nativeTry(() =>
           renderNativeSsh(generation.transport, directory),
         );
-        yield* files.write(join(directory, "identity"), key, 0o600);
+        // OpenSSH requires a final LF on disk; provider bytes and equality tags stay exact.
+        yield* files.write(
+          join(directory, "identity"),
+          key.endsWith("\n") ? key : `${key}\n`,
+          0o600,
+        );
         yield* Effect.scoped(
           Effect.gen(function* () {
             const owner = yield* processes.acquire(
