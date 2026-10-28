@@ -17,6 +17,7 @@ allowtcpforwarding no
 allowagentforwarding no
 x11forwarding no
 permittty no
+permituserenvironment no
 '''
 
 
@@ -25,6 +26,7 @@ class RemoteLoginTests(unittest.TestCase):
         self.commands = []
         def run(argv, **kwargs):
             self.commands.append(argv)
+            self.assertEqual(kwargs['timeout'], 15)
             output, error, status = '', '', 0
             if argv[0].endswith('/id'): output = groups
             elif argv[0].endswith('/sshd'): output = policy

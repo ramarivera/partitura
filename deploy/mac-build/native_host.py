@@ -19,10 +19,14 @@ import sys
 import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
-INSTALL_HOST_SHA256 = "e7405c2cd4703f9c3fd688e024588de9def95dac9acbe3b6cf1caad5015eb112"
-PROVISION_SHA256 = "bd7ddf90480cd7dcf35c79c406c802da00d8f38de75b997826ddba2d38e8cc8c"
+INSTALL_HOST_SHA256 = "5940063b204b37fdf6a60a8cf885a93016f243dd8e5d5105f595580c9ce69bc4"
+PROVISION_SHA256 = "d137301fcdff6865a8c92134ad0aaa908a8f13e1adecc6af9adb663dfc9b434b"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
+MAINTENANCE_TARGET = '/Library/Partitura/NativeBuild/maintenance_ssh.py'
+REMOTE_LOGIN_TARGET = '/Library/Partitura/NativeBuild/remote_login.py'
 STAGED_FILES = {
+    MAINTENANCE_TARGET: 'maintenance_ssh.py',
+    REMOTE_LOGIN_TARGET: 'remote_login.py',
     '/Library/Partitura/NativeBuild/credential-writer.py': 'credential-writer.py',
     '/Library/Partitura/NativeBuild/broker.py': 'broker.py',
     '/Library/Partitura/NativeBuild/config.json': 'config.json',
@@ -92,7 +96,8 @@ def verify_predecessor(payloads: dict, predecessor: str) -> None:
         previous = decoded['files']
         if set(decoded) != {'schema', 'files'} or decoded['schema'] != 1:
             raise ValueError('invalid installed manifest')
-        allowed = (targets, targets - {PLIST_TARGET}, targets - {PLIST_TARGET, WRITER_TARGET})
+        prior = targets - {MAINTENANCE_TARGET, REMOTE_LOGIN_TARGET}
+        allowed = (targets, prior, prior - {PLIST_TARGET}, prior - {PLIST_TARGET, WRITER_TARGET})
         if set(previous) not in allowed or (set(previous) != targets and not predecessor) or set(previous) != targets and hashlib.sha256(manifest).hexdigest() != predecessor:
             raise ValueError('installed manifest differs from the approved exact predecessor')
         for target, entry in previous.items():
@@ -345,6 +350,8 @@ def main(argv: list[str] | None = None) -> int:
                     verify_predecessor(payloads, args.predecessor_manifest_sha256)
                     raise InstallationRestored()
                 result.check_returncode()
+            # The host gate must be released before a real maintenance pass can inventory.
+            subprocess.run(["/usr/bin/python3", "-I", str(root_stage / "maintenance_ssh.py"), "test", "--account", args.account], check=True, timeout=160)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             return fail(f'host installation did not complete: {error}')
     return result.returncode

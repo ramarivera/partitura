@@ -2,17 +2,20 @@ from native_host_contract_support import *
 
 class PartituraNativeHostInstallTest(NativeHostFixture, unittest.TestCase):
     def test_failed_update_restores_all_managed_files_and_retry_passes_preflight(self):
-        for failure in ('sshd', 'bootstrap', 'readback'):
+        for failure in ('sshd', 'bootstrap', 'readback', 'loopback'):
             for was_loaded in (False, True):
                 with self.subTest(failure=failure, was_loaded=was_loaded):
                     self.exercise_install_rollback(failure, was_loaded)
 
 
+    def test_loopback_acl_rollback_refusal_keeps_fences_instead_of_exit_75(self):
+        self.exercise_install_rollback('loopback', False, rollback_refused=True)
+
     def test_restored_payload_drift_keeps_installer_fences_in_real_main(self):
         self.exercise_install_rollback('sshd', False, corrupt_restored=True)
 
     def test_failed_update_preserves_existing_maintenance_log(self):
-        for failure in ('sshd', 'bootstrap', 'readback'):
+        for failure in ('sshd', 'bootstrap', 'readback', 'loopback'):
             with self.subTest(failure=failure):
                 self.exercise_install_rollback(failure, True, existing_log=True)
 

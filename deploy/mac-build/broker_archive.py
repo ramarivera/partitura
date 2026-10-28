@@ -10,6 +10,7 @@ BROKER_FILES = (
     'partitura_broker/execution.py',
     'partitura_broker/diagnostics.py',
     'partitura_broker/identity.py',
+    'partitura_broker/maintenance.py',
     'partitura_broker/recovery.py',
     'partitura_broker/state.py',
     'partitura_broker/vm.py',

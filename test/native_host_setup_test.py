@@ -193,10 +193,10 @@ class NativeHostSetupTests(unittest.TestCase):
             self.assertTrue(control.is_symlink())
 
     def test_host_setup_pins_its_helper_modules(self):
-        for constant, name in (('HOST_SETUP_VALIDATION_SHA256', 'host_setup_validation.py'), ('BROKER_ARCHIVE_SHA256', 'broker_archive.py')):
+        for constant, name in (('HOST_SETUP_VALIDATION_SHA256', 'host_setup_validation.py'), ('BROKER_ARCHIVE_SHA256', 'broker_archive.py'), ('MAINTENANCE_SSH_SHA256', 'maintenance_ssh.py')):
             self.assertEqual(getattr(host_setup, constant), hashlib.sha256((ROOT / 'deploy/mac-build' / name).read_bytes()).hexdigest())
         with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
-            for name in ('host_setup.py', 'host_setup_validation.py', 'broker_archive.py'):
+            for name in ('host_setup.py', 'host_setup_validation.py', 'broker_archive.py', 'maintenance_ssh.py'):
                 (Path(directory) / name).write_bytes((ROOT / 'deploy/mac-build' / name).read_bytes())
             drifted = Path(directory) / 'broker_archive.py'
             drifted.write_bytes(drifted.read_bytes() + b'\nraise SystemExit("unpinned helper ran")\n')
@@ -265,7 +265,8 @@ class NativeHostSetupTests(unittest.TestCase):
         settings = {"account": "partitura-build"}
         expected = "\n".join(
             [
-                f"authorizedkeysfile {host_setup.ROOT_AUTHORIZED_KEYS}",
+                f"authorizedkeysfile {host_setup.ROOT_AUTHORIZED_KEYS} /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys",
+                "exposeauthinfo yes",
                 "passwordauthentication no",
                 "kbdinteractiveauthentication no",
                 "authenticationmethods publickey",

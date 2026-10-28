@@ -247,7 +247,7 @@ def render_settings(args):
     if args.keychain_policy is not None:
         old['keychain_policy'] = None if args.keychain_policy == 'preserve' else json.loads(args.keychain_policy)
     policy = dict(old, **{key: value for key, value in dict(profile=args.profile, minimum_free_bytes=args.minimum_free_bytes, daemon_relock_qualified=args.daemon_relock_qualified, daemon_relock_macos_build=args.daemon_relock_macos_build).items() if value is not None})
-    names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
+    names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py', 'maintenance_ssh.py', 'remote_login.py')
     blobs = {name: show(name) for name in names if name != 'broker.py'}
     blobs['broker.py'] = hs.broker_from_commit(clone, commit, hs.git_environment())
     digest = {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()}
@@ -384,13 +384,13 @@ def append_allowed_user(line, account):
 
 
 def admit_sshd(account, apply=False, run=subprocess.run, main=SSHD_CONFIG, backups=SSHD_BACKUPS, owner=0):
-    groups = run(['/usr/bin/id', '-Gn', account], capture_output=True, text=True, check=True).stdout.split()
+    groups = run(['/usr/bin/id', '-Gn', account], capture_output=True, text=True, check=True, timeout=15).stdout.split()
     if {'admin', 'wheel'} & set(groups):
         raise ValueError('build account must be unprivileged')
 
     def effective():
         out = run(['/usr/sbin/sshd', '-T', '-C', f'user={account},host=localhost,addr=127.0.0.1'],
-                  capture_output=True, text=True, check=True).stdout
+                  capture_output=True, text=True, check=True, timeout=15).stdout
         return access_plan(account, groups, sshd_values(out))
 
     if effective() == 'allowed':
@@ -421,7 +421,7 @@ def admit_sshd(account, apply=False, run=subprocess.run, main=SSHD_CONFIG, backu
         if os.path.lexists(name):
             os.unlink(name)
     try:
-        run(['/usr/sbin/sshd', '-t'], capture_output=True, text=True, check=True)
+        run(['/usr/sbin/sshd', '-t'], capture_output=True, text=True, check=True, timeout=15)
         if effective() != 'allowed':
             raise ValueError('edited sshd allowlist still does not admit the account')
     except (subprocess.CalledProcessError, ValueError):

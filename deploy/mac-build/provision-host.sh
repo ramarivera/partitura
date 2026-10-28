@@ -148,6 +148,9 @@ case "$tart_home" in /*) ;; *) die "--tart-home must be absolute" ;; esac
 checkout=$(cd "$(dirname "$0")/../.." && pwd)
 MB=$checkout/deploy/mac-build
 "${PY[@]}" "$MB/provision.py" validate-keys "${authorized_keys[@]}" || die "invalid/duplicate authorized public keys"
+# Read from the incoming sshd context before downloads, scratch, sudo or host changes.
+"${PY[@]}" "$MB/maintenance_ssh.py" preflight --tart-home "$tart_home" --source-path "$source_vm" \
+  || die "Remote Login storage preflight failed"
 commit=$("${GIT[@]}" -C "$checkout" rev-parse HEAD) || die "cannot read the Partitura checkout"
 [ -z "$("${GIT[@]}" -C "$checkout" status --porcelain)" ] || die "Partitura checkout $checkout has uncommitted changes"
 mkdir -p -m 0700 "$inputs"
