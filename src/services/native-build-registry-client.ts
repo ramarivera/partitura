@@ -361,6 +361,10 @@ export const createRegistryNativeBuildClient = Effect.fn(
       active.set(job.jobId, fiber);
       return job;
     }),
+    owned: Effect.fn("RegistryNativeBuildClient.owned")(
+      (organization: string, session: string, id: string, builder?: string) =>
+        nativeTry(() => state.owned(organization, session, id, builder)),
+    ),
     status: Effect.fn("RegistryNativeBuildClient.status")(function* (
       organization: string,
       session: string,
@@ -377,17 +381,29 @@ export const createRegistryNativeBuildClient = Effect.fn(
       ) {
         // run-v2 owns a long-lived SSH call. Probe its original authenticated
         // generation so callers can observe running and request cancellation.
-        const receipt = yield* transport.envelope(
-          yield* generationOf(job.generationId),
-          `status ${id}`,
-          job,
-          { timeout: 15_000 },
-        );
-        if (receipt.kind !== "known" && receipt.kind !== "unknown-job")
+        const receipt = yield* transport
+          .envelope(
+            yield* generationOf(job.generationId),
+            `status ${id}`,
+            job,
+            { timeout: 15_000 },
+          )
+          .pipe(
+            Effect.catchTag("@Gateway/NativeTransportError", (error) =>
+              error.reason === "unavailable"
+                ? Effect.succeed(undefined)
+                : Effect.fail(error),
+            ),
+          );
+        if (
+          receipt &&
+          receipt.kind !== "known" &&
+          receipt.kind !== "unknown-job"
+        )
           return yield* Effect.fail(
             NativeTransportError.new("protocol-mismatch"),
           );
-        if (receipt.kind === "known" && receipt.state === "running")
+        if (receipt?.kind === "known" && receipt.state === "running")
           yield* state.transaction((draft) => {
             const current = draft.jobs.find((entry) => entry.jobId === id);
             if (

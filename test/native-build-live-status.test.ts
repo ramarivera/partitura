@@ -5,7 +5,10 @@ import { Deferred, Effect, Fiber } from "effect";
 import { nativeIO } from "../src/services/native-build-errors.js";
 import { createRegistryNativeBuildClient } from "../src/services/native-build-registry-client.js";
 import { registryFixture } from "./fixtures/native-build-registry.js";
-import type { NativeBrokerTransport } from "./fixtures/native-build-transport.js";
+import {
+  type NativeBrokerTransport,
+  NativeTransportError,
+} from "./fixtures/native-build-transport.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const path = testPaths();
@@ -193,6 +196,43 @@ it.live(
           trace.filter((x) => x.command.startsWith("run-v2 ")),
         ).toHaveLength(1);
         expect(trace.some((x) => x.command.startsWith("cancel "))).toBe(true);
+      }),
+    ),
+);
+
+it.live(
+  "broker outages preserve durable status and cannot prevent cancellation recovery",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { f, client, job } = yield* runningFixture(
+          "outage-live-status",
+          (transport) => ({
+            ...transport,
+            envelope: Effect.fn("Test.outageStatus")(function* (
+              ...args: Parameters<NativeBrokerTransport["envelope"]>
+            ) {
+              if (args[1].startsWith("status "))
+                return yield* Effect.fail(
+                  NativeTransportError.new("unavailable"),
+                );
+              return yield* transport.envelope(...args);
+            }),
+          }),
+        );
+        expect(
+          (yield* client.status("org-a", "session-a", job.jobId)).state,
+        ).toBe("submitting");
+        yield* client.cancel("org-a", "session-a", job.jobId);
+        const saved = yield* client.owned("org-a", "session-a", job.jobId);
+        expect(saved.recovery.attempts).toBeGreaterThan(0);
+        expect(saved.recovery.lastReason).toBe("unavailable");
+        expect(f.state.quarantined(f.metadata.hostId)).toBe(true);
+        expect(
+          (yield* nativeIO(() => f.trace())).some((x) =>
+            x.command.startsWith("cancel "),
+          ),
+        ).toBe(true);
       }),
     ),
 );
