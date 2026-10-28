@@ -130,28 +130,30 @@ export async function observedStatusClient(
   >();
   let reads = 0,
     completed = 0;
-  const client = await createNativeBuildClient(config, (deps) => {
-    const refresh = legacyReceiptRefresh({
-      ...deps,
-      ...(now ? { now } : {}),
-      read: (...args) => {
-        reads++;
-        return deps.read(...args);
-      },
-    });
-    return {
-      ...refresh,
-      poll: (job) => {
-        const flight = refresh.poll(job);
-        if (flight && flights.get(job.job)?.task !== flight) {
-          const completion = flight.then(() => {
-            completed++;
-          });
-          flights.set(job.job, { task: flight, completion });
-        }
-        return flight;
-      },
-    };
+  const client = await createNativeBuildClient(config, {
+    makeReceiptRefresh: (deps) => {
+      const refresh = legacyReceiptRefresh({
+        ...deps,
+        ...(now ? { now } : {}),
+        read: (...args) => {
+          reads++;
+          return deps.read(...args);
+        },
+      });
+      return {
+        ...refresh,
+        poll: (job) => {
+          const flight = refresh.poll(job);
+          if (flight && flights.get(job.job)?.task !== flight) {
+            const completion = flight.then(() => {
+              completed++;
+            });
+            flights.set(job.job, { task: flight, completion });
+          }
+          return flight;
+        },
+      };
+    },
   });
   return {
     client,

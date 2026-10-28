@@ -3,7 +3,7 @@ export const waitUntil = async (
   ready: () => Promise<boolean>,
   clock = { now: Date.now, pause: () => Bun.sleep(5) },
 ) => {
-  const deadline = clock.now() + 4_500;
+  const deadline = clock.now() + 2_000;
   do {
     if (await ready()) return;
     await clock.pause();

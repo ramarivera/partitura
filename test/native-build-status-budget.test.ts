@@ -113,6 +113,6 @@ it.live(
       await expect(waitUntil(async () => false, clock)).rejects.toThrow(
         "Fixture did not reach expected state",
       );
-      expect(at).toBe(4_500);
+      expect(at).toBe(2_000);
     }),
 );
