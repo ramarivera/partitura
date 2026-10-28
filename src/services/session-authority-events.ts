@@ -322,6 +322,7 @@ export const makeEventHandler = ({
       );
       yield* updateRun(sessionId, {
         state: "succeeded",
+        terminalReason: Option.none(),
         nextAttemptAt: Option.none(),
       });
       yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
