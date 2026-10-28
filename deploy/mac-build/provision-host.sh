@@ -238,7 +238,7 @@ else
     || die "ownership is disabled on $volume_root (sudo diskutil enableOwnership $volume_root)"
   [ "$(df -k "$volume_root" | awk 'NR==2{print $4}')" -gt "$MIN_STORAGE_KB" ] || die "less than 120 GB free on $volume_root"
 fi
-[ "$(df -k /System/Volumes/Data | awk 'NR==2{print $4}')" -gt "$MIN_INTERNAL_KB" ] \
+"${PY[@]}" "$MB/broker/partitura_broker/capacity.py" "$((MIN_INTERNAL_KB * 1024))" /System/Volumes/Data \
   || die "internal disk is below the sealed runtime floor (at least 50 GiB)"
 fi
 

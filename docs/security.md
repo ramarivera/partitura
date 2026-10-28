@@ -512,3 +512,12 @@ launchd's client limit is separate. Build/reconcile SSH sessions, boot inventory
 and the installer self-tests all use the same sshd boundary. Operator-only bootstrap,
 base preparation/qualification and the root install guard remain explicit host
 setup operations, run in the already approved operator SSH context, not new daemons.
+
+Native-build runtime disk admission uses the shared capacity helper: per volume,
+the larger of account statvfs bytes and macOS CoreFoundation important-usage
+capacity, including OS-reclaimable space. This is for requested builds, not
+opportunistic prefetch. Invalid or unavailable CF results retain the statvfs-only
+floor; statvfs errors still refuse admission. Job and Tart capacity are never
+added across APFS volumes. The estimate reserves nothing and does not authorize
+snapshot deletion. Existing disk-write failure handling and cleanup fences stay
+in force. The broker health wire fields retain their numeric shape.
