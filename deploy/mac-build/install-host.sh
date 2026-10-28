@@ -3,6 +3,8 @@ set -euo pipefail
 stage="$1"
 tart_sha256="$2"
 account="$3"
+maintenance=/Library/Partitura/NativeBuild/maintenance_ssh.py
+remote_login=/Library/Partitura/NativeBuild/remote_login.py
 label=net.partitura.native-build-maintenance
 plist=/Library/LaunchDaemons/$label.plist
 tart_target=/Library/Partitura/NativeBuild/tart.app
@@ -11,10 +13,10 @@ tart_previous=/Library/Partitura/NativeBuild/.tart.app.previous
 for path in /Library /Library/Partitura /Library/Partitura/NativeBuild /Library/LaunchDaemons /private/etc /private/etc/ssh /private/etc/ssh/sshd_config.d; do
   [ ! -L "$path" ] || { echo "refusing symlink path: $path" >&2; exit 75; }
 done
-for path in "$plist" "$plist.new" "$plist.rollback" /Library/Partitura/NativeBuild/broker.py /Library/Partitura/NativeBuild/credential-writer.py /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/credential-writer.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/credential-writer.py.rollback /Library/Partitura/NativeBuild/config.json /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/tart.app /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
+for path in "$maintenance" "$maintenance.new" "$maintenance.rollback" "$remote_login" "$remote_login.new" "$remote_login.rollback" "$plist" "$plist.new" "$plist.rollback" /Library/Partitura/NativeBuild/broker.py /Library/Partitura/NativeBuild/credential-writer.py /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/credential-writer.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/credential-writer.py.rollback /Library/Partitura/NativeBuild/config.json /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/tart.app /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
   [ ! -L "$path" ] || { echo "refusing symlink target: $path" >&2; exit 75; }
 done
-for path in "$plist.new" "$plist.rollback" /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/credential-writer.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/credential-writer.py.rollback /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
+for path in "$maintenance.new" "$maintenance.rollback" "$remote_login.new" "$remote_login.rollback" "$plist.new" "$plist.rollback" /Library/Partitura/NativeBuild/broker.py.new /Library/Partitura/NativeBuild/credential-writer.py.new /Library/Partitura/NativeBuild/broker.py.rollback /Library/Partitura/NativeBuild/credential-writer.py.rollback /Library/Partitura/NativeBuild/config.json.new /Library/Partitura/NativeBuild/config.json.rollback /Library/Partitura/NativeBuild/managed-files.json.new /Library/Partitura/NativeBuild/managed-files.json.rollback /Library/Partitura/NativeBuild/authorized_keys.new /Library/Partitura/NativeBuild/authorized_keys.rollback /Library/Partitura/NativeBuild/.tart.app.new /Library/Partitura/NativeBuild/.tart.app.previous /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.new /private/etc/ssh/sshd_config.d/90-partitura-native-build.conf.rollback; do
   [ ! -e "$path" ] || { echo "refusing stale Tart transaction path: $path" >&2; exit 75; }
 done
 preflight="$(/usr/bin/mktemp -d /private/etc/ssh/.partitura-native-build.XXXXXX)" || exit 75
@@ -25,6 +27,8 @@ tart_old_moved=0
 tart_new_installed=0
 daemon_touched=0
 daemon_was_loaded=0
+log_created=0
+loopback_touched=0
 cleanup() {
   status=$?
   trap - EXIT
@@ -38,7 +42,12 @@ cleanup() {
     fi
     if [ "$tart_new_installed" -eq 1 ]; then /bin/rm -rf "$tart_target" || rollback_failed=1; fi
     if [ "$tart_old_moved" -eq 1 ]; then /bin/mv -f "$tart_previous" "$tart_target" || rollback_failed=1; fi
+    if [ "$loopback_touched" -eq 1 ]; then
+      /usr/bin/python3 -I "$stage/maintenance_ssh.py" rollback --account "$account" --backup "$preflight/loopback" || rollback_failed=1
+    fi
     if [ "$snapshot_ready" -eq 1 ]; then
+      restore_managed_file maintenance "$maintenance" || rollback_failed=1
+      restore_managed_file remote-login "$remote_login" || rollback_failed=1
       restore_managed_file broker /Library/Partitura/NativeBuild/broker.py || rollback_failed=1
       restore_managed_file writer /Library/Partitura/NativeBuild/credential-writer.py || rollback_failed=1
       restore_managed_file config /Library/Partitura/NativeBuild/config.json || rollback_failed=1
@@ -47,12 +56,16 @@ cleanup() {
       restore_managed_file manifest /Library/Partitura/NativeBuild/managed-files.json || rollback_failed=1
       restore_managed_file plist "$plist" || rollback_failed=1
     fi
+    if [ "$log_created" -eq 1 ]; then /bin/rm -f "$log" || rollback_failed=1; fi
     if [ "$daemon_touched" -eq 1 ] && [ "$daemon_was_loaded" -eq 1 ] && [ "$rollback_failed" -eq 0 ]; then
       /bin/launchctl bootstrap system "$plist" || rollback_failed=1
       /bin/launchctl print "system/$label" >/dev/null || rollback_failed=1
     fi
-  elif [ "$tart_old_moved" -eq 1 ]; then
-    /bin/rm -rf "$tart_previous" || rollback_failed=1
+  else
+    if [ "$loopback_touched" -eq 1 ]; then
+      /usr/bin/python3 -I "$stage/maintenance_ssh.py" finish --account "$account" --backup "$preflight/loopback" || rollback_failed=1
+    fi
+    if [ "$tart_old_moved" -eq 1 ]; then /bin/rm -rf "$tart_previous" || rollback_failed=1; fi
   fi
   /bin/rm -rf "$tart_new" || rollback_failed=1
   if [ "$rollback_failed" -ne 0 ]; then
@@ -99,6 +112,8 @@ load_state="$(/bin/launchctl print "system/$label" 2>&1)" && daemon_was_loaded=1
   case "$load_state" in *"Could not find service"*) ;; *) echo "cannot determine system daemon load state" >&2; exit 1 ;; esac
 }
 /bin/mkdir -m 0700 "$preflight/backups"
+backup_managed_file maintenance "$maintenance"
+backup_managed_file remote-login "$remote_login"
 backup_managed_file broker /Library/Partitura/NativeBuild/broker.py
 backup_managed_file writer /Library/Partitura/NativeBuild/credential-writer.py
 backup_managed_file config /Library/Partitura/NativeBuild/config.json
@@ -123,8 +138,10 @@ normalize_sshd_keywords() {
   /usr/bin/awk '{ key = $1; sub(/^[^ \t]+/, tolower(key)); print }'
 }
 effective="$(/usr/sbin/sshd -T -f "$preflight/sshd_config" -C user="$account",host=localhost,addr=127.0.0.1 | normalize_sshd_keywords)"
+/usr/bin/python3 -I "$stage/maintenance_ssh.py" policy --account "$account" <<<"$effective"
 for expected in \
-  "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys" \
+  "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys" \
+  "exposeauthinfo yes" \
   "passwordauthentication no" \
   "kbdinteractiveauthentication no" \
   "authenticationmethods publickey" \
@@ -149,6 +166,16 @@ fi
 if /bin/launchctl print "system/$label" >/dev/null 2>&1; then
   echo "previous maintenance instance is still loaded" >&2; exit 1
 fi
+# Root-owned parent prevents log replacement by the build account. Preserve
+# existing diagnostics, but refuse links, foreign owners and unsafe modes.
+log=/Library/Partitura/NativeBuild/maintenance.stderr.log
+[ ! -L "$log" ] || { echo "unsafe maintenance log" >&2; exit 75; }
+if [ -e "$log" ]; then
+  [ -f "$log" ] && [ "$(/usr/bin/stat -f '%l:%Su:%Lp' "$log")" = "1:$account:600" ] || { echo "unsafe maintenance log" >&2; exit 75; }
+else
+  log_created=1
+  /usr/bin/install -o "$account" -g staff -m 0600 /dev/null "$log"
+fi
 /usr/bin/ditto --rsrc "$stage/tart.app" "$tart_new"
 /usr/sbin/chown -R root:wheel "$tart_new"
 /bin/chmod -R go-w "$tart_new"
@@ -162,6 +189,8 @@ if [ -e "$tart_target" ]; then
 fi
 /bin/mv "$tart_new" "$tart_target"
 tart_new_installed=1
+atomic_install "$stage/maintenance_ssh.py" 0555 "$maintenance"
+atomic_install "$stage/remote_login.py" 0555 "$remote_login"
 atomic_install "$stage/broker.py" 0555 /Library/Partitura/NativeBuild/broker.py
 atomic_install "$stage/credential-writer.py" 0555 /Library/Partitura/NativeBuild/credential-writer.py
 atomic_install "$stage/config.json" 0444 /Library/Partitura/NativeBuild/config.json
@@ -171,8 +200,10 @@ atomic_install "$stage/managed-files.json" 0444 /Library/Partitura/NativeBuild/m
 /bin/mv -f "$dropin.new" "$dropin"
 /usr/sbin/sshd -t
 live_effective="$(/usr/sbin/sshd -T -C user="$account",host=localhost,addr=127.0.0.1 | normalize_sshd_keywords)"
+/usr/bin/python3 -I "$stage/maintenance_ssh.py" policy --account "$account" <<<"$live_effective"
 for expected in \
-  "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys" \
+  "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys" \
+  "exposeauthinfo yes" \
   "passwordauthentication no" \
   "kbdinteractiveauthentication no" \
   "authenticationmethods publickey" \
@@ -186,6 +217,12 @@ for expected in \
   "clientalivecountmax 3"; do
   /usr/bin/grep -Fxq "$expected" <<<"$live_effective" || { echo "live sshd policy differs: $expected" >&2; exit 1; }
 done
+# Generate/reuse the dedicated identity, confirm the Remote Login ACL, and prove
+# volume enumeration through the new dispatcher before activating launchd.
+/bin/mkdir -m 0700 "$preflight/loopback"
+loopback_touched=1
+/usr/bin/python3 -I "$stage/maintenance_ssh.py" prepare --account "$account" --backup "$preflight/loopback"
+/usr/bin/python3 -I "$stage/maintenance_ssh.py" check --account "$account"
 # Install/activate last, once all script/config/sshd readbacks have passed.
 atomic_install "$stage/maintenance.plist" 0644 "$plist"
 /bin/launchctl bootstrap system "$plist"

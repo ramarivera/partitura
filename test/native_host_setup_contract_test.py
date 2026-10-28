@@ -1,3 +1,4 @@
+import io
 from native_host_contract_support import *
 
 class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
@@ -51,7 +52,7 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         config.pop('authorized_key')
         config['authorized_keys'] = [VALID_KEY, second]
         normalized = MODULE.validate_settings(config)
-        lines = MODULE.expected_host_files(normalized, (b'1',) * 6)[MODULE.ROOT_AUTHORIZED_KEYS][0].decode().splitlines()
+        lines = MODULE.expected_host_files(normalized, (b'1',) * 8)[MODULE.ROOT_AUTHORIZED_KEYS][0].decode().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0].split(' ssh-ed25519 ')[0], lines[1].split(' ssh-ed25519 ')[0])
         for keys, error in (([], 'one or two'), ([VALID_KEY] * 3, 'one or two'), ([VALID_KEY, VALID_KEY.rsplit(' ', 1)[0] + ' another-comment'], 'duplicate')):
@@ -103,14 +104,23 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         plist = plistlib.loads(MODULE.maintenance_plist('builder'))
         self.assertEqual(plist['UserName'], 'builder')
         self.assertEqual(plist['StartInterval'], 60)
+        self.assertEqual(plist['StandardErrorPath'], '/Library/Partitura/NativeBuild/maintenance.stderr.log')
+        for key in ('SoftResourceLimits', 'HardResourceLimits'):
+            self.assertEqual(plist[key]['FileSize'], 1048576)
         self.assertTrue(plist['RunAtLoad'])
-        self.assertEqual(plist['ProgramArguments'][-3:], ['-I', str(MODULE.ROOT_BROKER), 'local-maintenance'])
+        self.assertEqual(plist['ProgramArguments'], MODULE._maintenance.ssh_command('builder'))
+        self.assertEqual(plist['ProgramArguments'][0], '/usr/bin/ssh')
         self.assertIn('-i', plist['ProgramArguments'])
         ssh = MODULE.sshd_dropin('builder')
         self.assertTrue(ssh.startswith('Match User builder\n'))
         self.assertIn('    ClientAliveInterval 15\n', ssh)
         self.assertIn('    ClientAliveCountMax 3\n', ssh)
         self.assertNotIn('Match all', ssh)
+        # sshd -t rejects keywords that sshd_config(5) doesn't allow inside Match.
+        allowed = {'authorizedkeysfile', 'exposeauthinfo', 'passwordauthentication', 'kbdinteractiveauthentication', 'authenticationmethods', 'forcecommand', 'allowtcpforwarding', 'allowagentforwarding', 'x11forwarding', 'permittty', 'clientaliveinterval', 'clientalivecountmax', 'acceptenv', 'permituserrc', 'disableforwarding', 'pubkeyauthentication', 'maxsessions', 'loglevel'}
+        keywords = {line.split()[0].lower() for line in ssh.splitlines()[1:] if line.strip()}
+        self.assertLessEqual(keywords, allowed)
+        self.assertNotIn('permituserenvironment', keywords)
 
 
     def test_capacity_checks_actual_roots_without_summing_free_space(self):
@@ -120,13 +130,38 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
             calls.append(argv)
             script = argv[argv.index('-c') + 1]
             with patch('sys.argv', ['capacity', '50', '/actual/jobs', '/actual/tart']), patch('os.statvfs', side_effect=lambda path: SimpleNamespace(f_bavail=40 if path.endswith('jobs') else 100, f_frsize=1)):
-                with self.assertRaisesRegex(SystemExit, 'below sealed'):
-                    exec(script, {})
+                with self.assertRaises(SystemExit) as caught:
+                    exec(script, {'__name__': '__main__'})
+                self.assertEqual(caught.exception.code, 1)
             return subprocess.CompletedProcess(argv, 0, stdout="")
         with patch.object(MODULE, 'account_python', return_value=['python']):
             MODULE.verify_runtime_capacity(config, run)
         self.assertEqual(calls[0][-3:], ['50', '/actual/jobs', '/actual/tart'])
 
+
+    def test_runtime_capacity_executes_the_same_pinned_purgeable_helper(self):
+        config = dict(account='builder', broker=dict(minimum_free_bytes=50), runtime=dict(root='/jobs', tart_home='/tart'))
+        def run(argv, **kwargs):
+            scope = {'__name__': 'capacity_test'}
+            exec(argv[argv.index('-c') + 1], scope)
+            with patch('sys.argv', ['capacity', '50', '/jobs', '/tart']), patch('os.statvfs', return_value=SimpleNamespace(f_bavail=30, f_frsize=1, f_blocks=200)):
+                scope['important_usage_capacity'] = lambda path: 70
+                self.assertEqual(scope['main'](), 0)
+                scope['important_usage_capacity'] = lambda path: None
+                self.assertEqual(scope['main'](), 1)
+            return subprocess.CompletedProcess(argv, 0, stdout='')
+        with patch.object(MODULE, 'account_python', return_value=['python']):
+            MODULE.verify_runtime_capacity(config, run)
+        with patch.object(MODULE, 'CAPACITY_SHA256', '0' * 64), self.assertRaisesRegex(MODULE.NativeHostError, 'pinned helper'):
+            MODULE.verify_runtime_capacity(config, run)
+        refused = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1, stdout='runtime capacity: [{"availableBytes":30}]\n', stderr='')
+        with patch.object(MODULE, 'account_python', return_value=['python']), patch('sys.stdout', new_callable=io.StringIO) as printed:
+            with self.assertRaisesRegex(MODULE.NativeHostError, 'below sealed free-space floor'):
+                MODULE.verify_runtime_capacity(config, refused)
+        self.assertIn('"availableBytes":30', printed.getvalue())
+        provision = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()
+        self.assertIn('"$MB/broker/partitura_broker/capacity.py" "$((MIN_INTERNAL_KB * 1024))" /System/Volumes/Data', provision)
+        self.assertNotIn('df -k /System/Volumes/Data', provision)
 
     def test_validation_accepts_a_second_generic_host_and_rejects_invalid_keys(self):
         config = json.loads(json.dumps(self.settings))
@@ -210,7 +245,7 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         config["base"]["sha256"] = "a" * 64
         config["base"]["source_sha256"] = "b" * 64
         config["base"]["mise_sha256"] = "c" * 64
-        files = MODULE.expected_host_files(config, (b"broker", b"runner", b"qualifier", b"launcher", b"installer", b"writer"))
+        files = MODULE.expected_host_files(config, (b"broker", b"runner", b"qualifier", b"launcher", b"installer", b"writer", b"maintenance", b"remote-login"))
         self.assertEqual(files[MODULE.ROOT_CONFIG][1], 0o444)
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -309,6 +344,8 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
                 *(MODULE.BROKER_SOURCE + name for name in MODULE.BROKER_FILES),
                 "deploy/mac-build/host_setup_validation.py",
                 "deploy/mac-build/broker_archive.py",
+                "deploy/mac-build/maintenance_ssh.py",
+                "deploy/mac-build/remote_login.py",
                 MODULE.GUEST_RUNNER_PATH,
                 MODULE.NATIVE_HOST_PATH,
                 MODULE.INSTALL_HOST_PATH,
@@ -352,8 +389,19 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
                         (repository / MODULE.NATIVE_HOST_PATH).read_bytes(),
                         (repository / MODULE.INSTALL_HOST_PATH).read_bytes(),
                         (repository / MODULE.WRITER_PATH).read_bytes(),
+                        (repository / "deploy/mac-build/maintenance_ssh.py").read_bytes(),
+                        (repository / "deploy/mac-build/remote_login.py").read_bytes(),
                     ),
                 )
+                real_run = subprocess.run
+                def damaged_remote(args, **kwargs):
+                    result = real_run(args, **kwargs)
+                    if args[-1].endswith(":deploy/mac-build/remote_login.py"):
+                        result.stdout += b"# unpinned Remote Login change\n"
+                    return result
+                with patch.object(MODULE.subprocess, "run", side_effect=damaged_remote):
+                    with self.assertRaisesRegex(MODULE.NativeHostError, "remote_login.py differs from the copy pinned"):
+                        MODULE.checked_source_blobs(config)
                 helper = repository / "deploy/mac-build/host_setup_validation.py"
                 helper_bytes = helper.read_bytes()
                 helper.write_bytes(helper_bytes + b"# unpinned change\n")
@@ -374,7 +422,8 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         calls = []
         output = "\n".join(
             [
-                f"authorizedkeysfile {MODULE.ROOT_AUTHORIZED_KEYS}",
+                f"authorizedkeysfile {MODULE.ROOT_AUTHORIZED_KEYS} /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys",
+                "exposeauthinfo yes",
                 "passwordauthentication no",
                 "kbdinteractiveauthentication no",
                 "authenticationmethods publickey",

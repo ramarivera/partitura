@@ -123,18 +123,29 @@ def destroy_vm(config, job, deadline=None):
         if seconds <= 0:
             raise TimeoutError('cleanup deadline')
         return seconds
+    stop_error = None
     try:
-        api.owned([config['tart'], 'stop', vm], environment, remaining(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass  # An already stopped VM still needs deletion and its readback.
+        budget = remaining()
+        # Tart 2.41.1 Stop.swift sends SIGKILL after its graceful timeout,
+        # including timeout=0. Leave ten seconds inside owned() for that kill
+        # and Tart's exit; owned()'s own group reap has a separate reserve.
+        grace = max(0, min(30, int(budget - 10)))
+        api.owned([config['tart'], 'stop', vm, '--timeout', str(grace)], environment, budget, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as error:
+        # An already stopped VM still needs deletion and its readback.
+        stop_error = error
     try:
         api.owned([config['tart'], 'delete', vm], environment, remaining(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         # Tart reports an error for an already absent VM, including a clone
         # that failed before creating it. The filesystem readback is decisive.
         if os.path.lexists(Path(config['tartHome']) / 'vms' / vm):
+            if stop_error is not None:
+                api.maintenance_error(stop_error, job)
             raise
     if os.path.lexists(Path(config['tartHome']) / 'vms' / vm):
+        if stop_error is not None:
+            api.maintenance_error(stop_error, job)
         raise ValueError('VM still exists after deletion')
 
 
@@ -227,6 +238,8 @@ def initialize_epoch(config):
 
 
 def emit(config, kind, **fields):
+    if kind == 'health' and 'storage-access-denied' in fields.get('reasons', []):
+        fields['storageAccessHint'] = api.STORAGE_ACCESS_HINT
     envelope = dict(protocolVersion=api.PROTOCOL_VERSION, hostId=config['hostId'], kind=kind, **fields)
     line = json.dumps(envelope, separators=(',', ':'), allow_nan=False) + '\n'
     if len(line.encode()) > api.MAX_STATE:
@@ -324,8 +337,7 @@ def disk_space(config, incoming=0):
     roots = [Path(config[key]) for key in ('root', 'tartHome')]
     free = []
     for path in roots:
-        info = os.statvfs(path)
-        free.append(info.f_bavail * info.f_frsize)
+        free.append(api.volume_capacity(path)['availableBytes'])
     # APFS sibling volumes may share a pool. Never add their reported free bytes.
     if roots[0].stat().st_dev == roots[1].stat().st_dev:
         sufficient = min(free) >= floor + incoming
@@ -427,9 +439,11 @@ def health(config):
                 reason = api.read_state(root / 'maintenance-reason')
                 if reason is not None and reason.strip() in api.MAINTENANCE_REASONS:
                     fields['reasons'] = [reason.strip()]
+                api.health_maintenance_reasons(config, fields)
                 api.emit(config, 'health', **fields)
                 return 0
             api.private_directory(root)
+            api.check_maintenance_storage(config)
             api.private_directory(Path(config['tartHome']))
             base = Path(config['tartHome']) / 'vms' / config['base']
             if base.is_symlink() or not base.is_dir() or not os.access(root, os.W_OK):
@@ -441,14 +455,15 @@ def health(config):
             else:
                 api.verify_vm_capacity()
                 fields.update(status='ready', accepting=True, capacity=1)
-        except OSError:
-            fields['reasons'] = ['host-disk-space-unavailable']
+        except OSError as error:
+            fields['reasons'] = [error.reason if isinstance(error, api.StorageProbeError) else 'storage-permission-denied' if error.errno in (1, 13) else 'host-disk-space-unavailable']
         except (ValueError, subprocess.SubprocessError):
             fields['reasons'] = ['host-capacity-unavailable']
     reason = api.read_state(root / 'maintenance-reason')
     if reason is not None and reason.strip() in api.MAINTENANCE_REASONS and reason.strip() not in fields['reasons']:
         fields['reasons'].append(reason.strip())
         fields.update(status='blocked', accepting=False, capacity=0)
+    api.health_maintenance_reasons(config, fields)
     if config['profile'] != 'registry-only':
         fields.update(status='blocked', accepting=False, capacity=0, reasons=[*fields['reasons'], 'legacy-profile'])
     api.emit(config, 'health', **fields)

@@ -430,10 +430,26 @@ def main(argv=()):
     if argv:
         if list(argv) not in (['local-maintenance'], ['local-relock']) or 'SSH_ORIGINAL_COMMAND' in os.environ or 'SSH_CONNECTION' in os.environ:
             raise ValueError('unsupported local invocation')
+        diagnostics_ready = argv[0] != 'local-maintenance' or api.prepare_maintenance_stderr()
         config = api.load_config()
-        return api.local_maintenance(config) if argv[0] == 'local-maintenance' else api.keychain_relock_entry(config)
-    request = api.parse_command(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
-    config = api.load_config()
+        if argv[0] == 'local-relock':
+            return api.keychain_relock_entry(config)
+        result = api.local_maintenance(config)
+        reason = Path(config['root']) / 'maintenance-reason'
+        if not diagnostics_ready and api.read_state(reason) is None:
+            api.durable_write(reason, 'diagnostics-unavailable\n')
+        return result
+    command = os.environ.get('SSH_ORIGINAL_COMMAND', '')
+    maintenance = api.maintenance_identity()
+    if command in api.MAINTENANCE_VERBS:
+        if not maintenance:
+            raise ValueError('unsupported local invocation')
+        api.ignore_shutdown_signals()
+        return api.loopback_maintenance(api.load_config(), check=command == api.MAINTENANCE_VERBS[1])
+    if maintenance:
+        raise ValueError('unsupported local invocation')  # This key cannot run builds or gateway verbs.
+    request = api.parse_command(command)
+    config = api.load_config(allow_storage_denial=True) if request[0] == 'health' else api.load_config()
     if request[0] in ('health', 'run-v2', 'reconcile') or config.get('profile') == 'registry-only':
         if 'hostId' not in config:
             print(json.dumps({'protocolVersion': api.PROTOCOL_VERSION, 'kind': 'error', 'code': 'identity-not-installed'}))
@@ -491,6 +507,12 @@ def main(argv=()):
 def cli(argv=()):
     try:
         return api.main(argv)
+    except api.StorageProbeError as error:
+        if os.environ.get('SSH_ORIGINAL_COMMAND') == 'health':
+            api.emit(error.config, 'error', code=error.reason, **({'storageAccessHint': api.STORAGE_ACCESS_HINT} if error.reason == 'storage-access-denied' else {}))
+        else:
+            api.storage_result(error)
+        return 1
     except Exception:
         command = os.environ.get('SSH_ORIGINAL_COMMAND', '')
         if command.split(' ', 1)[0] in ('health', 'run-v2', 'reconcile'):

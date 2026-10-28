@@ -186,10 +186,16 @@ against the hashes pinned in the script, plus Tart's signing team. It also check
   103-byte Unix socket limit;
 - build storage is a dedicated volume with ownership enabled and 120 GB free,
   never the system disk or a Time Machine destination's container;
-- the internal disk meets the sealed floor, initially 50 GiB, and Remote Login is on.
+- the internal disk meets the sealed floor, initially 50 GiB;
+- Remote Login is on, including **System Settings > General > Sharing > Remote
+  Login > Allow full disk access for remote users**. This is the one macOS
+  setting no script can set. Enable it before provisioning; no new launcher
+  grant or build-account GUI login is needed.
 
 After base preparation, staging and final readback measure available-to-account
-bytes on both actual runtime roots with `statvfs`. Each root must satisfy the
+bytes on both actual runtime roots with the shared Python capacity helper.
+It uses `max(statvfs f_bavail bytes, CF important-usage bytes)` on macOS, counting
+space the OS can reclaim automatically. Each root must satisfy the
 sealed floor. APFS free-space values are never added together. The external
 120 GiB provisioning requirement/reserve is separate from this runtime floor.
 
@@ -285,15 +291,17 @@ runtime roots. Conflicts stop; key rotation never mints another identity. A new
 profile can be supplied with `--profile`, but changing it requires a separate
 approved drain/cutover. This slice's rollout keeps both Macs in `legacy`.
 
-Upgrades that add the maintenance plist require
+Upgrades that add the maintenance SSH helpers or maintenance plist require
 `--predecessor-manifest-sha256 REVIEWED_SHA256`. Independently review and record
 the installed root-owned `managed-files.json` and its exact payloads first.
-Only the complete previous target set without the plist, or the older exact set
-without both plist and credential writer, is accepted. Unknown targets, changed
+Only the complete previous target set without the two SSH helpers, its predecessor
+without the plist, or the older exact set without both plist and credential writer,
+is accepted. Unknown targets, changed
 payloads and unexpected new files stop the upgrade. Subsequent same-target
 updates use the validated root-owned manifest normally. The generated, staged
-and installed manifest covers the same seven managed targets, including Tart.
-The immutable identity journal is separate installation state.
+and installed manifest covers the same nine managed targets, including Tart and the two SSH helpers.
+The immutable identity journal and host-local maintenance SSH identity are separate
+installation state. No private SSH key appears in settings or managed manifests.
 
 Root apply takes the existing runner lock nonblocking as the dedicated account,
 refuses outstanding safety fences/owned clones, and classifies private job state
@@ -599,7 +607,7 @@ be recovered under the lock from this SSH context. A completed inventory stays
 complete when the daemon leaves a pending keychain relock.
 
 On a clean host, artifact pruning precedes disk measurement using available-to-
-account `statvfs` bytes on the actual job and Tart roots. Each root needs the
+account available capacity on the actual job and Tart roots. Each root needs the
 sealed `minimumFreeBytes` floor, defaulting to 50 GiB; the job root additionally
 needs bundle plus secret input headroom before receiving. Free bytes from shared
 APFS storage are never added together. The broker records receiving state and a
@@ -640,8 +648,93 @@ deletion, readback or state writes retain the safety fence.
 The fixed local invocation is `broker.py local-maintenance`. It is rejected
 through `SSH_ORIGINAL_COMMAND` and whenever SSH environment markers are present.
 The installer installs `/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist`,
-root-owned mode 0644, invoking it as the dedicated build account at boot and
-every sixty seconds with a fixed interpreter/script and empty environment.
+root-owned mode 0644. At boot and every sixty seconds it starts `/usr/bin/ssh`
+as the dedicated build account, targeting that host's sshd on `127.0.0.1:22`.
+The fixed verb `partitura-local-maintenance` runs through the existing broker
+ForceCommand. It is admitted only for the installer-generated maintenance key,
+verified with sshd's `ExposeAuthInfo` record, and only on loopback. That key cannot
+run build/status/artifact verbs; gateway keys cannot select maintenance or its
+read-only `partitura-maintenance-check` preflight verb.
+
+Remote Login's **Allow full disk access for remote users** prerequisite reuses
+sshd-keygen-wrapper's system grant for external storage without a GUI session.
+The installer cannot enable that macOS privacy setting and never reads TCC.db.
+Before creating any files, accounts, volumes or credentials, the read-only
+provisioning preflight enumerates the external target or source volume through
+its incoming operator Remote Login SSH session. A fresh host has no maintenance
+key yet, so this tests the same sshd FDA boundary without creating one. Run
+preflight over SSH, not a local Terminal session. An EPERM fails immediately with
+the exact checkbox instruction. Once the maintenance identity exists, the
+transaction also tests its pinned loopback session before activation.
+
+The password-authorized transaction admits only the restricted build account to
+both the selected-user Remote Login ACL and an existing sshd AllowUsers list,
+before testing loopback access. Both changes roll back if installation fails.
+DenyUsers/DenyGroups and incompatible AllowGroups remain explicit refusals.
+
+Root installation creates the host-local key once at
+`/Library/Partitura/NativeBuild/maintenance-ssh/id_ed25519`, owned by the build
+account mode 0400. The parent directory and the public key, loopback-only restricted
+authorized_keys file and known_hosts file are root-owned. Reruns verify and reuse
+the valid key and do not append duplicate authorized entries. Damaged modes,
+hardlinks, corrupt key data or a failed public binding trigger a transactional
+repair. Root parses an existing private key only through unprivileged sudo as
+the build account. Rollback scratch contains public data only; repair renames the
+old private inode inside the sealed install directory, restores it on failure,
+and removes it after commit. The SSH client uses
+BatchMode, IdentitiesOnly, no agent/config/multiplexing/forwarding, and strict
+host-key checking. known_hosts is pinned from the root-owned local
+`/etc/ssh/ssh_host_ed25519_key.pub`; it never trusts a network discovery result.
+
+Before daemon activation the transaction runs `partitura-maintenance-check`
+while holding the installation lock. This verb only reads Tart home and its
+`vms` directory. It never writes state, takes runner.lock or truncates the log,
+even on denial. After commit the wrapper requests a real maintenance pass. Both
+verbs explicitly enumerate storage before any no-work, backoff or busy-lock
+return. The storage marker proves read access, not that cleanup ran, and neither
+self-test starts launchd. Pre-activation failure restores identity/pins, account
+admission, files and daemon state. A post-commit failure retains the installation
+for diagnosis. SSH exit 255 reports transport/authentication/host-pin failure;
+sudo/broker refusal is a separate category. Only EPERM on explicit Tart directory
+reads yields `storage-access-denied` and the FDA checkbox hint. EACCES or
+mutation/immutable-flag EPERM yields `storage-permission-denied`; other probe IO
+failures yield `inventory-unavailable`. Probe reasons have a separate durable
+file so they cannot overwrite locked recovery observations.
+
+Every admitted real pass records its boot id and timestamp before work scheduling.
+Health blocks with `maintenance-stale` after 240 seconds without a valid heartbeat,
+or immediately for a missing, malformed or previous-boot heartbeat. This allows a
+120-second cleanup plus two 60-second launch intervals, below the 900-second work
+backoff ceiling. Even no-work, busy-lock and backoff passes refresh it, so broken
+keys, auth-proof drift or a failed loopback listener cannot silently stay ready.
+Runtime TCC inheritance through a daemon-started sshd session still needs the
+actual Mac check before rollout.
+
+On SSH disconnect, the remote maintenance handler ignores HUP/TERM/INT until its
+bounded fenced pass finishes, preserving its exit result when the client remains.
+sshd creates a separate session, so launchd's ExitTimeOut bounds only the SSH
+client, not the remote pass. Its own 120-second cleanup deadline and durable
+fences cover an orphan, SIGKILL, reboot or an overlapping reinstall. An installer
+self-test timeout kills and reaps the local sudo/ssh process group. Local-only
+`local-maintenance` and `local-relock` invocations retain their previous rejection
+of SSH environment/argv. There is one maintenance LaunchDaemon; no independent boot
+recovery job bypasses this route. Operator bootstrap/base qualification and the
+root installation guard remain operator SSH setup paths, outside daemon execution.
+Its stderr is `/Library/Partitura/NativeBuild/maintenance.stderr.log`, a build-account-owned
+0600 file in the root-owned install directory. The installer refuses links,
+foreign owners and unsafe modes, and preserves existing diagnostics. Each pass
+replaces remote stderr with that validated descriptor, resets it at 512 KiB,
+and applies a 1 MiB session file-size limit independently of launchd's client
+limit. Diagnostics contain exception classes and safe broker or
+OS messages, never command argv, credentials or filesystem paths.
+Diagnostic writes are best effort. If the inherited log is unsafe or unusable,
+maintenance redirects stderr to `/dev/null`, continues cleanup, and records
+`diagnostics-unavailable` in `maintenance-reason` unless another reason exists.
+Rollback removes a log created by the failed install and preserves an existing log.
+Every `tart stop` uses an explicit graceful timeout shorter than its subprocess
+budget, reserving ten seconds for forced stop and exit when available and using
+`--timeout 0` when no graceful wait fits, as specified by
+[Tart 2.41.1 Stop.swift](https://github.com/cirruslabs/tart/blob/2.41.1/Sources/tart/Commands/Stop.swift).
 The dedicated account alone receives ClientAliveInterval 15 and
 ClientAliveCountMax 3 in its existing Match User block.
 The code inventories private receipt/owned-clone directories once per boot or
@@ -899,3 +992,28 @@ Code merge does not authorize cutover. Follow the separately approved
 [unexecuted deployment overlay](registry.compose.example.yaml).
 See [the engine and offline import contract](registry-engine.md) for Effect scope
 ownership, recovery, credential restoration and resumable imports.
+
+### Reclaimable space in the runtime floor
+
+The broker, installer runtime check and internal-disk provisioning floor share
+`broker/partitura_broker/capacity.py`. CoreFoundation's
+`kCFURLVolumeAvailableCapacityForImportantUsageKey` includes reclaimable capacity
+for explicitly requested work; opportunistic capacity is for speculative work.
+The helper uses the larger of that value and account `statvfs` bytes. Unsupported
+CF, missing/failed queries, non-integer/negative values, overflow and values above
+volume capacity fall back to statvfs. A failed statvfs still refuses admission.
+No snapshot deletion, preallocation or capacity reservation is performed.
+
+[Apple describes important versus opportunistic usage](https://developer.apple.com/videos/play/tech-talks/204/)
+and [automatic snapshot reclamation for file copies and software installs](https://support.apple.com/en-us/102154).
+Tart's [2.41.1 clone path copies the VM disk](https://github.com/cirruslabs/tart/blob/2.41.1/Sources/tart/VMDirectory.swift).
+A requested build's clone and subsequent disk writes fit important usage, rather
+than speculative cache prefetch. Capacity remains an estimate, not guaranteed
+space: concurrent use, non-purgeable snapshots or write failure can still fail a
+build, retaining the existing cleanup fences and post-transfer check.
+
+Health's existing `jobRootFreeBytes` and `tartRootFreeBytes` now report this
+effective capacity; their numeric wire shape is unchanged. Installer/preflight
+JSON reports `statvfsBytes`, `importantUsageBytes` or null on fallback, and
+`availableBytes` per queried root. No volumes' values are added, even for shared
+APFS pools. The external 120 GiB provisioning/reserve requirement is unchanged.

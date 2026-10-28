@@ -90,7 +90,7 @@ class NativeHostFixture:
         return config
 
 
-    def exercise_install_rollback(self, failure, was_loaded, corrupt_restored=False):
+    def exercise_install_rollback(self, failure, was_loaded, corrupt_restored=False, existing_log=False, rollback_refused=False):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -106,6 +106,10 @@ class NativeHostFixture:
             shims = Path(directory) / "shims"
             (host / "Library/LaunchDaemons").mkdir(parents=True)
             native_root.mkdir(parents=True)
+            maintenance_log = native_root / 'maintenance.stderr.log'
+            if existing_log:
+                maintenance_log.write_bytes(b'previous diagnostics\n')
+                maintenance_log.chmod(0o600)
             dropin.parent.mkdir(parents=True)
             source_executable.parent.mkdir(parents=True)
             stage.mkdir()
@@ -137,10 +141,10 @@ class NativeHostFixture:
             broker_blob, runner_blob, qualifier_blob = b"new broker", b"new runner", b"new qualifier"
             with patch.object(MODULE, "ROOT_TART_APP", installed_app), patch.object(
                 MODULE, "ROOT_BROKER", native_root / "broker.py"
-            ), patch.object(MODULE, "ROOT_WRITER", native_root / "credential-writer.py"), patch.object(MODULE, "ROOT_CONFIG", native_root / "config.json"), patch.object(
+            ), patch.object(MODULE, "ROOT_MAINTENANCE", native_root / "maintenance_ssh.py"), patch.object(MODULE, "ROOT_REMOTE_LOGIN", native_root / "remote_login.py"), patch.object(MODULE, "ROOT_WRITER", native_root / "credential-writer.py"), patch.object(MODULE, "ROOT_CONFIG", native_root / "config.json"), patch.object(
                 MODULE, "ROOT_AUTHORIZED_KEYS", native_root / "authorized_keys"
             ), patch.object(MODULE, "ROOT_SSHD_DROPIN", dropin), patch.object(MODULE, "ROOT_PLIST", host / "Library/LaunchDaemons/net.partitura.native-build-maintenance.plist"):
-                files = MODULE.expected_host_files(config, (broker_blob, runner_blob, qualifier_blob, b"launcher", b"installer", b"writer"))
+                files = MODULE.expected_host_files(config, (broker_blob, runner_blob, qualifier_blob, b"launcher", b"installer", b"writer", b"maintenance", b"remote-login"))
                 expected_manifest = MODULE.expected_managed_manifest(files, config)
 
             for target, (payload, mode) in files.items():
@@ -190,6 +194,7 @@ class NativeHostFixture:
             fail_once.touch()
             shim_source = f'''#!/usr/bin/env python3
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -232,6 +237,7 @@ elif name == "stat":
         "%u": str(metadata.st_uid),
         "%g": str(metadata.st_gid),
         "%Lp": format(metadata.st_mode & 0o777, "o"),
+        "%l:%Su:%Lp": str(metadata.st_nlink) + ":" + {self.settings["account"]!r} + ":" + format(metadata.st_mode & 0o777, "o"),
     }}
     print(values[args[1]])
 elif name == "sshd":
@@ -244,7 +250,8 @@ elif name == "sshd":
             sys.exit(1)
     elif "-T" in args:
         print("\\n".join([
-            "authorizedkeysfile {native_root / "authorized_keys"}",
+            "authorizedkeysfile {native_root / "authorized_keys"} {native_root / "maintenance-ssh/authorized_keys"}",
+            "exposeauthinfo yes",
             "passwordauthentication no",
             "kbdinteractiveauthentication no",
             "authenticationmethods publickey",
@@ -277,15 +284,23 @@ elif name == "launchctl":
         if {failure!r} == 'bootstrap' and Path({str(fail_once)!r}).exists():
             Path({str(fail_once)!r}).unlink()
             sys.exit(1)
+elif name == "python3":
+    with Path({str(Path(directory) / "python-calls")!r}).open("a") as calls:
+        calls.write(json.dumps(args) + "\\n")
+    if "rollback" in args and {rollback_refused!r}:
+        sys.exit(1) # The real helper propagates dseditgroup -d failure.
+    if "check" in args and {failure!r} == "loopback" and Path({str(fail_once)!r}).exists():
+        Path({str(fail_once)!r}).unlink()
+        sys.exit(1)
 elif name == "sudo":
     raise SystemExit('securityd denies keychain access in sudo context')
-elif name not in ("codesign", "chown", "plutil"):
+elif name not in ("codesign", "chown", "plutil", "python3"):
     raise SystemExit(f"unexpected fixture command: {{name}} {{args}}")
 '''
             shim = shims / "fixture-command"
             shim.write_text(shim_source)
             shim.chmod(0o755)
-            for command in ("install", "ditto", "shasum", "stat", "sshd", "codesign", "chown", "plutil", "launchctl", "sudo"):
+            for command in ("install", "ditto", "shasum", "stat", "sshd", "codesign", "chown", "plutil", "launchctl", "sudo", "python3"):
                 (shims / command).symlink_to(shim)
 
             for old_path, new_path in (
@@ -301,8 +316,10 @@ elif name not in ("codesign", "chown", "plutil"):
                 ("/usr/bin/plutil", str(shims / "plutil")),
                 ("/bin/launchctl", str(shims / "launchctl")),
                 ("/usr/bin/sudo", str(shims / "sudo")),
+                ("/usr/bin/python3", str(shims / "python3")),
             ):
                 installer = installer.replace(old_path, new_path)
+            installer = installer.replace('forcecommand ' + str(shims / 'python3'), 'forcecommand /usr/bin/python3')
 
             def run_installer():
                 # Drive the actual root wrapper's exit-75 branch, including its
@@ -331,6 +348,9 @@ elif name not in ("codesign", "chown", "plutil"):
                     nonlocal result
                     if args[0] == '/usr/bin/ditto':
                         shutil.copytree(args[-2], args[-1])
+                        return subprocess.CompletedProcess(args, 0)
+                    if args[0] == '/usr/bin/python3':
+                        self.assertEqual(args[-3:], ['test', '--account', config['account']])
                         return subprocess.CompletedProcess(args, 0)
                     self.assertEqual(args[0], '/bin/bash')
                     # Run the actual transaction against the fixture payloads;
@@ -366,13 +386,25 @@ elif name not in ("codesign", "chown", "plutil"):
                     code = launcher.main(argv)
                 self.assertIsNotNone(result)
                 self.assertEqual(code, 0 if result.returncode == 0 else 1)
-                self.assertEqual((runtime / 'cleanup-required').exists(), corrupt_restored)
-                self.assertEqual((runtime / 'maintenance-blocked').exists(), corrupt_restored)
+                self.assertEqual((runtime / 'cleanup-required').exists(), corrupt_restored or rollback_refused)
+                self.assertEqual((runtime / 'maintenance-blocked').exists(), corrupt_restored or rollback_refused)
                 return result
 
             failed_update = run_installer()
-            self.assertEqual(failed_update.returncode, 75, failed_update.stdout + failed_update.stderr)
-            if corrupt_restored:
+            self.assertEqual(failed_update.returncode, 1 if rollback_refused else 75, failed_update.stdout + failed_update.stderr)
+            calls = [json.loads(line) for line in (Path(directory) / "python-calls").read_text().splitlines()]
+            rolled_back = [args for args in calls if "rollback" in args]
+            if any("prepare" in args for args in calls):
+                self.assertEqual(len(rolled_back), 1)
+                self.assertIn("--backup", rolled_back[0])
+                self.assertTrue(rolled_back[0][-1].endswith("/loopback"))
+            if failure == "loopback":
+                self.assertTrue(rolled_back, "failed loopback check must undo the prepared identity")
+            self.assertEqual(maintenance_log.exists(), existing_log)
+            if existing_log:
+                self.assertEqual(maintenance_log.read_bytes(), b'previous diagnostics\n')
+                self.assertEqual(stat.S_IMODE(maintenance_log.stat().st_mode), 0o600)
+            if corrupt_restored or rollback_refused:
                 return # The real verifier rejected drift and retained both fences.
             self.assertEqual(installed_executable.read_bytes(), old_tart)
             self.assertEqual(daemon_state.exists(), was_loaded)

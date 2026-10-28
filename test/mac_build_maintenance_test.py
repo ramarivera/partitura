@@ -54,7 +54,7 @@ class MaintenanceTrialTests(RegistryFixture, unittest.TestCase):
         with patch.object(broker, 'process_start', return_value=None), patch.object(broker, 'macos_build', return_value='26B123'):
             self.assertEqual(self.maintenance(), 0)
         self.assertFalse(clone.exists())
-        self.assertEqual(self.trace(), [['stop', 'partitura-job-' + self.job], ['delete', 'partitura-job-' + self.job]])
+        self.assertEqual(self.trace(), [['stop', 'partitura-job-' + self.job, '--timeout', '20'], ['delete', 'partitura-job-' + self.job]])
         self.assertEqual((operator / 'keep').read_bytes(), b'untouched')
         self.assertTrue((self.root / 'vms' / self.config['base']).exists())
         self.assertFalse((directory / 'source.bundle').exists())

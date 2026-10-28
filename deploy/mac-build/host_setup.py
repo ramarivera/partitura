@@ -17,7 +17,6 @@ import pwd
 from pathlib import Path
 import re
 import stat
-import plistlib
 import subprocess
 import sys
 import types
@@ -63,8 +62,10 @@ BROKER_POLICY_KEYS = {"host_id", "protocol", "profile", "minimum_free_bytes", "d
 
 # Pinned host_setup.py bytes pin its helpers transitively: each helper is hashed
 # before it runs, so a drifted working tree can't execute unpinned code.
+CAPACITY_SHA256 = "8917a05cc6a57ada3d9427dbfa4c50e7fa2c106054f734303af52881a530e734"
 HOST_SETUP_VALIDATION_SHA256 = "a1a7d417d746549a4afc4e22f38e1d0370bcb0ca0da04239ebdd64b5bb5c2efa"
-BROKER_ARCHIVE_SHA256 = "f7b713b945f8a4adffc80149ada9a5845c2c0eced4ad0c2a2ca0fe58aaab430e"
+MAINTENANCE_SSH_SHA256 = "8ef7c42ed494fd008e99da853be4a82ca4e69c7b98cb12ba6c527d5e596c8874"
+BROKER_ARCHIVE_SHA256 = "747dbb6a612e5bb4c304784753e6e1bcb55f90f02d2e424d4551fbae0a3244af"
 
 
 def _load_pinned_helper(name: str, filename: str, expected: str) -> types.ModuleType:
@@ -99,6 +100,11 @@ broker_from_directory = _archive.broker_from_directory
 BROKER_FILES = _archive.BROKER_FILES
 BROKER_SOURCE = _archive.BROKER_SOURCE
 
+
+_maintenance = _load_pinned_helper("partitura_maintenance_ssh", "maintenance_ssh.py", MAINTENANCE_SSH_SHA256)
+maintenance_plist = _maintenance.maintenance_plist
+ROOT_MAINTENANCE = Path("/Library/Partitura/NativeBuild/maintenance_ssh.py")
+ROOT_REMOTE_LOGIN = Path("/Library/Partitura/NativeBuild/remote_login.py")
 
 def account_python(account: str) -> list[str]:
     """Run the same qualified interpreter selection as a dedicated account.
@@ -164,10 +170,13 @@ def authorized_key_line(public_key: str) -> str:
 
 
 def sshd_dropin(account: str) -> str:
+    # sshd refuses non-Match keywords here (PermitUserEnvironment is global-only);
+    # its effective "no" default is verified separately through sshd -T.
     return "\n".join(
         [
             f"Match User {account}",
-            "    AuthorizedKeysFile /Library/Partitura/NativeBuild/authorized_keys",
+            "    AuthorizedKeysFile /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys",
+            "    ExposeAuthInfo yes",
             "    PasswordAuthentication no",
             "    KbdInteractiveAuthentication no",
             "    AuthenticationMethods publickey",
@@ -181,16 +190,6 @@ def sshd_dropin(account: str) -> str:
             "",
         ]
     )
-
-
-def maintenance_plist(account: str) -> bytes:
-    return plistlib.dumps({
-        "Label": MAINTENANCE_LABEL, "UserName": account, "GroupName": "staff",
-        "ProgramArguments": ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", f"HOME=/Users/{account}", "DEVELOPER_DIR=/Library/Developer/CommandLineTools", "/usr/bin/python3", "-I", str(ROOT_BROKER), "local-maintenance"],
-        "RunAtLoad": True, "StartInterval": 60, "ProcessType": "Background", "WorkingDirectory": "/",
-        "Umask": 0o077, "ExitTimeOut": 150, "ThrottleInterval": 60,
-        "HardResourceLimits": {"Core": 0}, "SoftResourceLimits": {"Core": 0},
-    }, sort_keys=True)
 
 
 def read_root_json(path: Path) -> dict | None:
@@ -258,19 +257,16 @@ def provision_constant(blob: bytes, name: str) -> str:
 
 
 def verify_runtime_capacity(config: dict, run=subprocess.run) -> None:
-    script = r'''
-import os, sys
-floor = int(sys.argv[1])
-free = []
-for path in sys.argv[2:]:
-    info = os.statvfs(path)
-    free.append(info.f_bavail * info.f_frsize)
-if min(free) < floor:
-    raise SystemExit('runtime job/Tart root below sealed free-space floor')
-print('runtime capacity verified: jobRootFreeBytes=%d tartRootFreeBytes=%d minimumFreeBytes=%d' % (*free, floor))
-'''
-    result = run([*account_python(config['account']), '-c', script, str(config['broker']['minimum_free_bytes']), config['runtime']['root'], config['runtime']['tart_home']], check=True, capture_output=True, text=True, timeout=15, cwd='/')
+    helper = Path(__file__).parent / 'broker/partitura_broker/capacity.py'
+    script = safe_read(helper)
+    if sha256_bytes(script) != CAPACITY_SHA256:
+        raise NativeHostError('capacity.py differs from the pinned helper')
+    result = run([*account_python(config['account']), '-c', script.decode(), str(config['broker']['minimum_free_bytes']), config['runtime']['root'], config['runtime']['tart_home']], check=False, capture_output=True, text=True, timeout=15, cwd='/')
+    # Print the measured values before refusing, so a below-floor install shows why.
     print(result.stdout, end='')
+    if result.returncode != 0:
+        detail = (result.stderr.strip().splitlines() or [''])[-1]
+        raise NativeHostError('runtime job/Tart root below sealed free-space floor' + (f' ({detail})' if detail else ''))
 
 
 def verify_host_policy(config: dict, run=subprocess.run) -> bool:
@@ -306,7 +302,7 @@ else:
     return result.stdout.strip() == 'incomplete'
 
 
-def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, bytes, bytes]:
+def checked_source_blobs(config: dict) -> tuple[bytes, ...]:
     source = config["source"]
     repository = Path(source["partitura_repository"])
     reject_symlink_ancestors(repository)
@@ -330,9 +326,9 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
     ).stdout
     if sha256_bytes(setup) != sha256_file(Path(__file__)):
         raise NativeHostError("running host setup module differs from the pinned Partitura commit")
-    for relative in ("deploy/mac-build/host_setup_validation.py", "deploy/mac-build/broker_archive.py"):
+    for relative in ("deploy/mac-build/host_setup_validation.py", "deploy/mac-build/broker_archive.py", "deploy/mac-build/maintenance_ssh.py", "deploy/mac-build/broker/partitura_broker/capacity.py"):
         result = subprocess.run(["/usr/bin/git", "-C", str(repository), "show", f"{commit}:{relative}"], check=True, capture_output=True, env=git_environment())
-        if sha256_bytes(result.stdout) != sha256_file(Path(__file__).with_name(Path(relative).name)):
+        if sha256_bytes(result.stdout) != sha256_file(Path(__file__).parent / Path(relative).relative_to("deploy/mac-build")):
             raise NativeHostError("running host setup module differs from the pinned Partitura commit")
     broker = broker_from_commit(repository, commit, git_environment())
     if sha256_bytes(broker) != source["broker_sha256"]:
@@ -357,7 +353,10 @@ def checked_source_blobs(config: dict) -> tuple[bytes, bytes, bytes, bytes, byte
     qualifier = safe_read(Path(source["qualifier_source"]))
     if sha256_bytes(qualifier) != source["qualifier_sha256"]:
         raise NativeHostError("pinned Partitura qualifier hash differs")
-    return blobs[0], blobs[1], qualifier, blobs[2], blobs[3], blobs[4]
+    extra = [subprocess.run(["/usr/bin/git", "-C", str(repository), "show", f"{commit}:deploy/mac-build/{name}"], check=True, capture_output=True, env=git_environment()).stdout for name in ("maintenance_ssh.py", "remote_login.py")]
+    if sha256_bytes(extra[1]) != _maintenance.REMOTE_LOGIN_SHA256:
+        raise NativeHostError("remote_login.py differs from the copy pinned by maintenance_ssh.py")
+    return blobs[0], blobs[1], qualifier, blobs[2], blobs[3], blobs[4], *extra
 
 
 def verify_tart_source(config: dict) -> Path:
@@ -466,6 +465,7 @@ def sshd_effective(settings: dict, run=subprocess.run) -> dict[str, str]:
         check=True,
         timeout=15,
     )
+    _maintenance.verify_environment(result.stdout)
     return {
         key.lower(): value
         for line in result.stdout.splitlines()
@@ -474,7 +474,7 @@ def sshd_effective(settings: dict, run=subprocess.run) -> dict[str, str]:
     }
 
 
-def expected_host_files(config: dict, blobs: tuple[bytes, bytes, bytes, bytes, bytes, bytes]) -> dict[Path, tuple[bytes, int]]:
+def expected_host_files(config: dict, blobs: tuple[bytes, ...]) -> dict[Path, tuple[bytes, int]]:
     broker, runner, qualifier = blobs[:3]
     # The guest files are staged for a later approved base-qualification path.
     # This host installer does not run them or copy a VM image.
@@ -486,6 +486,8 @@ def expected_host_files(config: dict, blobs: tuple[bytes, bytes, bytes, bytes, b
         ROOT_AUTHORIZED_KEYS: (''.join(authorized_key_line(key) for key in config.get("authorized_keys", [config["authorized_key"]] if config.get("authorized_key") else [])).encode(), 0o444),
         ROOT_SSHD_DROPIN: (sshd_dropin(config["account"]).encode(), 0o644),
         ROOT_PLIST: (maintenance_plist(config["account"]), 0o644),
+        ROOT_MAINTENANCE: (blobs[6], 0o555),
+        ROOT_REMOTE_LOGIN: (blobs[7], 0o555),
     }
 
 
@@ -542,7 +544,8 @@ def check_existing_files(
     migrating = manifest and set(previous) != target_names
     if migrating:
         predecessor = config["predecessor_manifest_sha256"]
-        predecessors = (target_names - {str(ROOT_PLIST)}, target_names - {str(ROOT_PLIST), str(ROOT_WRITER)})
+        prior = target_names - {str(ROOT_MAINTENANCE), str(ROOT_REMOTE_LOGIN)}
+        predecessors = (prior, prior - {str(ROOT_PLIST)}, prior - {str(ROOT_PLIST), str(ROOT_WRITER)})
         if set(previous) not in predecessors or not predecessor or sha256_file(manifest_path) != predecessor:
             raise NativeHostError("managed-files manifest does not match the frozen predecessor target set")
         # Every predecessor entry must still match. The pin alone does not
@@ -614,23 +617,10 @@ def check_existing_files(
 
 
 def verify_effective_sshd(settings: dict, effective: dict[str, str]) -> None:
-    expected = {
-        "authorizedkeysfile": str(ROOT_AUTHORIZED_KEYS),
-        "passwordauthentication": "no",
-        "kbdinteractiveauthentication": "no",
-        "authenticationmethods": "publickey",
-        "forcecommand": FORCED_COMMAND,
-        "allowtcpforwarding": "no",
-        "allowagentforwarding": "no",
-        "x11forwarding": "no",
-        "permittty": "no",
-        "permituserenvironment": "no",
-        "clientaliveinterval": "15",
-        "clientalivecountmax": "3",
-    }
-    mismatch = [key for key, value in expected.items() if effective.get(key) != value]
-    if mismatch:
-        raise NativeHostError("effective sshd policy differs: " + ", ".join(mismatch))
+    try:
+        _maintenance.verify_effective_sshd(settings['account'], effective)
+    except ValueError as error:
+        raise NativeHostError(str(error)) from None
 
 
 def check(settings: object, *, system: str | None = None, run=subprocess.run) -> int:
@@ -657,6 +647,7 @@ def check(settings: object, *, system: str | None = None, run=subprocess.run) ->
     if not verify_host_policy(config, run):
         print("partitura native host: managed files current; maintenance daemon needs installation")
         return 2
+    _maintenance.self_test(config["account"], check=True, run=run)
     print("partitura native host: pinned sources, account, Tart, base, sshd and files verified")
     return 0
 
@@ -735,7 +726,9 @@ def stage(settings: object, destination: Path) -> None:
     (destination / "native_host.py").write_bytes(blobs[3])
     (destination / "install-host.sh").write_bytes(blobs[4])
     (destination / "credential-writer.py").write_bytes(blobs[5])
-    for name in ("broker.py", "guest-run.sh", "qualify.sh", "native_host.py", "install-host.sh", "credential-writer.py"):
+    (destination / "maintenance_ssh.py").write_bytes(blobs[6])
+    (destination / "remote_login.py").write_bytes(blobs[7])
+    for name in ("broker.py", "guest-run.sh", "qualify.sh", "native_host.py", "install-host.sh", "credential-writer.py", "maintenance_ssh.py", "remote_login.py"):
         os.chmod(destination / name, 0o600)
     (destination / "config.json").write_text(
         json.dumps(make_broker_config(config), sort_keys=True, indent=2) + "\n"
@@ -778,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
             return check(settings)
         stage(settings, arguments.stage)
         return 0
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, NativeHostError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         print(f"partitura native host: {error}", file=sys.stderr)
         return 1
 
