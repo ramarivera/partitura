@@ -103,16 +103,23 @@ SAFE_MESSAGES = frozenset((
 
 
 def maintenance_error(error, job=None):
-    if isinstance(error, OSError) and error.errno is not None:
-        message = os.strerror(error.errno)
-    elif isinstance(error, subprocess.TimeoutExpired):
-        message = 'command timed out'
-    elif isinstance(error, subprocess.CalledProcessError):
-        message = 'command failed with exit ' + str(error.returncode)
-    else:
-        message = str(error) if str(error) in SAFE_MESSAGES else 'redacted exception message'
-    identity = ' job=' + job if job is not None else ''
-    print('maintenance-error' + identity + ' ' + type(error).__name__ + ': ' + message, file=sys.stderr, flush=True)
+    try:
+        if isinstance(error, OSError) and type(error.errno) is int:
+            message = os.strerror(error.errno)
+        elif isinstance(error, subprocess.TimeoutExpired):
+            message = 'command timed out'
+        elif isinstance(error, subprocess.CalledProcessError):
+            message = 'command failed'
+            if type(error.returncode) is int:
+                message += ' with exit ' + str(error.returncode)
+        else:
+            message = str(error) if str(error) in SAFE_MESSAGES else 'redacted exception message'
+        identity = ' job=' + job if job is not None else ''
+        print('maintenance-error' + identity + ' ' + type(error).__name__ + ': ' + message, file=sys.stderr, flush=True)
+    except Exception:
+        # Includes OSError/BrokenPipeError and ValueError from write or flush.
+        # Formatting a foreign exception must not interrupt cleanup either.
+        pass
 
 
 def prepare_maintenance_stderr(descriptor=2):
@@ -122,11 +129,24 @@ def prepare_maintenance_stderr(descriptor=2):
     The kernel cap also bounds unexpected stderr output within a single pass.
     Pipes/terminals in hermetic tests and foreground diagnostics stay untouched.
     """
-    info = os.fstat(descriptor)
-    if not stat.S_ISREG(info.st_mode):
-        return
-    if info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
-        raise ValueError('unsafe maintenance stderr')
-    if info.st_size >= 524288:
-        os.ftruncate(descriptor, 0)
-    os.lseek(descriptor, 0, os.SEEK_END)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return True
+        if info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError('unsafe maintenance stderr')
+        if info.st_size >= 524288:
+            os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_END)
+        return True
+    except (OSError, ValueError):
+        # Never write to or truncate an unsafe inode. Losing diagnostics must
+        # not disable orphan cleanup; main records the degraded log separately.
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            if null != descriptor:
+                os.dup2(null, descriptor)
+        finally:
+            if null != descriptor:
+                os.close(null)
+        return False

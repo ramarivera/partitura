@@ -11,6 +11,11 @@ class PartituraNativeHostInstallTest(NativeHostFixture, unittest.TestCase):
     def test_restored_payload_drift_keeps_installer_fences_in_real_main(self):
         self.exercise_install_rollback('sshd', False, corrupt_restored=True)
 
+    def test_failed_update_preserves_existing_maintenance_log(self):
+        for failure in ('sshd', 'bootstrap', 'readback'):
+            with self.subTest(failure=failure):
+                self.exercise_install_rollback(failure, True, existing_log=True)
+
 
     def test_installer_validates_live_sshd_and_restores_the_dropin_on_failure(self):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()

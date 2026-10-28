@@ -306,7 +306,7 @@ export async function createNativeBuildClient(
       }
       for (const file of await readdir(config.scratchRoot)) {
         const match =
-          /^([a-f0-9]{32})\.(?:tar(?:\..+)?|bundle(?:\..+)?|json\.(?:new|invalid))$/u.exec(
+          /^([a-f0-9]{32})\.(?:tar(?:\..+)?|bundle(?:\..+)?|json\.new)$/u.exec(
             file,
           );
         const jobId = match?.[1];
@@ -374,17 +374,6 @@ export async function createNativeBuildClient(
         join(config.scratchRoot, file),
         join(config.scratchRoot, `${file}.invalid`),
       );
-      // The filename was validated independently of the corrupt record. Retry
-      // broker cleanup without trusting its session, commit or receipt fields.
-      try {
-        await remote(`cancel ${file.slice(0, 32)}`, { timeout: 10_000 });
-      } catch {
-        await Effect.runPromise(
-          Effect.logWarning("Quarantined native build cleanup unavailable", {
-            code: "native-quarantine-cancel-unavailable",
-          }),
-        );
-      }
       await Effect.runPromise(
         Effect.logWarning("Invalid native build record quarantined", {
           code: "native-record-invalid",

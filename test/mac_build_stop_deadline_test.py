@@ -1,9 +1,19 @@
 """Forced-stop margin through the real daemon and SSH reconciliation paths."""
 from mac_build_broker_support import *
 import subprocess
+import stat
 
 
 class StopDeadlineTests(RegistryFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        owned = broker.owned
+        def scaled_owned(arguments, environment, timeout, **kwargs):
+            return owned(arguments, environment, timeout * 0.03 if arguments[1] == 'stop' else timeout, **kwargs)
+        timing = patch.object(broker, 'owned', side_effect=scaled_owned)
+        timing.start()
+        self.addCleanup(timing.stop)
+
     def crashed_job(self):
         directory = self.root / self.job
         directory.mkdir()
@@ -33,6 +43,24 @@ class StopDeadlineTests(RegistryFixture, unittest.TestCase):
         clone = self.crashed_job()
         self.assertEqual(self.reconcile()[1]['kind'], 'reconciled-terminal')
         self.assert_cleaned(clone)
+
+    def test_default_grace_exceeds_owned_deadline_before_force_stop(self):
+        clone = self.crashed_job()
+        with self.assertRaises(subprocess.TimeoutExpired), preserved_shutdown_signals():
+            broker.owned([self.config['tart'], 'stop', clone.name], broker.environment_for(self.config), 30)
+        self.assertTrue((self.root / 'stop-waiting').exists())
+        self.assertFalse((self.root / 'forced-stop').exists())
+        self.assertTrue(clone.exists())
+
+    def test_stopped_vm_stop_fails_but_delete_is_quiet(self):
+        self.clone()
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            broker.owned([self.config['tart'], 'stop', 'partitura-job-' + self.job], broker.environment_for(self.config), 30)
+        self.assertEqual(caught.exception.returncode, 1)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            broker.destroy_vm(self.config, self.job)
+        self.assertEqual(output.getvalue(), '')
 
     def test_all_stop_budgets_leave_force_margin_and_tight_budget_uses_zero(self):
         for deadline, expected_grace, expected_budget in ((None, 30, 45), (220, 20, 30), (125, 0, 5)):
@@ -80,8 +108,8 @@ class StopDeadlineTests(RegistryFixture, unittest.TestCase):
             os.write(descriptor, b'next pass\n')
             self.assertEqual(path.read_bytes(), b'next pass\n')
             os.chmod(path, 0o644)
-            with self.assertRaisesRegex(ValueError, 'unsafe maintenance stderr'):
-                broker.prepare_maintenance_stderr(descriptor)
+            self.assertFalse(broker.prepare_maintenance_stderr(descriptor))
+            self.assertTrue(stat.S_ISCHR(os.fstat(descriptor).st_mode))
         finally:
             os.close(descriptor)
 

@@ -25,6 +25,7 @@ tart_old_moved=0
 tart_new_installed=0
 daemon_touched=0
 daemon_was_loaded=0
+log_created=0
 cleanup() {
   status=$?
   trap - EXIT
@@ -47,6 +48,7 @@ cleanup() {
       restore_managed_file manifest /Library/Partitura/NativeBuild/managed-files.json || rollback_failed=1
       restore_managed_file plist "$plist" || rollback_failed=1
     fi
+    if [ "$log_created" -eq 1 ]; then /bin/rm -f "$log" || rollback_failed=1; fi
     if [ "$daemon_touched" -eq 1 ] && [ "$daemon_was_loaded" -eq 1 ] && [ "$rollback_failed" -eq 0 ]; then
       /bin/launchctl bootstrap system "$plist" || rollback_failed=1
       /bin/launchctl print "system/$label" >/dev/null || rollback_failed=1
@@ -156,6 +158,7 @@ log=/Library/Partitura/NativeBuild/maintenance.stderr.log
 if [ -e "$log" ]; then
   [ -f "$log" ] && [ "$(/usr/bin/stat -f '%l:%Su:%Lp' "$log")" = "1:$account:600" ] || { echo "unsafe maintenance log" >&2; exit 75; }
 else
+  log_created=1
   /usr/bin/install -o "$account" -g staff -m 0600 /dev/null "$log"
 fi
 /usr/bin/ditto --rsrc "$stage/tart.app" "$tart_new"

@@ -452,3 +452,6 @@ hardlinks, foreign owners and permissive modes. Each pass truncates that same
 private inode at 512 KiB, and launchd enforces a 1 MiB file-size limit so even
 unexpected stderr output stays bounded. Exception command arguments, credentials
 and filesystem paths are excluded from these diagnostics.
+An unsafe or unusable inherited log redirects to `/dev/null` without touching
+the unsafe inode or blocking cleanup. Maintenance records the diagnostics failure
+in `maintenance-reason`; write and flush failures never interrupt recovery.

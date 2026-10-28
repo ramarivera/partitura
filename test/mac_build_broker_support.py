@@ -30,7 +30,7 @@ real_boot_id = broker.boot_id
 RealLoginKeychain = broker.LoginKeychain
 
 FAKE_TART = '''#!/usr/bin/python3
-import json, pathlib, shutil, sys, time
+import json, pathlib, shutil, signal, sys, time
 root = pathlib.Path(__file__).parent
 args = sys.argv[1:]
 with (root/'trace').open('a') as out: out.write(json.dumps(args)+'\\n')
@@ -42,16 +42,27 @@ if args[0]=='run' and scenario in ('boot-failure', 'host-key-failure'):
     sys.exit(42)
 if args[0]=='run':
     if any(not (root/'vms'/args[1]/name).stat().st_mode & 0o200 for name in ['config.json','disk.img','nvram.bin']): sys.exit(1)
-    time.sleep(120)
+    running=root/'vms'/args[1]/'.running'
+    running.touch()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try: time.sleep(120)
+    finally: running.unlink(missing_ok=True)
 # Model a guest that ignores graceful shutdown. With Tart's default 30-second
 # wait, owned()'s 30-second deadline kills stop before its forced-stop phase.
-# An explicit shorter grace reaches that phase and makes deletion possible.
+# Scale simulated Tart seconds to 30 ms; deadline tests scale owned() too.
+# Include startup/exit work so default grace cannot finish at the same deadline.
 if scenario=='force-stop-required':
     if args[0]=='stop':
+        if (root/'forced-stop').exists(): sys.exit(1)
         grace=int(args[args.index('--timeout')+1]) if '--timeout' in args else 30
-        if grace>=30: sys.exit(1)
+        (root/'stop-waiting').touch()
+        time.sleep(grace * 0.03 + 0.1)
         (root/'forced-stop').write_text(str(grace))
     if args[0]=='delete' and not (root/'forced-stop').exists(): sys.exit(1)
+elif args[0]=='stop':
+    running=root/'vms'/args[1]/'.running'
+    if not running.exists(): sys.exit(1)
+    running.unlink()
 if args[0]=='delete' and scenario in ('cleanup-failure', 'build-cleanup-failure'): sys.exit(1)
 if args[0]=='delete':
     target=root/'vms'/args[1]
