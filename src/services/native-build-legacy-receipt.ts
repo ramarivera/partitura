@@ -44,23 +44,37 @@ const FailureFields = {
     ),
   ),
 };
+const ArtifactSha256 = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u));
+const ArtifactBytes = Schema.Number.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(2147483648),
+);
 const ArtifactFields = {
-  artifactSha256: Schema.optionalKey(
-    Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
-  ),
-  artifactBytes: Schema.optionalKey(
-    Schema.Number.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(0),
-      Schema.isLessThanOrEqualTo(2147483648),
-    ),
-  ),
+  artifactSha256: Schema.optionalKey(ArtifactSha256),
+  artifactBytes: Schema.optionalKey(ArtifactBytes),
 };
 // A failed workflow may carry the repository's own logs as its artifact.
 export const FailedReceiptSchema = Schema.Struct({
   ...FailureFields,
   ...ArtifactFields,
   state: Schema.Literal("failed"),
+});
+export const SucceededReceiptSchema = Schema.Struct({
+  state: Schema.Literal("succeeded"),
+  artifactSha256: ArtifactSha256,
+  artifactBytes: ArtifactBytes,
+});
+// Running evidence can identify a stage, but cannot claim a terminal diagnostic
+// or artifact. Validate it before resetting the unavailable-lookup budget.
+export const RunningReceiptSchema = Schema.Struct({
+  state: Schema.Literal("running"),
+  stage: FailureFields.stage,
+  failureCode: Schema.optionalKey(Schema.Never),
+  artifactSha256: Schema.optionalKey(Schema.Never),
+  artifactBytes: Schema.optionalKey(Schema.Never),
+  bootExitCode: Schema.optionalKey(Schema.Never),
+  workflowExitCode: Schema.optionalKey(Schema.Never),
 });
 export const NativeBuildJobSchema = Schema.Struct({
   ...FailureFields,

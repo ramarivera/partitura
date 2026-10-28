@@ -161,8 +161,52 @@ it.live(
     }),
 );
 
+for (const malformed of [
+  { stage: "not-a-stage" },
+  { stage: "workflow", failureCode: "workflow-failed" },
+  { artifactBytes: 1 },
+  { artifactSha256: "not-a-hash" },
+  { bootExitCode: 0 },
+  { workflowExitCode: 0 },
+] as const)
+  it.live(
+    `malformed running receipt spends the error budget: ${JSON.stringify(malformed)}`,
+    () =>
+      Effect.promise(async () => {
+        const job = jobFixture();
+        let at = 0,
+          reads = 0;
+        const refresh = legacyReceiptRefresh({
+          read: async () => {
+            reads++;
+            return JSON.stringify({ ...job, state: "running", ...malformed });
+          },
+          save: async () => {
+            throw new Error("must not save malformed running receipt");
+          },
+          retain: () => () => {},
+          current: () => true,
+          now: () => at,
+        });
+        try {
+          refresh.track(job.job);
+          for (const next of [0, 1_000, 6_000, 36_000]) {
+            at = next;
+            await refresh.poll(job);
+          }
+          expect(reads).toBe(4);
+          at = 1_000_000;
+          for (let poll = 0; poll < 20; poll++) await refresh.poll(job);
+          expect(reads).toBe(4);
+          expect(job).toEqual(jobFixture());
+        } finally {
+          await refresh.close();
+        }
+      }),
+  );
+
 it.live(
-  "running receipts stop at the tracking deadline after one hour plus cleanup grace",
+  "running receipts get one final due lookup after the tracking deadline then stop",
   () =>
     Effect.promise(async () => {
       const job = jobFixture();
@@ -192,11 +236,15 @@ it.live(
         await refresh.poll(job);
         expect(reads).toBe(3);
         at++;
+        // The prior backoff still applies; crossing the deadline doesn't bypass it.
         for (let poll = 0; poll < 20; poll++)
           expect(refresh.poll(job)).toBeUndefined();
+        at += 30_000;
+        await refresh.poll(job);
+        expect(reads).toBe(4);
         at += 86_400_000;
         expect(refresh.poll(job)).toBeUndefined();
-        expect(reads).toBe(3);
+        expect(reads).toBe(4);
         expect(job).toEqual(jobFixture());
       } finally {
         await refresh.close();
