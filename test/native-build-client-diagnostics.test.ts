@@ -4,8 +4,57 @@ import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import { createNativeBuildClient } from "../src/services/native-build-client.js";
+import { legacyNativeFailure } from "../src/services/native-build-failure.js";
 
 import { payload, settled, setup } from "./native-build-client-helpers.js";
+
+for (const stage of ["clone", "artifact"] as const) {
+  it.live(
+    `reports a confirmed code-less ${stage} failure without claiming interruption`,
+    () =>
+      Effect.promise(async () => {
+        const fixture = await setup();
+        await writeFile(
+          fixture.configFile,
+          JSON.stringify({
+            trace: fixture.trace,
+            exitCode: 1,
+            receiptOverrides: { state: "failed", stage },
+          }),
+        );
+        const client = await createNativeBuildClient(fixture.config);
+        try {
+          const job = await client.start({
+            sessionId: "session-a",
+            workspacePath: fixture.workspace,
+            commit: fixture.commit,
+            pullRequest: 12,
+            action: "archive",
+          });
+          const status = await settled(client, job.job);
+          expect(status).toMatchObject({ state: "failed", stage });
+          expect(status.failureCode).toBeUndefined();
+          const diagnostic = {
+            failureCode: "build-failed",
+            message: `The native build failed during ${stage}.`,
+          };
+          expect(legacyNativeFailure(status)).toEqual(diagnostic);
+          await expect(
+            client.artifact("session-a", job.job),
+          ).rejects.toMatchObject({ diagnostic });
+          const stored = JSON.parse(
+            await readFile(
+              join(fixture.config.scratchRoot, `${job.job}.json`),
+              "utf8",
+            ),
+          );
+          expect(stored.failureCode).toBeUndefined();
+        } finally {
+          await client.close();
+        }
+      }),
+  );
+}
 
 for (const [stage, failureCode] of [
   ["unlock", "unlock-failed"],

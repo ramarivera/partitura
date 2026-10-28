@@ -22,6 +22,13 @@ const messages = {
  * receipt. Keep receipt lookup and idempotent broker cancellation available. */
 export const legacyNativeFailure = (job: NativeBuildJob) => {
   if (job.state !== "failed") return undefined;
+  // Only validated broker receipts supply a stage. A code-less receipt is
+  // still a confirmed failure, not a lost local transport outcome.
+  if (!job.failureCode && job.stage)
+    return {
+      failureCode: "build-failed",
+      message: `The native build failed during ${job.stage}.`,
+    };
   const failureCode = job.failureCode ?? "execution-interrupted";
   return { failureCode, message: messages[failureCode] };
 };
