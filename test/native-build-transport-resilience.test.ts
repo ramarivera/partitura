@@ -289,3 +289,39 @@ it.live(
       }),
     ),
 );
+
+it.live(
+  "materialization adds OpenSSH's required newline without changing generation identity",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* registryFixture(path("identity-no-newline"));
+        const key = fixture.key.replace(/\n$/u, "");
+        const generation = yield* fixture.state.addGeneration(
+          "primary",
+          fixture.metadata,
+          key,
+        );
+        const transport = yield* createNativeBuildTransport(fixture.state, {
+          suffix: "example.test",
+          executable: fixture.executable,
+        });
+        yield* transport.materialize(generation, key);
+        expect(transport.hasCredential(generation.id)).toBe(true);
+        expect(
+          yield* nativeIO(() =>
+            readFile(
+              join(fixture.state.generationPath(generation.id), "identity"),
+              "utf8",
+            ),
+          ),
+        ).toBe(`${key}\n`);
+        expect(fixture.state.equalityTag(fixture.metadata, key)).toBe(
+          generation.equalityTag,
+        );
+        expect(
+          fixture.state.equalityTag(fixture.metadata, `${key}\n`),
+        ).not.toBe(generation.equalityTag);
+      }),
+    ),
+);

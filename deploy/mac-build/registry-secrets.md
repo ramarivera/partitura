@@ -127,7 +127,9 @@ approved operator runs `/app/dist/operator/builder-secret.js` with `create`, `up
 or `validate`, explicit `--vault-id`, and `--item-id` for update/validate. Supply
 `--input-file <protected-file>` for create/update, using the file provider's exact
 8-field record format. Keys remain canonical base64 and preserve their original
-bytes. No literal key or token argument is accepted.
+bytes, with or without a trailing newline. Only the temporary SSH identity file
+adds the final newline OpenSSH requires; generation matching still uses the
+original bytes. No literal key or token argument is accepted.
 
 Disable core dumps with `ulimit -c 0` in the operator shell before running the tool.
 Choose exactly one of `--desktop-account <account-name>` or
