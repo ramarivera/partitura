@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
-import { lstat, realpath } from "node:fs/promises";
-import { dirname } from "node:path";
+import { lstat, readdir, realpath } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { Effect, Layer, Schema } from "effect";
 import { nativeIO } from "../../src/services/native-build-errors.js";
 import {
@@ -8,6 +8,7 @@ import {
   nativeFile,
 } from "../../src/services/native-build-file-io.js";
 import { NativeBuildFiles } from "../../src/services/native-build-files.js";
+import { NativeBuildJobSchema } from "../../src/services/native-build-legacy-receipt.js";
 import { NativeBuildProcesses } from "../../src/services/native-build-process.js";
 import {
   type NativeStateOptions,
@@ -27,13 +28,33 @@ import {
 
 /** Current ownership comes from a read-only, consistent durable DB snapshot.
  * A protected original snapshot alone is never enough to import a tenant job. */
-export function currentNativeImportOwner(db: Database, sessionId: string) {
+export function currentNativeImportOwner(
+  db: Database,
+  sessionId: string,
+  bindings: (typeof NativeImportOwners.Type)["originalOwners"],
+) {
   const run = db
-    .query<{ organization_id: string }, [string]>(
-      "SELECT organization_id FROM agent_run WHERE session_id = ?",
+    .query<{ organization_id: string; repository_id: string }, [string]>(
+      "SELECT organization_id, repository_id FROM agent_run WHERE session_id = ?",
     )
     .get(sessionId);
-  if (!run) return undefined;
+  const matches = Object.values(bindings).filter(
+    (owner) => owner.sessionId === sessionId,
+  );
+  const original = matches[0];
+  if (
+    !run ||
+    !original ||
+    matches.some(
+      (owner) =>
+        owner.pullRequest !== original.pullRequest ||
+        owner.repositoryId !== original.repositoryId ||
+        owner.organizationId !== original.organizationId,
+    ) ||
+    run.repository_id !== original.repositoryId ||
+    run.organization_id !== original.organizationId
+  )
+    return undefined;
   const pulls = new Set<number>();
   for (const row of db
     .query<{ payload_json: string }, [string]>(
@@ -71,10 +92,14 @@ export function currentNativeImportOwner(db: Database, sessionId: string) {
       /* Unrelated or incomplete action events aren't ownership evidence. */
     }
   }
-  const pullRequest = [...pulls][0];
-  return pulls.size === 1 && pullRequest !== undefined
-    ? { organizationId: run.organization_id, pullRequest }
-    : undefined;
+  // Run events expire before legacy jobs. A frozen, independently verified PR
+  // binding survives them; any remaining contradictory action evidence refuses.
+  if (pulls.size > 0 && (pulls.size !== 1 || !pulls.has(original.pullRequest)))
+    return undefined;
+  return {
+    organizationId: run.organization_id,
+    pullRequest: original.pullRequest,
+  };
 }
 
 async function openImportDatabase(path: string) {
@@ -146,6 +171,28 @@ export const executeNativeImport = Effect.fn("NativeImportOperator.execute")(
       nativeIO(() => openImportDatabase(plan.databasePath)),
       (db) => Effect.sync(() => db.close()),
     );
+    // Validate the frozen PR proof against each original job before any import.
+    for (const slot of plan.slots)
+      for (const name of yield* nativeIO(() => readdir(slot.legacyRoot))) {
+        if (!/^[a-f0-9]{32}\.json$/u.test(name)) continue;
+        const job = yield* nativeIO(async () =>
+          Schema.decodeUnknownSync(NativeBuildJobSchema)(
+            JSON.parse(
+              (
+                await nativeFile(join(slot.legacyRoot, name), 0o600, 65_536)
+              ).toString(),
+            ),
+            { onExcessProperty: "error" },
+          ),
+        );
+        const original = owners.originalOwners[job.job];
+        if (
+          !original ||
+          original.commit !== job.commit ||
+          original.sessionId !== job.sessionId
+        )
+          return yield* Effect.fail(new Error("native-import-proof-mismatch"));
+      }
     const inputs = plan.slots.map((slot) => ({
       ...slot.transport,
       builderId: slot.builderId,
@@ -156,7 +203,7 @@ export const executeNativeImport = Effect.fn("NativeImportOperator.execute")(
       acknowledgeQuiesced: true as const,
       originalOwners: owners.originalOwners,
       resolveOwner: async (sessionId: string) =>
-        currentNativeImportOwner(db, sessionId),
+        currentNativeImportOwner(db, sessionId, owners.originalOwners),
     }));
     const otherRoots = [
       ...new Set([
@@ -176,11 +223,11 @@ export const executeNativeImport = Effect.fn("NativeImportOperator.execute")(
     const transport = yield* createNativeBuildTransport(state, {
       suffix: plan.suffix,
     });
-    let imported = 0;
+    let matchedJobs = 0;
     for (const input of inputs)
-      imported += (yield* importLegacyNativeSlot(state, transport, input))
+      matchedJobs += (yield* importLegacyNativeSlot(state, transport, input))
         .importedJobs.length;
-    return { imported, slots: inputs.length };
+    return { matchedJobs, slots: inputs.length };
   },
   Effect.scoped,
 );

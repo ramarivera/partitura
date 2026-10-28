@@ -8,6 +8,8 @@ const Owner = Schema.Struct({
   sessionId: Schema.String.check(Schema.isMinLength(1)),
   organizationId: Schema.String.check(Schema.isMinLength(1)),
   pullRequest: Positive,
+  repositoryId: Schema.String.check(Schema.isMinLength(1)),
+  commit: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
 });
 export const NativeImportOwners = Schema.Struct({
   originalOwners: Schema.Record(

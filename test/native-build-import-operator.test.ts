@@ -21,11 +21,12 @@ const fixture = Effect.fn("Test.importOperator")(function* (name: string) {
   const databasePath = join(f.root, "gateway.sqlite");
   const db = new Database(databasePath, { create: true });
   db.exec(
-    "CREATE TABLE agent_run(session_id TEXT, organization_id TEXT, state TEXT); CREATE TABLE run_event(session_id TEXT, kind TEXT, payload_json TEXT)",
+    "CREATE TABLE agent_run(session_id TEXT, organization_id TEXT, repository_id TEXT, state TEXT); CREATE TABLE run_event(session_id TEXT, kind TEXT, payload_json TEXT)",
   );
-  db.query("INSERT INTO agent_run VALUES (?,?,?)").run(
+  db.query("INSERT INTO agent_run VALUES (?,?,?,?)").run(
     legacy.sessionId,
     "owner-org",
+    "repo-1",
     "succeeded",
   );
   const insert = (pullRequest: number) =>
@@ -53,7 +54,12 @@ const fixture = Effect.fn("Test.importOperator")(function* (name: string) {
     writeFile(
       ownerSnapshotPath,
       JSON.stringify({
-        originalOwners: legacy.input.originalOwners,
+        originalOwners: Object.fromEntries(
+          Object.entries(legacy.input.originalOwners).map(([id, owner]) => [
+            id,
+            { ...owner, repositoryId: "repo-1", commit: legacy.record.commit },
+          ]),
+        ),
         unresolved: [],
       }),
       { mode: 0o600 },
@@ -111,10 +117,10 @@ it.live(
         );
         expect(
           yield* executeNativeImport(f.plan, true, f.f.options.filesystem),
-        ).toEqual({ imported: 1, slots: 1 });
+        ).toEqual({ matchedJobs: 1, slots: 1 });
         expect(
           yield* executeNativeImport(f.plan, true, f.f.options.filesystem),
-        ).toEqual({ imported: 1, slots: 1 });
+        ).toEqual({ matchedJobs: 1, slots: 1 });
         expect(
           yield* Effect.promise(() => readFile(f.legacy.recordPath)),
         ).toEqual(original);
@@ -132,13 +138,23 @@ it.live(
       }),
     ),
 );
-for (const failure of ["active", "tenant", "pr", "acknowledgement"] as const) {
+for (const failure of [
+  "active",
+  "tenant",
+  "repository",
+  "proof",
+  "unsafe-db",
+  "pr",
+  "acknowledgement",
+] as const) {
   it.live(`offline operator refuses ${failure} without importing jobs`, () =>
     run(`import-cli-${failure}`, (f) =>
       Effect.gen(function* () {
         const db = new Database(f.plan.databasePath);
         if (failure === "active")
           db.exec("UPDATE agent_run SET state='running'");
+        if (failure === "repository")
+          db.exec("UPDATE agent_run SET repository_id='other-repo'");
         if (failure === "tenant")
           db.exec("UPDATE agent_run SET organization_id='other-org'");
         if (failure === "pr")
@@ -153,6 +169,19 @@ for (const failure of ["active", "tenant", "pr", "acknowledgement"] as const) {
             }),
           );
         db.close();
+        if (failure === "unsafe-db")
+          yield* Effect.promise(() => chmod(f.plan.databasePath, 0o644));
+        if (failure === "proof") {
+          const owners = JSON.parse(
+            yield* Effect.promise(() =>
+              readFile(f.plan.ownerSnapshotPath, "utf8"),
+            ),
+          );
+          owners.originalOwners[f.legacy.id].commit = "a".repeat(40);
+          yield* Effect.promise(() =>
+            writeFile(f.plan.ownerSnapshotPath, JSON.stringify(owners)),
+          );
+        }
         const result = yield* executeNativeImport(
           f.plan,
           failure !== "acknowledgement",
@@ -173,7 +202,7 @@ it("durable owner lookup refuses multiple PR claims in a session", () => {
   const db = new Database(":memory:");
   try {
     db.exec(
-      "CREATE TABLE agent_run(session_id TEXT, organization_id TEXT);CREATE TABLE run_event(session_id TEXT,kind TEXT,payload_json TEXT);INSERT INTO agent_run VALUES ('s','o')",
+      "CREATE TABLE agent_run(session_id TEXT, organization_id TEXT, repository_id TEXT);CREATE TABLE run_event(session_id TEXT,kind TEXT,payload_json TEXT);INSERT INTO agent_run VALUES ('s','o','r')",
     );
     for (const pullRequest of [1, 2])
       db.query("INSERT INTO run_event VALUES ('s','action',?)").run(
@@ -186,8 +215,31 @@ it("durable owner lookup refuses multiple PR claims in a session", () => {
           },
         }),
       );
-    expect(currentNativeImportOwner(db, "s")).toBeUndefined();
+    expect(
+      currentNativeImportOwner(db, "s", {
+        ["a".repeat(32)]: {
+          sessionId: "s",
+          organizationId: "o",
+          repositoryId: "r",
+          commit: "e".repeat(40),
+          pullRequest: 1,
+        },
+      }),
+    ).toBeUndefined();
   } finally {
     db.close();
   }
 });
+
+it.live("verified PR bindings survive expired action events", () =>
+  run("import-cli-expired-events", (f) =>
+    Effect.gen(function* () {
+      const db = new Database(f.plan.databasePath);
+      db.exec("DELETE FROM run_event");
+      db.close();
+      expect(
+        yield* executeNativeImport(f.plan, true, f.f.options.filesystem),
+      ).toEqual({ matchedJobs: 1, slots: 1 });
+    }),
+  ),
+);

@@ -145,16 +145,19 @@ the engine. Supply every legacy and worker root in `otherRoots`. No inline key,
 SSH config parser or provider token is accepted.
 
 The owner snapshot uses `{ "originalOwners": { "<job-id>": { "sessionId": "...",
-"organizationId": "...", "pullRequest": 123 } }, "unresolved": [] }`. Prepare
+"organizationId": "...", "pullRequest": 123, "repositoryId": "...", "commit": "<40-hex>" } }, "unresolved": [] }`. Prepare
 it while quiesced from durable session bindings and independently verified
 repository/PR identity. A worker's claimed PR number alone is not verification.
-The command cross-checks current durable session ownership and native-start
-activity. Missing or ambiguous PR evidence, changed tenants, unresolved owners,
+The command cross-checks current durable session and repository ownership,
+the original job commit, and any surviving native-start activity. Expired activity
+does not erase independently verified PR bindings in this protected snapshot.
+Contradictory or ambiguous PR evidence, changed tenants/repositories, unresolved owners,
 unsafe database files and active runs refuse migration. The stopped-gateway flag
 is an operator acknowledgement; the native state lock cannot stop a separate
 legacy gateway from accepting work.
 
-Output contains only imported-job and slot counts. A later-slot failure can leave
+Output contains only matched-job and slot counts. Repeated matches are counted
+again on a resume; the count does not mean newly created jobs. A later-slot failure can leave
 earlier imports committed. Preserve state and retry the same inputs; existing
 per-job identity, original-byte checks and artifact copy checkpoints make retries
 resumable. Originals are never rewritten. Provider journal initialization remains
