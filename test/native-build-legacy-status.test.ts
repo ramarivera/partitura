@@ -1,7 +1,11 @@
 import { expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import type { NativeBuildJob } from "../src/services/native-build-legacy-receipt.js";
-import { legacyReceiptRefresh } from "../src/services/native-build-legacy-status.js";
+import {
+  LEGACY_NATIVE_BUILD_RECEIPT_GRACE_MS,
+  LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS,
+  legacyReceiptRefresh,
+} from "../src/services/native-build-legacy-status.js";
 
 const jobFixture = (): NativeBuildJob => ({
   job: "a".repeat(32),
@@ -47,7 +51,7 @@ it("only success or a pre-ownership disk refusal proves cancel can be suppressed
 });
 
 it.live(
-  "uncertain status refresh is single-flight, nonblocking and bounded by backoff and four attempts",
+  "offline status refresh is single-flight, nonblocking and bounded by backoff and four failures",
   () =>
     Effect.promise(async () => {
       let at = 0,
@@ -93,11 +97,108 @@ it.live(
           await refresh.poll(job);
         }
         expect(reads).toBe(4);
-        at = 1e9;
+        at = 1_000_000; // Still inside the lifetime cap; only the failure budget stops reads.
         for (let poll = 0; poll < 20; poll++) await refresh.poll(job);
         expect(reads).toBe(4);
       } finally {
         gate.reject(new Error("test closed"));
+        await refresh.close();
+      }
+    }),
+);
+
+it.live(
+  "running receipts reset intermittent failures and their retry backoff before workflow failure",
+  () =>
+    Effect.promise(async () => {
+      const job = jobFixture();
+      let at = 0,
+        reads = 0,
+        writes = 0;
+      const refresh = legacyReceiptRefresh({
+        read: async () => {
+          reads++;
+          if (reads > 12)
+            return JSON.stringify({
+              ...job,
+              stage: "workflow",
+              failureCode: "workflow-failed",
+            });
+          if (reads % 2 === 1) throw new Error("intermittent SSH failure");
+          return JSON.stringify({ ...job, state: "running" });
+        },
+        save: async () => {
+          writes++;
+        },
+        retain: () => () => {},
+        current: () => true,
+        now: () => at,
+      });
+      try {
+        refresh.track(job.job);
+        for (let round = 0; round < 6; round++) {
+          await refresh.poll(job); // One failure, followed by a valid running read.
+          expect(reads).toBe(round * 2 + 1);
+          at += 999;
+          expect(refresh.poll(job)).toBeUndefined();
+          at++;
+          await refresh.poll(job);
+          expect(reads).toBe(round * 2 + 2);
+          at += 29_999;
+          expect(refresh.poll(job)).toBeUndefined();
+          at++;
+        }
+        await refresh.poll(job);
+        expect(reads).toBe(13);
+        expect(writes).toBe(1);
+        expect(job).toMatchObject({
+          state: "failed",
+          failureCode: "workflow-failed",
+        });
+      } finally {
+        await refresh.close();
+      }
+    }),
+);
+
+it.live(
+  "running receipts stop at the tracking deadline after one hour plus cleanup grace",
+  () =>
+    Effect.promise(async () => {
+      const job = jobFixture();
+      const started = 123_456;
+      let at = started,
+        reads = 0;
+      const refresh = legacyReceiptRefresh({
+        read: async () => {
+          reads++;
+          return JSON.stringify({ ...job, state: "running" });
+        },
+        save: async () => {
+          throw new Error("must not save a running receipt");
+        },
+        retain: () => () => {},
+        current: () => true,
+        now: () => at,
+      });
+      try {
+        refresh.track(job.job);
+        await refresh.poll(job);
+        expect(reads).toBe(1);
+        at = started + LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS;
+        await refresh.poll(job);
+        expect(reads).toBe(2); // The post-timeout grace still permits a final receipt.
+        at += LEGACY_NATIVE_BUILD_RECEIPT_GRACE_MS - 1;
+        await refresh.poll(job);
+        expect(reads).toBe(3);
+        at++;
+        for (let poll = 0; poll < 20; poll++)
+          expect(refresh.poll(job)).toBeUndefined();
+        at += 86_400_000;
+        expect(refresh.poll(job)).toBeUndefined();
+        expect(reads).toBe(3);
+        expect(job).toEqual(jobFixture());
+      } finally {
         await refresh.close();
       }
     }),

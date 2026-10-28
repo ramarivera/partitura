@@ -3,15 +3,8 @@ import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import { createNativeBuildClient } from "../src/services/native-build-client.js";
+import { waitUntil } from "./fixtures/native-build-wait.js";
 import { settled, setup } from "./native-build-client-helpers.js";
-
-const waitUntil = async (ready: () => Promise<boolean>) => {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    if (await ready()) return;
-    await Bun.sleep(5);
-  }
-  throw new Error("Fixture did not reach expected state");
-};
 
 for (const failureCode of [
   "cleanup-required",

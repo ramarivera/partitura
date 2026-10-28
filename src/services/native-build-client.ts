@@ -28,7 +28,10 @@ export {
   validateNativeBuildDiagnostics,
 } from "./native-build-legacy-receipt.js";
 
-import { legacyReceiptRefresh } from "./native-build-legacy-status.js";
+import {
+  LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS,
+  legacyReceiptRefresh,
+} from "./native-build-legacy-status.js";
 import { workerIdentityCommand } from "./worker-security.js";
 
 export interface NativeBuildConfig {
@@ -82,7 +85,10 @@ async function privatePath(path: string, directory: boolean) {
 }
 
 /** Gateway-owned SSH only. No worker receives the transport key or host target. */
-export async function createNativeBuildClient(config: NativeBuildConfig) {
+export async function createNativeBuildClient(
+  config: NativeBuildConfig,
+  internal: { readonly makeReceiptRefresh?: typeof legacyReceiptRefresh } = {},
+) {
   const terminalRetentionMs =
     config.terminalRetentionMs ?? DEFAULT_TERMINAL_RETENTION_MS;
   if (!Number.isSafeInteger(terminalRetentionMs) || terminalRetentionMs < 1)
@@ -337,7 +343,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
       pruneFailure = error;
     }
   };
-  const receipts = legacyReceiptRefresh({
+  const receipts = (internal.makeReceiptRefresh ?? legacyReceiptRefresh)({
     read: async (id, signal) =>
       (
         await remote(`status ${id}`, {
@@ -499,7 +505,7 @@ export async function createNativeBuildClient(config: NativeBuildConfig) {
               ...(secretInput === undefined
                 ? {}
                 : { inputPrefix: secretInput }),
-              timeout: 3_600_000,
+              timeout: LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS,
               signal: abort.signal,
               acceptFailedReceipt: true,
             },

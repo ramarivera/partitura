@@ -5,8 +5,12 @@ import {
   validateNativeBuildDiagnostics,
 } from "./native-build-legacy-receipt.js";
 
-/** Legacy status reads stay local. Only uncertain submissions need a bounded,
- * background receipt refresh; polling never waits on an offline SSH connection. */
+export const LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS = 3_600_000;
+/** Allow final cleanup/receipt publication after the SSH run deadline. */
+export const LEGACY_NATIVE_BUILD_RECEIPT_GRACE_MS = 5 * 60_000;
+
+/** Legacy status reads stay local. Background refresh bounds unavailable lookups
+ * while keeping live builds observable; polling never waits on offline SSH. */
 export const legacyReceiptRefresh = (deps: {
   readonly read: (job: string, signal: AbortSignal) => Promise<string>;
   readonly save: (job: NativeBuildJob) => Promise<void>;
@@ -14,7 +18,10 @@ export const legacyReceiptRefresh = (deps: {
   readonly current: (job: NativeBuildJob) => boolean;
   readonly now?: () => number;
 }) => {
-  const pending = new Map<string, { attempts: number; next: number }>();
+  const pending = new Map<
+    string,
+    { failures: number; next: number; expiresAt: number }
+  >();
   const flights = new Map<
     string,
     { task: Promise<void>; abort: AbortController }
@@ -25,7 +32,15 @@ export const legacyReceiptRefresh = (deps: {
   };
   let closed = false;
   return {
-    track: (id: string) => pending.set(id, { attempts: 0, next: 0 }),
+    track: (id: string) =>
+      pending.set(id, {
+        failures: 0,
+        next: 0,
+        expiresAt:
+          now() +
+          LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS +
+          LEGACY_NATIVE_BUILD_RECEIPT_GRACE_MS,
+      }),
     confirmed: (job: NativeBuildJob) =>
       job.state === "succeeded" ||
       // Only this refusal precedes runner/VM/keychain ownership. Other failed
@@ -40,10 +55,11 @@ export const legacyReceiptRefresh = (deps: {
       if (closed || !retry) return;
       const flight = flights.get(job.job);
       if (flight) return flight.task;
-      if (retry.attempts >= 4 || now() < retry.next) return;
-      retry.attempts++;
-      const backoff =
-        [1_000, 5_000, 30_000, 30_000][retry.attempts - 1] ?? 30_000;
+      if (retry.failures >= 4 || now() < retry.next || now() >= retry.expiresAt)
+        return;
+      // A live broker may still be building long after the SSH run was lost.
+      // Successful non-terminal reads back off without spending the error budget.
+      let backoff = 30_000;
       const release = deps.retain(job.job);
       const abort = new AbortController();
       const task = (async () => {
@@ -62,7 +78,10 @@ export const legacyReceiptRefresh = (deps: {
             response.action !== job.action
           )
             throw new Error("Invalid native build receipt identity");
-          if ("state" in response && response.state === "running") return;
+          if ("state" in response && response.state === "running") {
+            retry.failures = 0;
+            return;
+          }
           const failure =
             Schema.decodeUnknownSync(FailedReceiptSchema)(response);
           validateNativeBuildDiagnostics(failure);
@@ -72,6 +91,9 @@ export const legacyReceiptRefresh = (deps: {
           Object.assign(job, updated);
           confirm(job.job);
         } catch {
+          retry.failures++;
+          backoff =
+            [1_000, 5_000, 30_000, 30_000][retry.failures - 1] ?? 30_000;
           await Effect.runPromise(
             Effect.logWarning("Native failure receipt unavailable", {
               code: "native-receipt-unavailable",

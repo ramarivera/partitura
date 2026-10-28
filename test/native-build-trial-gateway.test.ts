@@ -8,16 +8,9 @@ import {
   InstallationRepo,
   RunRepo,
 } from "../src/services/store/repositories.js";
-import { setup } from "./native-build-client-helpers.js";
+import { waitUntil } from "./fixtures/native-build-wait.js";
+import { observedStatusClient, setup } from "./native-build-client-helpers.js";
 import { createAuthorityFixture } from "./session-authority-fixture.js";
-
-const waitUntil = async (ready: () => Promise<boolean>) => {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    if (await ready()) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("Fixture did not reach expected state");
-};
 
 for (const state of ["succeeded", "failed"] as const)
   it.live(
@@ -80,7 +73,9 @@ for (const invalid of [
           f.configFile,
           JSON.stringify({ trace: f.trace, crashRun: true }),
         );
-        const client = await createNativeBuildClient(f.config);
+        const observed = await observedStatusClient(f.config);
+        const { client } = observed;
+        const barrier = join(f.workspace, "status-receipt");
         let jobId = "";
         try {
           const job = await client.start({
@@ -104,6 +99,7 @@ for (const invalid of [
             f.configFile,
             JSON.stringify({
               trace: f.trace,
+              statusBarrier: barrier,
               statusReceipt: {
                 job: invalid === "foreign-job" ? "f".repeat(32) : job.job,
                 commit:
@@ -121,11 +117,13 @@ for (const invalid of [
             "utf8",
           );
           await client.status("session-a", job.job);
-          await waitUntil(async () =>
-            (await readFile(f.trace, "utf8")).includes(`status ${job.job}`),
+          await waitUntil(() => Bun.file(`${barrier}.entered`).exists());
+          expect(observed.completed()).toBe(0);
+          // Release the fake response only when we're joining its processing.
+          await observed.settleStatus(job.job, () =>
+            writeFile(barrier, "release"),
           );
-          // Wait for the fake SSH receipt, without another remote attempt.
-          await new Promise((resolve) => setTimeout(resolve, 25));
+          expect(observed.completed()).toBe(1);
           if (!invalid)
             await waitUntil(
               async () =>
@@ -163,6 +161,7 @@ for (const invalid of [
             ).toMatchObject(status);
           }
         } finally {
+          await writeFile(barrier, "release");
           await client.close();
         }
         if (!invalid) {

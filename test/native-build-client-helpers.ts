@@ -1,7 +1,11 @@
 import { spawnSync } from "node:child_process";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { createNativeBuildClient } from "../src/services/native-build-client.js";
+import {
+  createNativeBuildClient,
+  type NativeBuildConfig,
+} from "../src/services/native-build-client.js";
+import { legacyReceiptRefresh } from "../src/services/native-build-legacy-status.js";
 import { testPaths } from "./fixtures/paths.js";
 
 export const path = testPaths();
@@ -113,4 +117,53 @@ export async function settled(
     await Bun.sleep(10);
   }
   throw new Error("Native fixture job didn't settle");
+}
+
+/** Join the exact background flight, including receipt validation/persistence. */
+export async function observedStatusClient(
+  config: NativeBuildConfig,
+  now?: () => number,
+) {
+  const flights = new Map<
+    string,
+    { task: Promise<void>; completion: Promise<void> }
+  >();
+  let reads = 0,
+    completed = 0;
+  const client = await createNativeBuildClient(config, {
+    makeReceiptRefresh: (deps) => {
+      const refresh = legacyReceiptRefresh({
+        ...deps,
+        ...(now ? { now } : {}),
+        read: (...args) => {
+          reads++;
+          return deps.read(...args);
+        },
+      });
+      return {
+        ...refresh,
+        poll: (job) => {
+          const flight = refresh.poll(job);
+          if (flight && flights.get(job.job)?.task !== flight) {
+            const completion = flight.then(() => {
+              completed++;
+            });
+            flights.set(job.job, { task: flight, completion });
+          }
+          return flight;
+        },
+      };
+    },
+  });
+  return {
+    client,
+    reads: () => reads,
+    completed: () => completed,
+    settleStatus: async (job: string, release?: () => Promise<unknown>) => {
+      const flight = flights.get(job);
+      if (!flight) throw new Error("No status flight to join");
+      await release?.();
+      await flight.completion;
+    },
+  };
 }
