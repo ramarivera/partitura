@@ -58,8 +58,9 @@ export const legacyReceiptRefresh = (deps: {
       const flight = flights.get(job.job);
       if (flight) return flight.task;
       if (retry.failures >= 4 || now() < retry.next) return;
-      // A live broker may still be building long after the SSH run was lost.
-      // Successful non-terminal reads back off without spending the error budget.
+      // Valid running replies reset consecutive failures before the deadline.
+      // A due lookup after it can still recover a terminal receipt; a late
+      // running reply exhausts tracking, while errors retain the four-read cap.
       let backoff = 30_000;
       const release = deps.retain(job.job);
       const abort = new AbortController();

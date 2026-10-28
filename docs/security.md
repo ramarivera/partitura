@@ -444,3 +444,14 @@ code acceptance from approved mounts/image deployment, provider provisioning,
 legacy drain/import, each sealed host-profile change and smoke build. No merge
 authorizes those operations. Preserve original legacy records for deliberate
 rollback; never feed registry metadata to an older decoder or run two state owners.
+
+The native maintenance LaunchDaemon writes sanitized failure diagnostics to the
+build-account-owned 0600 `maintenance.stderr.log` in the root-owned
+`/Library/Partitura/NativeBuild` directory. The installer rejects symlinks,
+hardlinks, foreign owners and permissive modes. Each pass truncates that same
+private inode at 512 KiB, and launchd enforces a 1 MiB file-size limit so even
+unexpected stderr output stays bounded. Exception command arguments, credentials
+and filesystem paths are excluded from these diagnostics.
+An unsafe or unusable inherited log redirects to `/dev/null` without touching
+the unsafe inode or blocking cleanup. Maintenance records the diagnostics failure
+in `maintenance-reason`; write and flush failures never interrupt recovery.

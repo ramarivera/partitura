@@ -341,3 +341,44 @@ it.live("a retired job cannot be re-created by a delayed receipt", () =>
     }
   }),
 );
+
+it.live(
+  "four SSH failures after the receipt deadline exhaust late lookups",
+  () =>
+    Effect.promise(async () => {
+      let at = 0;
+      let reads = 0;
+      const job = jobFixture();
+      const refresh = legacyReceiptRefresh({
+        read: async () => {
+          reads++;
+          throw new Error("offline");
+        },
+        save: async () => {
+          throw new Error("must not save an unavailable receipt");
+        },
+        retain: () => () => {},
+        current: () => true,
+        now: () => at,
+      });
+      try {
+        refresh.track(job.job);
+        at =
+          LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS +
+          LEGACY_NATIVE_BUILD_RECEIPT_GRACE_MS +
+          60_000;
+        for (const backoff of [1_000, 5_000, 30_000, 30_000]) {
+          await refresh.poll(job);
+          expect(refresh.poll(job)).toBeUndefined();
+          at += backoff;
+        }
+        expect(reads).toBe(4);
+        at += 24 * 60 * 60 * 1_000;
+        for (let count = 0; count < 20; count++) await refresh.poll(job);
+        expect(reads).toBe(4);
+        expect(job.failureCode).toBeUndefined();
+      } finally {
+        await refresh.close();
+      }
+    }),
+);

@@ -430,8 +430,15 @@ def main(argv=()):
     if argv:
         if list(argv) not in (['local-maintenance'], ['local-relock']) or 'SSH_ORIGINAL_COMMAND' in os.environ or 'SSH_CONNECTION' in os.environ:
             raise ValueError('unsupported local invocation')
+        diagnostics_ready = argv[0] != 'local-maintenance' or api.prepare_maintenance_stderr()
         config = api.load_config()
-        return api.local_maintenance(config) if argv[0] == 'local-maintenance' else api.keychain_relock_entry(config)
+        if argv[0] == 'local-relock':
+            return api.keychain_relock_entry(config)
+        result = api.local_maintenance(config)
+        reason = Path(config['root']) / 'maintenance-reason'
+        if not diagnostics_ready and api.read_state(reason) is None:
+            api.durable_write(reason, 'diagnostics-unavailable\n')
+        return result
     request = api.parse_command(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
     config = api.load_config()
     if request[0] in ('health', 'run-v2', 'reconcile') or config.get('profile') == 'registry-only':

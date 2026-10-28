@@ -90,7 +90,7 @@ class NativeHostFixture:
         return config
 
 
-    def exercise_install_rollback(self, failure, was_loaded, corrupt_restored=False):
+    def exercise_install_rollback(self, failure, was_loaded, corrupt_restored=False, existing_log=False):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -106,6 +106,10 @@ class NativeHostFixture:
             shims = Path(directory) / "shims"
             (host / "Library/LaunchDaemons").mkdir(parents=True)
             native_root.mkdir(parents=True)
+            maintenance_log = native_root / 'maintenance.stderr.log'
+            if existing_log:
+                maintenance_log.write_bytes(b'previous diagnostics\n')
+                maintenance_log.chmod(0o600)
             dropin.parent.mkdir(parents=True)
             source_executable.parent.mkdir(parents=True)
             stage.mkdir()
@@ -232,6 +236,7 @@ elif name == "stat":
         "%u": str(metadata.st_uid),
         "%g": str(metadata.st_gid),
         "%Lp": format(metadata.st_mode & 0o777, "o"),
+        "%l:%Su:%Lp": str(metadata.st_nlink) + ":" + {self.settings["account"]!r} + ":" + format(metadata.st_mode & 0o777, "o"),
     }}
     print(values[args[1]])
 elif name == "sshd":
@@ -372,6 +377,10 @@ elif name not in ("codesign", "chown", "plutil"):
 
             failed_update = run_installer()
             self.assertEqual(failed_update.returncode, 75, failed_update.stdout + failed_update.stderr)
+            self.assertEqual(maintenance_log.exists(), existing_log)
+            if existing_log:
+                self.assertEqual(maintenance_log.read_bytes(), b'previous diagnostics\n')
+                self.assertEqual(stat.S_IMODE(maintenance_log.stat().st_mode), 0o600)
             if corrupt_restored:
                 return # The real verifier rejected drift and retained both fences.
             self.assertEqual(installed_executable.read_bytes(), old_tart)

@@ -123,18 +123,29 @@ def destroy_vm(config, job, deadline=None):
         if seconds <= 0:
             raise TimeoutError('cleanup deadline')
         return seconds
+    stop_error = None
     try:
-        api.owned([config['tart'], 'stop', vm], environment, remaining(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass  # An already stopped VM still needs deletion and its readback.
+        budget = remaining()
+        # Tart 2.41.1 Stop.swift sends SIGKILL after its graceful timeout,
+        # including timeout=0. Leave ten seconds inside owned() for that kill
+        # and Tart's exit; owned()'s own group reap has a separate reserve.
+        grace = max(0, min(30, int(budget - 10)))
+        api.owned([config['tart'], 'stop', vm, '--timeout', str(grace)], environment, budget, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as error:
+        # An already stopped VM still needs deletion and its readback.
+        stop_error = error
     try:
         api.owned([config['tart'], 'delete', vm], environment, remaining(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         # Tart reports an error for an already absent VM, including a clone
         # that failed before creating it. The filesystem readback is decisive.
         if os.path.lexists(Path(config['tartHome']) / 'vms' / vm):
+            if stop_error is not None:
+                api.maintenance_error(stop_error, job)
             raise
     if os.path.lexists(Path(config['tartHome']) / 'vms' / vm):
+        if stop_error is not None:
+            api.maintenance_error(stop_error, job)
         raise ValueError('VM still exists after deletion')
 
 

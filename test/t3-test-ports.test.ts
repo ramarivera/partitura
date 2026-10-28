@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import { testPaths } from "./fixtures/paths.js";
@@ -24,7 +23,7 @@ it("leases disjoint blocks for concurrent fixtures outside the outgoing connecti
 });
 
 it.live(
-  "a killed owner's stale lease is reclaimed with an unwritable home",
+  "kernel leases span different TMPDIRs and a killed owner leaves no stale lease",
   () =>
     Effect.promise(async () => {
       const temp = path("temporary");
@@ -47,7 +46,6 @@ await lease.release();`,
           stderr: "pipe",
         },
       );
-      const root = join(temp, `partitura-t3-test-ports-${process.getuid?.()}`);
       let concurrent: Awaited<ReturnType<typeof leaseT3TestPorts>> | undefined;
       let recovered: Awaited<ReturnType<typeof leaseT3TestPorts>> | undefined;
       try {
@@ -56,16 +54,13 @@ await lease.release();`,
         reader.releaseLock();
         expect(first.done).toBe(false);
         const base = Number(new TextDecoder().decode(first.value).trim());
-        expect(base).toBe(10_000);
-        concurrent = await leaseT3TestPorts(root);
+        expect(base).toBeGreaterThanOrEqual(10_000);
+        concurrent = await leaseT3TestPorts();
         expect(concurrent.base).not.toBe(base);
         child.kill("SIGKILL");
         await child.exited;
-        // The dead owner's file remains, but the kernel released its lock.
-        expect(
-          await Bun.file(join(root, String(base), "owner.lock")).exists(),
-        ).toBe(true);
-        recovered = await leaseT3TestPorts(root);
+        // The child used a different TMPDIR. The shared kernel name is now free.
+        recovered = await leaseT3TestPorts();
         expect(recovered.base).toBe(base);
       } finally {
         child.kill("SIGKILL");

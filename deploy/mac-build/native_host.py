@@ -19,7 +19,7 @@ import sys
 import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
-INSTALL_HOST_SHA256 = "b8863ad7ae1f203b8889dcd198536683e599206cd59ad4275fe0930fa41d1009"
+INSTALL_HOST_SHA256 = "e7405c2cd4703f9c3fd688e024588de9def95dac9acbe3b6cf1caad5015eb112"
 PROVISION_SHA256 = "bd7ddf90480cd7dcf35c79c406c802da00d8f38de75b997826ddba2d38e8cc8c"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 STAGED_FILES = {

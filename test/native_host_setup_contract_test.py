@@ -103,6 +103,9 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         plist = plistlib.loads(MODULE.maintenance_plist('builder'))
         self.assertEqual(plist['UserName'], 'builder')
         self.assertEqual(plist['StartInterval'], 60)
+        self.assertEqual(plist['StandardErrorPath'], '/Library/Partitura/NativeBuild/maintenance.stderr.log')
+        for key in ('SoftResourceLimits', 'HardResourceLimits'):
+            self.assertEqual(plist[key]['FileSize'], 1048576)
         self.assertTrue(plist['RunAtLoad'])
         self.assertEqual(plist['ProgramArguments'][-3:], ['-I', str(MODULE.ROOT_BROKER), 'local-maintenance'])
         self.assertIn('-i', plist['ProgramArguments'])

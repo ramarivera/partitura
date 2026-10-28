@@ -113,6 +113,13 @@ def inspect_job_directory(directory):
     return files, relock
 
 
+def job_execution_evidence(config, job, kind, receipt):
+    """Shared daemon/reconcile predicate; validate even terminal job debris."""
+    _, unlock = api.inspect_job_directory(Path(config['root']) / job)
+    clone = api.verify_owned_clone(config, job)
+    return unlock or (kind == 'known' and receipt['state'] == 'running') or clone
+
+
 def reconcile_locked(config, requested, daemon=False, deadline=None, allow_blocked=False, clear_blocked=True):
     """The caller owns runner.lock. No PID or marker timestamp grants authority."""
     root = Path(config['root'])
@@ -130,6 +137,7 @@ def reconcile_locked(config, requested, daemon=False, deadline=None, allow_block
     # Publish a fence even for an unknown/inconsistent directory before touching it.
     api.durable_write(root / 'cleanup-required', sorted(jobs)[0] + '\n')
     try:
+        # Execution evidence must stay in sync with resource_jobs() below.
         # Validate all evidence first. Do not partly clean an untrusted state set.
         states = {}
         unlock = api.fence_job(root / 'unlock-attempt')
@@ -139,12 +147,7 @@ def reconcile_locked(config, requested, daemon=False, deadline=None, allow_block
         for job in sorted(jobs):
             kind, receipt = api.registry_status(config, job)
             states[job] = kind, receipt
-            _, private_unlock_evidence = api.inspect_job_directory(root / job)
-            relock |= private_unlock_evidence
-            if kind == 'known' and receipt['state'] == 'running':
-                relock = True
-            if api.verify_owned_clone(config, job):
-                relock = True  # Missing-marker migration debris is conservative.
+            relock |= job_execution_evidence(config, job, kind, receipt)
         api.durable_write(root / 'recovery.json', json.dumps(dict(jobs=sorted(jobs), relock=relock)) + '\n')
         for job in sorted(jobs):
             if time.monotonic() >= deadline:
@@ -184,7 +187,8 @@ def reconcile_locked(config, requested, daemon=False, deadline=None, allow_block
         if allow_blocked and clear_blocked:
             api.durable_remove(root / 'maintenance-blocked')
         return 'reconciled', sorted(jobs)
-    except Exception:
+    except Exception as error:
+        api.maintenance_error(error, sorted(jobs)[0])
         api.durable_write(root / 'cleanup-required', sorted(jobs)[0] + '\n')
         return 'cleanup-required', sorted(jobs)
 
@@ -363,6 +367,9 @@ def prune_history(config, protected_jobs=()):
 def resource_jobs(config, jobs, runner):
     """Under runner.lock, distinguish inert input debris from execution resources."""
     root = Path(config['root'])
+    # Keep execution evidence in sync with reconcile_locked(): fences, recovery
+    # relock, post-capacity runner stages, private unlock state, running receipt
+    # and owned clones. The daemon also protects relock=False recovery jobs.
     live = {job for name in api.FENCES if (job := api.fence_job(root / name))}
     recovery = api.json_state(root / 'recovery.json')
     if recovery:
@@ -371,8 +378,7 @@ def resource_jobs(config, jobs, runner):
         live.add(runner['job'])
     for job in jobs:
         kind, receipt = api.registry_status(config, job)
-        _, unlock = api.inspect_job_directory(root / job)
-        if unlock or (kind == 'known' and receipt['state'] == 'running') or api.verify_owned_clone(config, job):
+        if job_execution_evidence(config, job, kind, receipt):
             live.add(job)
     return live
 
@@ -446,12 +452,14 @@ def local_maintenance(config):
             else:
                 result = 'cleanup-required'
                 reason = 'inventory-incomplete'
-        except ValueError:
+        except ValueError as error:
+            api.maintenance_error(error)
             api.durable_write(root / 'maintenance-blocked', 'inventory-invalid\n')
             result = 'cleanup-required'
             reason = 'inventory-invalid'
             complete = False
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as error:
+            api.maintenance_error(error)
             # IO failures are retryable. No operator-only flag is manufactured.
             result = 'cleanup-required'
             reason = 'inventory-unavailable'

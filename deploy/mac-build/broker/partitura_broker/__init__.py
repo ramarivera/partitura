@@ -45,7 +45,7 @@ HISTORY_PASS_SECONDS = 10
 MAX_STATE = 4096
 TERMINAL = ('succeeded', 'failed', 'cancelled')
 FENCES = ('active-vm', 'cleanup-required', 'unlock-attempt', 'keychain-relock-pending')
-MAINTENANCE_REASONS = ('inventory-unavailable', 'inventory-invalid', 'inventory-incomplete', 'runner-owner-missing', 'runner-owner-unavailable', 'runner-owner-alive', 'runner-owner-ambiguous', 'keychain-relock-pending', 'cleanup-required')
+MAINTENANCE_REASONS = ('inventory-unavailable', 'inventory-invalid', 'inventory-incomplete', 'runner-owner-missing', 'runner-owner-unavailable', 'runner-owner-alive', 'runner-owner-ambiguous', 'keychain-relock-pending', 'cleanup-required', 'diagnostics-unavailable')
 
 
 from .identity import parse_command, sealed, load_config, validate_keychain_paths, KeychainError, validate_keychain_policy, policy_evidence, KeychainSettings, LoginKeychain
@@ -53,3 +53,5 @@ from .vm import verify_vm_capacity, receive, stop, capture_boot_log, diagnostic_
 from .state import durable_write, sync_directory, durable_remove, record, housekeeping_counts, record_housekeeping, prune_artifacts, environment_for, destroy_vm, ignore_shutdown_signals, private_directory, read_state, unique_object, json_state, fence_job, admission_epoch, initialize_epoch, emit, runner_state, process_start, owner_block_reason, obligations, run_lock, disk_space, require_disk, DiskUnavailable, registry_status, health
 from .recovery import tombstone, verify_owned_clone, macos_build, daemon_relock_qualified, keychain_relock_entry, relock_keychain, remove_partial_input, inspect_job_directory, reconcile_locked, reconcile, InventoryPending, inventory_obligations, boot_id, maintenance_state, record_maintenance, history_gc_due, prune_history, local_maintenance, refuse
 from .execution import run_v2, cancel_job, RunnerMarker, run_job, main, cli
+
+from .diagnostics import maintenance_error, prepare_maintenance_stderr
