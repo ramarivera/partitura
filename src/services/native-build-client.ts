@@ -29,6 +29,10 @@ export {
 } from "./native-build-legacy-receipt.js";
 
 import {
+  legacyNativeFailure,
+  NativeArtifactFailure,
+} from "./native-build-failure.js";
+import {
   LEGACY_NATIVE_BUILD_RUN_TIMEOUT_MS,
   legacyReceiptRefresh,
 } from "./native-build-legacy-status.js";
@@ -582,8 +586,11 @@ export async function createNativeBuildClient(
         job.state === "failed" &&
         job.failureCode === "workflow-failed" &&
         job.artifactSha256 !== undefined;
-      if (job.state !== "succeeded" && !workflowLogs)
+      if (job.state !== "succeeded" && !workflowLogs) {
+        const diagnostic = legacyNativeFailure(job);
+        if (diagnostic) throw NativeArtifactFailure.unavailable(diagnostic);
         throw new Error("Native build has no deliverable artifact");
+      }
       const path = join(config.scratchRoot, `${job.job}.tar`);
       const otherConsumers = artifactLeases.get(job.job) ?? 0;
       const release = retainArtifact(job.job);

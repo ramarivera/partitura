@@ -18,6 +18,10 @@ import {
   type createNativeBuildClient,
   deliverNativeArtifact,
 } from "./native-build-client.js";
+import {
+  legacyNativeFailure,
+  NativeArtifactFailure,
+} from "./native-build-failure.js";
 import type { NativeBuildFleet } from "./native-build-fleet.js";
 import type { NativeBuildJobs } from "./native-build-jobs.js";
 import {
@@ -370,7 +374,11 @@ export const makeLinearHostToolsForRun = ({
                 case "native_build_status": {
                   if (typeof job !== "string") return fail("job is required");
                   const status = await client.status(run.sessionId, job);
-                  const result = { ...status, builder };
+                  const result = {
+                    ...status,
+                    ...legacyNativeFailure(status),
+                    builder,
+                  };
                   return textResult(JSON.stringify(result), result);
                 }
                 case "native_build_artifact": {
@@ -409,7 +417,9 @@ export const makeLinearHostToolsForRun = ({
                 default:
                   return fail(`Unknown native build tool: ${request.toolName}`);
               }
-            } catch {
+            } catch (error) {
+              if (error instanceof NativeArtifactFailure)
+                return textResult(error.message, error.diagnostic, true);
               return fail("Native build operation failed");
             }
           });
