@@ -26,11 +26,20 @@ executes the built helper with EOF, without SDK initialization or credentials.
 Bun gateway/operator bundles never import the SDK at runtime.
 
 The published wrapper retries after `DesktopSessionExpiredError`, including
-reinitialization. The WASM request amplification hasn't been bounded by an offline
-method-count test. Local costs of 8 initialization units and 4 read units are
-operation reservations, not a measured hard network-request guarantee. Unknown
-amplification blocks live enablement; qualification may require larger cost
-reservations within the same account allocation.
+reinitialization. The Node helper installs a scoped fetch guard before importing
+the SDK. Each init permits at most 8 underlying fetch invocations; each whole-item
+read permits at most 4, including SDK retries and reauthentication. Cold runtime
+reads therefore fit the 12-unit reservation; warm reads fit 4. A guard expires
+after 10 seconds per IPC request, aborts outstanding fetches, refuses redirects
+and denies retries from completed/expired async contexts. Outside a request,
+fetch is refused. Writes have a separate 12-invocation ceiling.
+
+These are local invocation limits, not measurements of quota-accounted server
+operations or proof that every successful operation fits. The parent process
+deadline/reaping still covers a blocked Node event loop. Qualification must verify
+successful SDK operation under these limits before live enablement. An exhausted
+cap fails closed with `provider-unavailable`; deadline expiry uses
+`provider-timeout`. No SDK exception text crosses the pipe.
 
 ## Private helper and operation service
 
