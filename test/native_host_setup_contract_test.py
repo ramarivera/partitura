@@ -362,6 +362,15 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
                         (repository / "deploy/mac-build/remote_login.py").read_bytes(),
                     ),
                 )
+                real_run = subprocess.run
+                def damaged_remote(args, **kwargs):
+                    result = real_run(args, **kwargs)
+                    if args[-1].endswith(":deploy/mac-build/remote_login.py"):
+                        result.stdout += b"# unpinned Remote Login change\n"
+                    return result
+                with patch.object(MODULE.subprocess, "run", side_effect=damaged_remote):
+                    with self.assertRaisesRegex(MODULE.NativeHostError, "remote_login.py differs from the copy pinned"):
+                        MODULE.checked_source_blobs(config)
                 helper = repository / "deploy/mac-build/host_setup_validation.py"
                 helper_bytes = helper.read_bytes()
                 helper.write_bytes(helper_bytes + b"# unpinned change\n")

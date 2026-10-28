@@ -8,6 +8,9 @@ class PartituraNativeHostInstallTest(NativeHostFixture, unittest.TestCase):
                     self.exercise_install_rollback(failure, was_loaded)
 
 
+    def test_loopback_acl_rollback_refusal_keeps_fences_instead_of_exit_75(self):
+        self.exercise_install_rollback('loopback', False, rollback_refused=True)
+
     def test_restored_payload_drift_keeps_installer_fences_in_real_main(self):
         self.exercise_install_rollback('sshd', False, corrupt_restored=True)
 

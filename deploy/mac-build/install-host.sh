@@ -61,8 +61,11 @@ cleanup() {
       /bin/launchctl bootstrap system "$plist" || rollback_failed=1
       /bin/launchctl print "system/$label" >/dev/null || rollback_failed=1
     fi
-  elif [ "$tart_old_moved" -eq 1 ]; then
-    /bin/rm -rf "$tart_previous" || rollback_failed=1
+  else
+    if [ "$loopback_touched" -eq 1 ]; then
+      /usr/bin/python3 -I "$stage/maintenance_ssh.py" finish --account "$account" --backup "$preflight/loopback" || rollback_failed=1
+    fi
+    if [ "$tart_old_moved" -eq 1 ]; then /bin/rm -rf "$tart_previous" || rollback_failed=1; fi
   fi
   /bin/rm -rf "$tart_new" || rollback_failed=1
   if [ "$rollback_failed" -ne 0 ]; then
@@ -135,6 +138,7 @@ normalize_sshd_keywords() {
   /usr/bin/awk '{ key = $1; sub(/^[^ \t]+/, tolower(key)); print }'
 }
 effective="$(/usr/sbin/sshd -T -f "$preflight/sshd_config" -C user="$account",host=localhost,addr=127.0.0.1 | normalize_sshd_keywords)"
+/usr/bin/python3 -I "$stage/maintenance_ssh.py" policy --account "$account" <<<"$effective"
 for expected in \
   "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys" \
   "exposeauthinfo yes" \
@@ -196,6 +200,7 @@ atomic_install "$stage/managed-files.json" 0444 /Library/Partitura/NativeBuild/m
 /bin/mv -f "$dropin.new" "$dropin"
 /usr/sbin/sshd -t
 live_effective="$(/usr/sbin/sshd -T -C user="$account",host=localhost,addr=127.0.0.1 | normalize_sshd_keywords)"
+/usr/bin/python3 -I "$stage/maintenance_ssh.py" policy --account "$account" <<<"$live_effective"
 for expected in \
   "authorizedkeysfile /Library/Partitura/NativeBuild/authorized_keys /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys" \
   "exposeauthinfo yes" \

@@ -457,7 +457,8 @@ the unsafe inode or blocking cleanup. Maintenance records the diagnostics failur
 in `maintenance-reason`; write and flush failures never interrupt recovery.
 
 Maintenance reaches external Tart storage through a loopback SSH session, using
-macOS Remote Login's existing "Allow full disk access for remote users" grant.
+macOS Remote Login's "Allow full disk access for remote users" prerequisite.
+This is the one macOS setting scripts cannot enable; it must already be on.
 The LaunchDaemon starts `/usr/bin/ssh` as the unprivileged build account, with
 an installer-generated ed25519 identity at
 `/Library/Partitura/NativeBuild/maintenance-ssh/id_ed25519`, account-owned mode
@@ -466,6 +467,9 @@ command argument, environment value or log. Its root-owned authorized entry has
 `restrict`, a loopback-only `from` list and the existing forced broker command.
 The global ForceCommand stays unchanged. `ExposeAuthInfo yes` lets that broker
 compare sshd's verified public key against the root-owned maintenance public key.
+The proof path must match sshd's literal `/tmp/sshauth.` name with its 15-character
+suffix. Effective sshd policy pins `PermitUserEnvironment no` and rejects every
+AcceptEnv pattern that could admit an SSH_* variable, including repeated lines.
 Only that identity on loopback can use the fixed maintenance/check verbs; it
 cannot use build, artifact or gateway control verbs. Gateway keys keep their
 existing verbs and cannot select maintenance, even from loopback. Missing or
@@ -474,22 +478,36 @@ unsafe authenticated-key proof fails closed on loopback after installation.
 The client ignores user SSH config and agents, forbids forwarding and connection
 sharing, and requires strict host authentication against a root-owned known_hosts
 file derived from the host's own protected `/etc/ssh/ssh_host_ed25519_key.pub`.
-There is no TOFU or ssh-keyscan. The installer checks Remote Login ACL admission
-with the existing restricted-account helper and adds only the build account when
-needed. It tests volume enumeration inside sshd before activating the daemon and
-runs a real maintenance pass after releasing the installation lock. Failed
-pre-activation checks restore files, generated identity/pins, ACL membership and
-daemon state. A post-commit maintenance failure reports failure with the installed
-configuration retained for diagnosis. No TCC database is read and no new FDA path
-grant is required. The existing Remote Login prerequisite includes its full-disk
-access checkbox; an ineffective grant produces `storage-access-denied` and a
-fixed checkbox hint in health and private diagnostics.
+There is no TOFU or ssh-keyscan. Before mutation, provisioning tests an external
+volume read through the incoming operator Remote Login SSH session. Fresh hosts
+have no maintenance identity yet. Within the installation transaction, the
+restricted account's Remote Login ACL and existing AllowUsers admission are
+applied before testing the actual pinned loopback key. Pre-activation failure
+restores public files/pins, admission, identity and daemon state. A valid key is
+reused; damage triggers transactional repair. Root never parses account-controlled
+private bytes, and private keys are not copied into rollback scratch. An old key
+is renamed inside its sealed directory until commit or rollback. Failed rollback
+keeps admission fenced. The post-commit pass explicitly reads Tart storage even
+when the runner lock is busy or no work is due. It does not prove launchd/TCC
+inheritance on the real Mac.
+
+Only explicit Tart directory read/list EPERM produces `storage-access-denied`
+and the fixed Remote Login checkbox hint. EACCES and mutation EPERM report
+`storage-permission-denied`; other probe IO errors report `inventory-unavailable`.
+Separate probe evidence cannot overwrite the locked recovery reason. The check
+verb is read-only even on denial. Real admitted passes write a boot-bound heartbeat
+before scheduling; health reports `maintenance-stale` after 240 seconds without
+one. This is below the 900-second work-retry ceiling, and no-work, backoff and
+busy-lock passes still beat. Missing or invalid heartbeat evidence fails closed.
 
 SSH disconnect HUP/TERM signals do not interrupt the bounded maintenance pass.
-Existing atomic writes and durable recovery fences still protect SIGKILL/reboot
-failures. The remote broker checks/truncates the same private log inode before a
-pass because its SSH stderr is a pipe; launchd's SSH client still has the 1 MiB
-output limit. Build/reconcile SSH sessions, boot inventory triggered by the daemon,
+sshd starts the remote process in a separate session. launchd's ExitTimeOut only
+bounds the SSH client, so the remote cleanup deadline and durable fences cover
+orphaned passes, SIGKILL and reboot. Installer self-test timeouts kill and reap
+the local sudo/ssh process group. The remote broker dup2s the validated log
+onto fd 2, or /dev/null on refusal, replacing a potentially dead SSH pipe. It
+checks/truncates the private inode and applies its own 1 MiB file-size limit;
+launchd's client limit is separate. Build/reconcile SSH sessions, boot inventory triggered by the daemon,
 and the installer self-tests all use the same sshd boundary. Operator-only bootstrap,
 base preparation/qualification and the root install guard remain explicit host
 setup operations, run in the already approved operator SSH context, not new daemons.

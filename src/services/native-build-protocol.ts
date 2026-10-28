@@ -135,7 +135,7 @@ const envelopeKeys: Record<string, readonly string[]> = {
   "reconciled-unknown": ["job", "epoch", "nonce", "reconciledJobs"],
   "cleanup-required": ["job"],
   "keychain-relock-pending": ["job"],
-  error: ["code"],
+  error: ["code", "storageAccessHint"],
 };
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -195,15 +195,19 @@ export function decodeBrokerEnvelope(
     )
   )
     invalid();
+  if (
+    value.storageAccessHint !== undefined &&
+    (value.storageAccessHint !==
+      "Enable Remote Login > Allow full disk access for remote users. This macOS setting cannot be set by a script." ||
+      !(
+        (value.kind === "health" &&
+          Array.isArray(value.reasons) &&
+          value.reasons.includes("storage-access-denied")) ||
+        (value.kind === "error" && value.code === "storage-access-denied")
+      ))
+  )
+    invalid();
   if (value.kind === "health") {
-    if (
-      value.storageAccessHint !== undefined &&
-      (value.storageAccessHint !==
-        "Verify Remote Login > Allow full disk access for remote users is enabled on this host." ||
-        !Array.isArray(value.reasons) ||
-        !value.reasons.includes("storage-access-denied"))
-    )
-      invalid();
     if (
       (value.maintenanceJobId !== undefined &&
         !validId(value.maintenanceJobId)) ||

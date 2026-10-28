@@ -90,7 +90,7 @@ class NativeHostFixture:
         return config
 
 
-    def exercise_install_rollback(self, failure, was_loaded, corrupt_restored=False, existing_log=False):
+    def exercise_install_rollback(self, failure, was_loaded, corrupt_restored=False, existing_log=False, rollback_refused=False):
         installer = (ROOT / "deploy/mac-build/install-host.sh").read_text()
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -194,6 +194,7 @@ class NativeHostFixture:
             fail_once.touch()
             shim_source = f'''#!/usr/bin/env python3
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -284,6 +285,10 @@ elif name == "launchctl":
             Path({str(fail_once)!r}).unlink()
             sys.exit(1)
 elif name == "python3":
+    with Path({str(Path(directory) / "python-calls")!r}).open("a") as calls:
+        calls.write(json.dumps(args) + "\\n")
+    if "rollback" in args and {rollback_refused!r}:
+        sys.exit(1) # The real helper propagates dseditgroup -d failure.
     if "check" in args and {failure!r} == "loopback" and Path({str(fail_once)!r}).exists():
         Path({str(fail_once)!r}).unlink()
         sys.exit(1)
@@ -381,17 +386,25 @@ elif name not in ("codesign", "chown", "plutil", "python3"):
                     code = launcher.main(argv)
                 self.assertIsNotNone(result)
                 self.assertEqual(code, 0 if result.returncode == 0 else 1)
-                self.assertEqual((runtime / 'cleanup-required').exists(), corrupt_restored)
-                self.assertEqual((runtime / 'maintenance-blocked').exists(), corrupt_restored)
+                self.assertEqual((runtime / 'cleanup-required').exists(), corrupt_restored or rollback_refused)
+                self.assertEqual((runtime / 'maintenance-blocked').exists(), corrupt_restored or rollback_refused)
                 return result
 
             failed_update = run_installer()
-            self.assertEqual(failed_update.returncode, 75, failed_update.stdout + failed_update.stderr)
+            self.assertEqual(failed_update.returncode, 1 if rollback_refused else 75, failed_update.stdout + failed_update.stderr)
+            calls = [json.loads(line) for line in (Path(directory) / "python-calls").read_text().splitlines()]
+            rolled_back = [args for args in calls if "rollback" in args]
+            if any("prepare" in args for args in calls):
+                self.assertEqual(len(rolled_back), 1)
+                self.assertIn("--backup", rolled_back[0])
+                self.assertTrue(rolled_back[0][-1].endswith("/loopback"))
+            if failure == "loopback":
+                self.assertTrue(rolled_back, "failed loopback check must undo the prepared identity")
             self.assertEqual(maintenance_log.exists(), existing_log)
             if existing_log:
                 self.assertEqual(maintenance_log.read_bytes(), b'previous diagnostics\n')
                 self.assertEqual(stat.S_IMODE(maintenance_log.stat().st_mode), 0o600)
-            if corrupt_restored:
+            if corrupt_restored or rollback_refused:
                 return # The real verifier rejected drift and retained both fences.
             self.assertEqual(installed_executable.read_bytes(), old_tart)
             self.assertEqual(daemon_state.exists(), was_loaded)

@@ -11,35 +11,35 @@ import subprocess
 def admit(account, apply=False, run=subprocess.run):
     if not re.fullmatch(r'[a-z][a-z0-9_-]{0,30}', account) or account == 'root':
         raise ValueError('invalid build account')
-    groups = run(['/usr/bin/id', '-Gn', account], capture_output=True, text=True, check=True).stdout.split()
+    groups = run(['/usr/bin/id', '-Gn', account], capture_output=True, text=True, check=True, timeout=15).stdout.split()
     if {'admin', 'wheel'} & set(groups):
         raise ValueError('build account must be unprivileged')
-    policy = run(['/usr/sbin/sshd', '-T', '-C', f'user={account},host=localhost,addr=127.0.0.1'], capture_output=True, text=True, check=True).stdout
+    policy = run(['/usr/sbin/sshd', '-T', '-C', f'user={account},host=localhost,addr=127.0.0.1'], capture_output=True, text=True, check=True, timeout=15).stdout
     fields = {key.lower(): value for key, value in (line.split(' ', 1) for line in policy.splitlines() if ' ' in line)}
     required = {
         'forcecommand': '/usr/bin/python3 /Library/Partitura/NativeBuild/broker.py',
         'passwordauthentication': 'no', 'kbdinteractiveauthentication': 'no',
         'authenticationmethods': 'publickey', 'allowtcpforwarding': 'no',
-        'allowagentforwarding': 'no', 'x11forwarding': 'no', 'permittty': 'no',
+        'allowagentforwarding': 'no', 'x11forwarding': 'no', 'permittty': 'no', 'permituserenvironment': 'no',
     }
     authorized = '/Library/Partitura/NativeBuild/authorized_keys'
     if fields.get('authorizedkeysfile') not in (authorized, authorized + ' /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys') or any(fields.get(key) != value for key, value in required.items()):
         raise ValueError('install and verify the restricted native SSH policy first')
     # An absent service ACL means macOS already admits all local accounts.
-    group = run(['/usr/bin/dscl', '.', '-read', '/Groups/com.apple.access_ssh'], capture_output=True, text=True)
+    group = run(['/usr/bin/dscl', '.', '-read', '/Groups/com.apple.access_ssh'], capture_output=True, text=True, timeout=15)
     if group.returncode:
         if 'eDSRecordNotFound' not in group.stderr:
             raise ValueError('could not inspect Remote Login service ACL')
         return 'Remote Login has no selected-user ACL; no membership changed'
-    member = run(['/usr/sbin/dseditgroup', '-o', 'checkmember', '-m', account, 'com.apple.access_ssh'], capture_output=True, text=True)
+    member = run(['/usr/sbin/dseditgroup', '-o', 'checkmember', '-m', account, 'com.apple.access_ssh'], capture_output=True, text=True, timeout=15)
     if member.returncode == 0:
         return 'Restricted build account already admitted to Remote Login'
     if f'no {account} is NOT a member of com.apple.access_ssh' not in member.stdout:
         raise ValueError('could not verify Remote Login membership')
     if not apply:
         return 'Restricted build account needs explicit Remote Login membership approval'
-    run(['/usr/sbin/dseditgroup', '-o', 'edit', '-a', account, '-t', 'user', 'com.apple.access_ssh'], capture_output=True, text=True, check=True)
-    run(['/usr/sbin/dseditgroup', '-o', 'checkmember', '-m', account, 'com.apple.access_ssh'], capture_output=True, text=True, check=True)
+    run(['/usr/sbin/dseditgroup', '-o', 'edit', '-a', account, '-t', 'user', 'com.apple.access_ssh'], capture_output=True, text=True, check=True, timeout=15)
+    run(['/usr/sbin/dseditgroup', '-o', 'checkmember', '-m', account, 'com.apple.access_ssh'], capture_output=True, text=True, check=True, timeout=15)
     return 'Restricted build account admitted to Remote Login; membership verified'
 
 

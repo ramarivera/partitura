@@ -19,8 +19,8 @@ import sys
 import tempfile
 
 # Updated with install-host.sh; both files are pinned by the source commit.
-INSTALL_HOST_SHA256 = "c4037174e565d1b7b9364f1142456d6b781f8b5a729800bb63b05d038d8fa918"
-PROVISION_SHA256 = "3e0090761e80894be139f71ca2ffefe282c203e83ba9db23406b6233bb6a630e"
+INSTALL_HOST_SHA256 = "5940063b204b37fdf6a60a8cf885a93016f243dd8e5d5105f595580c9ce69bc4"
+PROVISION_SHA256 = "d137301fcdff6865a8c92134ad0aaa908a8f13e1adecc6af9adb663dfc9b434b"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 MAINTENANCE_TARGET = '/Library/Partitura/NativeBuild/maintenance_ssh.py'
 REMOTE_LOGIN_TARGET = '/Library/Partitura/NativeBuild/remote_login.py'

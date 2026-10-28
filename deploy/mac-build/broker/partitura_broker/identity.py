@@ -94,10 +94,11 @@ def load_config(allow_storage_denial=False):
         try:
             info = path.lstat()
         except OSError as error:
-            if api.storage_access_denied(config, error):
-                api.record_storage_denial(config)
-                if allow_storage_denial:
-                    continue  # Health reports the denial without trusting/admitting storage.
+            if api.tart_path(config, path):
+                probe = api.StorageProbeError(config, error)
+                if allow_storage_denial and key == 'tartHome':
+                    continue  # Health can still inspect the accessible runtime root.
+                raise probe from None
             raise
         if not path.is_absolute() or path.resolve() != path or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError('unsafe private runtime directory')

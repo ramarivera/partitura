@@ -63,7 +63,7 @@ BROKER_POLICY_KEYS = {"host_id", "protocol", "profile", "minimum_free_bytes", "d
 # Pinned host_setup.py bytes pin its helpers transitively: each helper is hashed
 # before it runs, so a drifted working tree can't execute unpinned code.
 HOST_SETUP_VALIDATION_SHA256 = "a1a7d417d746549a4afc4e22f38e1d0370bcb0ca0da04239ebdd64b5bb5c2efa"
-MAINTENANCE_SSH_SHA256 = "ef5f5bc8e9d101de4e1c53070dba87052948157363b40bdccdc42d7bcaf4e14d"
+MAINTENANCE_SSH_SHA256 = "8ef7c42ed494fd008e99da853be4a82ca4e69c7b98cb12ba6c527d5e596c8874"
 BROKER_ARCHIVE_SHA256 = "2b4725bb9e6c9e872e58828a787afd2490bfde51dc349428540b671293ca12c0"
 
 
@@ -182,6 +182,7 @@ def sshd_dropin(account: str) -> str:
             "    AllowAgentForwarding no",
             "    X11Forwarding no",
             "    PermitTTY no",
+            "    PermitUserEnvironment no",
             "    ClientAliveInterval 15",
             "    ClientAliveCountMax 3",
             "",
@@ -354,6 +355,8 @@ def checked_source_blobs(config: dict) -> tuple[bytes, ...]:
     if sha256_bytes(qualifier) != source["qualifier_sha256"]:
         raise NativeHostError("pinned Partitura qualifier hash differs")
     extra = [subprocess.run(["/usr/bin/git", "-C", str(repository), "show", f"{commit}:deploy/mac-build/{name}"], check=True, capture_output=True, env=git_environment()).stdout for name in ("maintenance_ssh.py", "remote_login.py")]
+    if sha256_bytes(extra[1]) != _maintenance.REMOTE_LOGIN_SHA256:
+        raise NativeHostError("remote_login.py differs from the copy pinned by maintenance_ssh.py")
     return blobs[0], blobs[1], qualifier, blobs[2], blobs[3], blobs[4], *extra
 
 
@@ -463,6 +466,7 @@ def sshd_effective(settings: dict, run=subprocess.run) -> dict[str, str]:
         check=True,
         timeout=15,
     )
+    _maintenance.verify_environment(result.stdout)
     return {
         key.lower(): value
         for line in result.stdout.splitlines()
@@ -614,24 +618,10 @@ def check_existing_files(
 
 
 def verify_effective_sshd(settings: dict, effective: dict[str, str]) -> None:
-    expected = {
-        "authorizedkeysfile": str(ROOT_AUTHORIZED_KEYS) + " /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys",
-        "exposeauthinfo": "yes",
-        "passwordauthentication": "no",
-        "kbdinteractiveauthentication": "no",
-        "authenticationmethods": "publickey",
-        "forcecommand": FORCED_COMMAND,
-        "allowtcpforwarding": "no",
-        "allowagentforwarding": "no",
-        "x11forwarding": "no",
-        "permittty": "no",
-        "permituserenvironment": "no",
-        "clientaliveinterval": "15",
-        "clientalivecountmax": "3",
-    }
-    mismatch = [key for key, value in expected.items() if effective.get(key) != value]
-    if mismatch:
-        raise NativeHostError("effective sshd policy differs: " + ", ".join(mismatch))
+    try:
+        _maintenance.verify_effective_sshd(settings['account'], effective)
+    except ValueError as error:
+        raise NativeHostError(str(error)) from None
 
 
 def check(settings: object, *, system: str | None = None, run=subprocess.run) -> int:

@@ -507,6 +507,12 @@ def main(argv=()):
 def cli(argv=()):
     try:
         return api.main(argv)
+    except api.StorageProbeError as error:
+        if os.environ.get('SSH_ORIGINAL_COMMAND') == 'health':
+            api.emit(error.config, 'error', code=error.reason, **({'storageAccessHint': api.STORAGE_ACCESS_HINT} if error.reason == 'storage-access-denied' else {}))
+        else:
+            api.storage_result(error)
+        return 1
     except Exception:
         command = os.environ.get('SSH_ORIGINAL_COMMAND', '')
         if command.split(' ', 1)[0] in ('health', 'run-v2', 'reconcile'):

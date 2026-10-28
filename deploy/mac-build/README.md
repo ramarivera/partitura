@@ -186,7 +186,11 @@ against the hashes pinned in the script, plus Tart's signing team. It also check
   103-byte Unix socket limit;
 - build storage is a dedicated volume with ownership enabled and 120 GB free,
   never the system disk or a Time Machine destination's container;
-- the internal disk meets the sealed floor, initially 50 GiB, and Remote Login is on.
+- the internal disk meets the sealed floor, initially 50 GiB;
+- Remote Login is on, including **System Settings > General > Sharing > Remote
+  Login > Allow full disk access for remote users**. This is the one macOS
+  setting no script can set. Enable it before provisioning; no new launcher
+  grant or build-account GUI login is needed.
 
 After base preparation, staging and final readback measure available-to-account
 bytes on both actual runtime roots with `statvfs`. Each root must satisfy the
@@ -650,40 +654,66 @@ verified with sshd's `ExposeAuthInfo` record, and only on loopback. That key can
 run build/status/artifact verbs; gateway keys cannot select maintenance or its
 read-only `partitura-maintenance-check` preflight verb.
 
-Remote Login must already be enabled with **Allow full disk access for remote
-users** as part of the host's existing Remote Login prerequisite. This reuses
-sshd-keygen-wrapper's system grant for removable/external storage when the daemon
-user has no GUI session. It adds no launcher binary, per-path FDA grant, login
-session or System Settings step. The installer never reads TCC.db. It checks the
-restricted account's Remote Login ACL with `remote_login.py`, adding only that
-account if the selected-user ACL needs it, under the existing password-authorized
-installation. It does not enable Remote Login or change its privacy policy.
+Remote Login's **Allow full disk access for remote users** prerequisite reuses
+sshd-keygen-wrapper's system grant for external storage without a GUI session.
+The installer cannot enable that macOS privacy setting and never reads TCC.db.
+Before creating any files, accounts, volumes or credentials, the read-only
+provisioning preflight enumerates the external target or source volume through
+its incoming operator Remote Login SSH session. A fresh host has no maintenance
+key yet, so this tests the same sshd FDA boundary without creating one. Run
+preflight over SSH, not a local Terminal session. An EPERM fails immediately with
+the exact checkbox instruction. Once the maintenance identity exists, the
+transaction also tests its pinned loopback session before activation.
+
+The password-authorized transaction admits only the restricted build account to
+both the selected-user Remote Login ACL and an existing sshd AllowUsers list,
+before testing loopback access. Both changes roll back if installation fails.
+DenyUsers/DenyGroups and incompatible AllowGroups remain explicit refusals.
 
 Root installation creates the host-local key once at
 `/Library/Partitura/NativeBuild/maintenance-ssh/id_ed25519`, owned by the build
 account mode 0400. The parent directory and the public key, loopback-only restricted
 authorized_keys file and known_hosts file are root-owned. Reruns verify and reuse
-the key and do not append duplicate authorized entries. The SSH client uses
+the valid key and do not append duplicate authorized entries. Damaged modes,
+hardlinks, corrupt key data or a failed public binding trigger a transactional
+repair. Root parses an existing private key only through unprivileged sudo as
+the build account. Rollback scratch contains public data only; repair renames the
+old private inode inside the sealed install directory, restores it on failure,
+and removes it after commit. The SSH client uses
 BatchMode, IdentitiesOnly, no agent/config/multiplexing/forwarding, and strict
 host-key checking. known_hosts is pinned from the root-owned local
 `/etc/ssh/ssh_host_ed25519_key.pub`; it never trusts a network discovery result.
 
-Before daemon activation the transaction runs a read-only loopback storage check
-under the new dispatcher, while the installation lock is still held. After the
-guard commits/releases that lock, the wrapper runs one real loopback maintenance
-pass and requires the storage enumeration marker plus exit 0. This avoids a false
-pass caused by a busy runner lock. A pre-activation failure rolls back the new
-identity/pins, account ACL addition, managed files and daemon state; a post-commit
-failure returns nonzero and leaves the installed state for diagnosis. A denied
-Tart-volume operation records `storage-access-denied` and points to
-**Remote Login > Allow full disk access for remote users** in health and stderr.
-An unrelated EIO remains `inventory-unavailable`. No successful test is inferred
-from a TCC database row. Runtime TCC inheritance through an sshd session launched
-by the daemon must still be qualified on the actual Mac before rollout.
+Before daemon activation the transaction runs `partitura-maintenance-check`
+while holding the installation lock. This verb only reads Tart home and its
+`vms` directory. It never writes state, takes runner.lock or truncates the log,
+even on denial. After commit the wrapper requests a real maintenance pass. Both
+verbs explicitly enumerate storage before any no-work, backoff or busy-lock
+return. The storage marker proves read access, not that cleanup ran, and neither
+self-test starts launchd. Pre-activation failure restores identity/pins, account
+admission, files and daemon state. A post-commit failure retains the installation
+for diagnosis. SSH exit 255 reports transport/authentication/host-pin failure;
+sudo/broker refusal is a separate category. Only EPERM on explicit Tart directory
+reads yields `storage-access-denied` and the FDA checkbox hint. EACCES or
+mutation/immutable-flag EPERM yields `storage-permission-denied`; other probe IO
+failures yield `inventory-unavailable`. Probe reasons have a separate durable
+file so they cannot overwrite locked recovery observations.
+
+Every admitted real pass records its boot id and timestamp before work scheduling.
+Health blocks with `maintenance-stale` after 240 seconds without a valid heartbeat,
+or immediately for a missing, malformed or previous-boot heartbeat. This allows a
+120-second cleanup plus two 60-second launch intervals, below the 900-second work
+backoff ceiling. Even no-work, busy-lock and backoff passes refresh it, so broken
+keys, auth-proof drift or a failed loopback listener cannot silently stay ready.
+Runtime TCC inheritance through a daemon-started sshd session still needs the
+actual Mac check before rollout.
 
 On SSH disconnect, the remote maintenance handler ignores HUP/TERM/INT until its
 bounded fenced pass finishes, preserving its exit result when the client remains.
-Atomic fsync/rename writes and durable fences cover SIGKILL/reboot. Local-only
+sshd creates a separate session, so launchd's ExitTimeOut bounds only the SSH
+client, not the remote pass. Its own 120-second cleanup deadline and durable
+fences cover an orphan, SIGKILL, reboot or an overlapping reinstall. An installer
+self-test timeout kills and reaps the local sudo/ssh process group. Local-only
 `local-maintenance` and `local-relock` invocations retain their previous rejection
 of SSH environment/argv. There is one maintenance LaunchDaemon; no independent boot
 recovery job bypasses this route. Operator bootstrap/base qualification and the
@@ -691,8 +721,9 @@ root installation guard remain operator SSH setup paths, outside daemon executio
 Its stderr is `/Library/Partitura/NativeBuild/maintenance.stderr.log`, a build-account-owned
 0600 file in the root-owned install directory. The installer refuses links,
 foreign owners and unsafe modes, and preserves existing diagnostics. Each pass
-resets the same inode once it reaches 512 KiB; launchd applies a 1 MiB file-size
-limit within a pass. Diagnostics contain exception classes and safe broker or
+replaces remote stderr with that validated descriptor, resets it at 512 KiB,
+and applies a 1 MiB session file-size limit independently of launchd's client
+limit. Diagnostics contain exception classes and safe broker or
 OS messages, never command argv, credentials or filesystem paths.
 Diagnostic writes are best effort. If the inherited log is unsafe or unusable,
 maintenance redirects stderr to `/dev/null`, continues cleanup, and records

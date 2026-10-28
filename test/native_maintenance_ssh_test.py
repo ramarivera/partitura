@@ -61,6 +61,7 @@ class MaintenanceSSHTests(unittest.TestCase):
             admission = Mock()
             admission.admit.return_value = 'Restricted build account already admitted to Remote Login'
             stack.enter_context(patch.object(module, 'remote_login', return_value=admission))
+            stack.enter_context(patch.object(module, 'snapshot_admission'))
             calls = []
             def run(args, **kwargs):
                 calls.append(args)
@@ -80,6 +81,7 @@ class MaintenanceSSHTests(unittest.TestCase):
             first = root / 'backup1'
             first.mkdir(mode=0o700)
             module.prepare(account, first, run)
+            module.snapshot_admission.assert_called_once_with(account, first, run)
             before = module.KEY.stat()
             contents = module.KEY.read_bytes()
             self.assertEqual(before.st_mode & 0o777, 0o400)
@@ -117,18 +119,18 @@ class MaintenanceSSHTests(unittest.TestCase):
             self.assertEqual(module.KEY.read_bytes(), identity)
             self.assertEqual(module.KNOWN_HOSTS.read_bytes(), original)
 
-    def test_incomplete_identity_or_unsafe_private_key_is_refused_without_keygen(self):
+    def test_unexpected_identity_entries_are_refused_without_keygen(self):
         with self.installation() as (root, run, calls, _):
             account = pwd.getpwuid(os.getuid()).pw_name
             module.SSH_ROOT.mkdir(mode=0o755)
             (module.SSH_ROOT / 'unexpected').touch()
             backup = root / 'backup'
             backup.mkdir(mode=0o700)
-            with self.assertRaisesRegex(ValueError, 'incomplete loopback'):
+            with self.assertRaisesRegex(ValueError, 'unexpected loopback'):
                 module.prepare(account, backup, run)
             self.assertEqual(calls, [])
 
-    def test_unsafe_private_mode_is_refused_and_added_acl_is_removed_on_rollback(self):
+    def test_unsafe_private_mode_is_repaired_and_added_acl_is_removed_on_rollback(self):
         with self.installation() as (root, run, calls, admission):
             account = pwd.getpwuid(os.getuid()).pw_name
             admission.admit.return_value = 'Restricted build account needs explicit Remote Login membership approval'
@@ -144,9 +146,10 @@ class MaintenanceSSHTests(unittest.TestCase):
             module.KEY.chmod(0o600)
             backup = root / 'unsafe'
             backup.mkdir(mode=0o700)
-            with self.assertRaisesRegex(ValueError, 'unsafe loopback'):
-                module.prepare(account, backup, run)
-            self.assertEqual(sum('-t' in command and command[0].endswith('ssh-keygen') for command in calls), 2)
+            module.prepare(account, backup, run)
+            self.assertEqual(module.KEY.stat().st_mode & 0o777, 0o400)
+            self.assertEqual(sum('-t' in command and command[0].endswith('ssh-keygen') for command in calls), 3)
+            module.finish(backup)
 
     def test_self_tests_are_bounded_and_refuse_missing_probe_or_nonzero_maintenance(self):
         def runner(code, output):
@@ -158,8 +161,12 @@ class MaintenanceSSHTests(unittest.TestCase):
             return run
         for checking in (True, False):
             module.self_test('builder', checking, runner(0, 'PARTITURA_MAINTENANCE_STORAGE_OK\n'))
-            with self.assertRaisesRegex(ValueError, 'Remote Login > Allow full disk access for remote users'):
+            with self.assertRaisesRegex(ValueError, 'transport, authentication or pinned host-key'):
                 module.self_test('builder', checking, runner(255, ''))
+            with self.assertRaisesRegex(ValueError, 'refused by sudo or broker'):
+                module.self_test('builder', checking, runner(1, ''))
+            with self.assertRaisesRegex(ValueError, 'Remote Login > Allow full disk access for remote users'):
+                module.self_test('builder', checking, runner(1, 'PARTITURA_MAINTENANCE_STORAGE_ERROR=storage-access-denied\n'))
             with self.assertRaisesRegex(ValueError, 'maintenance returned failure'):
                 module.self_test('builder', checking, runner(1, 'PARTITURA_MAINTENANCE_STORAGE_OK\n'))
 
@@ -177,6 +184,125 @@ class MaintenanceSSHTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 67, f'no {account} is NOT a member of com.apple.access_ssh', '')
             module.rollback(account, backup, absent)
             self.assertFalse(module.SSH_ROOT.exists())
+
+
+    def test_repair_keeps_no_private_backup_and_rolls_back_original_inode(self):
+        with self.installation() as (root, run, calls, _):
+            account = pwd.getpwuid(os.getuid()).pw_name
+            first = root / 'first'
+            first.mkdir(mode=0o700)
+            module.prepare(account, first, run)
+            # The fake parser rejects corrupt content as the unprivileged user.
+            module.KEY.chmod(0o600)
+            module.KEY.write_bytes(b'corrupt private fixture')
+            module.KEY.chmod(0o400)
+            original = module.KEY.stat().st_ino
+            def damaged(args, **kwargs):
+                if '-y' in args:
+                    self.assertEqual(args[:5], ['/usr/bin/sudo', '--non-interactive', '-H', '-u', account])
+                    raise subprocess.CalledProcessError(1, args)
+                return run(args, **kwargs)
+            backup = root / 'repair'
+            backup.mkdir(mode=0o700)
+            module.prepare(account, backup, damaged)
+            self.assertNotEqual(module.KEY.stat().st_ino, original)
+            self.assertEqual(module.KEY.with_name('id_ed25519.previous').stat().st_ino, original)
+            self.assertFalse(any(path.name == 'id_ed25519' for path in backup.rglob('*')))
+            module.rollback(account, backup, run)
+            self.assertEqual(module.KEY.stat().st_ino, original)
+            self.assertEqual(module.KEY.read_bytes(), b'corrupt private fixture')
+            # A hardlink is repaired too, without parsing it as root or uid.
+            os.link(module.KEY, root / 'untrusted-alias')
+            backup = root / 'hardlink-repair'
+            backup.mkdir(mode=0o700)
+            previous_calls = len(calls)
+            module.prepare(account, backup, run)
+            self.assertFalse(any('-y' in args for args in calls[previous_calls:]))
+            self.assertEqual(module.KEY.stat().st_nlink, 1)
+            module.finish(backup)
+            self.assertFalse(module.KEY.with_name('id_ed25519.previous').exists())
+
+    def test_failed_acl_rollback_raises_instead_of_claiming_no_mutation(self):
+        with self.installation() as (root, run, _, admission):
+            account = pwd.getpwuid(os.getuid()).pw_name
+            admission.admit.return_value = 'needs explicit Remote Login membership approval'
+            backup = root / 'backup'
+            backup.mkdir(mode=0o700)
+            module.prepare(account, backup, run)
+            def cannot_remove(args, **kwargs):
+                self.assertEqual(kwargs['timeout'], 15)
+                if '-d' in args:
+                    raise subprocess.CalledProcessError(1, args)
+                return run(args, **kwargs)
+            with self.assertRaises(subprocess.CalledProcessError):
+                module.rollback(account, backup, cannot_remove)
+            self.assertTrue((backup / 'membership.json').exists())
+
+    def test_allowusers_is_admitted_inside_prepare_and_restored_on_rollback(self):
+        snapshot = module.snapshot_admission
+        with self.installation() as (root, run, _, _):
+            helper = module.load_provision()
+            config = root / 'sshd_config'
+            config.write_text('AllowUsers operator\n')
+            config.chmod(0o644)
+            original_admit = helper.admit_sshd
+            def admit(account, apply=False, **kwargs):
+                return original_admit(account, apply, main=config, owner=os.getuid(), **kwargs)
+            helper.admit_sshd = admit
+            original_first = helper.first_allowlist
+            helper.first_allowlist = lambda main=config: original_first(main)
+            def policy(args, **kwargs):
+                self.assertEqual(kwargs['timeout'], 15)
+                if args[0].endswith('/id'):
+                    return subprocess.CompletedProcess(args, 0, 'staff', '')
+                return subprocess.CompletedProcess(args, 0, 'allowusers ' + config.read_text().split(' ', 1)[1], '')
+            backup = root / 'backup'
+            backup.mkdir(mode=0o700)
+            (backup / 'membership.json').write_text('{"account":"builder","added":false}')
+            with patch.object(module, 'load_provision', return_value=helper), patch.object(module.os, 'chown'):
+                snapshot('builder', backup, policy)
+                self.assertEqual(config.read_text(), 'AllowUsers operator builder\n')
+                module.rollback('builder', backup, policy)
+            self.assertEqual(config.read_text(), 'AllowUsers operator\n')
+
+    def test_effective_policy_forbids_environment_spoofing_including_repeated_acceptenv(self):
+        for pattern in ('SSH_*', 'SSH_USER_AUTH', '*', 'S*', '?SH_*', '*_AUTH'):
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(ValueError, 'AcceptEnv'):
+                module.verify_environment('acceptenv ' + pattern + '\nacceptenv LANG LC_*')
+        module.verify_environment('acceptenv LANG LC_*\nacceptenv SAFE_*')
+        with self.assertRaisesRegex(ValueError, 'permituserenvironment'):
+            module.verify_effective_sshd('builder', {'permituserenvironment': 'yes'})
+
+    def test_readonly_preflight_checks_incoming_ssh_volume_before_any_install(self):
+        with patch.dict(os.environ, SSH_CONNECTION='10.0.0.2 10000 10.0.0.1 22'), patch.object(module.os, 'scandir') as probe:
+            probe.return_value.__enter__.return_value = iter(())
+            module.preflight_storage('/Volumes/External/tart')
+            probe.assert_called_once_with(Path('/Volumes/External'))
+            probe.side_effect = PermissionError(1, 'private path')
+            with self.assertRaisesRegex(ValueError, 'Allow full disk access for remote users.*cannot be set by a script'):
+                module.preflight_storage('/Volumes/External/tart')
+            probe.side_effect = PermissionError(13, 'private path')
+            with self.assertRaisesRegex(ValueError, 'permissions or IO; not an FDA diagnosis'):
+                module.preflight_storage('/Volumes/External/tart')
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, 'over Remote Login SSH'):
+            module.preflight_storage('/Volumes/External/tart')
+        script = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()
+        self.assertLess(script.index('maintenance_ssh.py" preflight'), script.index('mkdir -p'))
+
+    def test_selftest_timeout_kills_client_process_group_and_reaps(self):
+        child = Mock(pid=98765)
+        child.communicate.side_effect = [subprocess.TimeoutExpired('fixture', 150), ('', '')]
+        with patch.object(module.subprocess, 'Popen', return_value=child) as popen, patch.object(module.os, 'killpg') as kill:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                module.run_test(['fixture'])
+            self.assertTrue(popen.call_args.kwargs['start_new_session'])
+            kill.assert_called_once_with(child.pid, module.signal.SIGKILL)
+            self.assertEqual(child.communicate.call_count, 2)
+        # host_setup passes its default subprocess.run. It must still take the
+        # process-group path, rather than kill only sudo on timeout.
+        with patch.object(module, 'run_test', return_value=subprocess.CompletedProcess([], 0, 'PARTITURA_MAINTENANCE_STORAGE_OK\n', '')) as grouped:
+            module.self_test('builder', run=subprocess.run)
+            grouped.assert_called_once()
 
 
 if __name__ == '__main__':
