@@ -8,6 +8,7 @@ BROKER_FILES = (
     '__main__.py',
     'partitura_broker/__init__.py',
     'partitura_broker/execution.py',
+    'partitura_broker/diagnostics.py',
     'partitura_broker/identity.py',
     'partitura_broker/recovery.py',
     'partitura_broker/state.py',

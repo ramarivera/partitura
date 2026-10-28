@@ -149,6 +149,15 @@ fi
 if /bin/launchctl print "system/$label" >/dev/null 2>&1; then
   echo "previous maintenance instance is still loaded" >&2; exit 1
 fi
+# Root-owned parent prevents log replacement by the build account. Preserve
+# existing diagnostics, but refuse links, foreign owners and unsafe modes.
+log=/Library/Partitura/NativeBuild/maintenance.stderr.log
+[ ! -L "$log" ] || { echo "unsafe maintenance log" >&2; exit 75; }
+if [ -e "$log" ]; then
+  [ -f "$log" ] && [ "$(/usr/bin/stat -f '%l:%Su:%Lp' "$log")" = "1:$account:600" ] || { echo "unsafe maintenance log" >&2; exit 75; }
+else
+  /usr/bin/install -o "$account" -g staff -m 0600 /dev/null "$log"
+fi
 /usr/bin/ditto --rsrc "$stage/tart.app" "$tart_new"
 /usr/sbin/chown -R root:wheel "$tart_new"
 /bin/chmod -R go-w "$tart_new"

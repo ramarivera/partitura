@@ -64,7 +64,7 @@ BROKER_POLICY_KEYS = {"host_id", "protocol", "profile", "minimum_free_bytes", "d
 # Pinned host_setup.py bytes pin its helpers transitively: each helper is hashed
 # before it runs, so a drifted working tree can't execute unpinned code.
 HOST_SETUP_VALIDATION_SHA256 = "a1a7d417d746549a4afc4e22f38e1d0370bcb0ca0da04239ebdd64b5bb5c2efa"
-BROKER_ARCHIVE_SHA256 = "f7b713b945f8a4adffc80149ada9a5845c2c0eced4ad0c2a2ca0fe58aaab430e"
+BROKER_ARCHIVE_SHA256 = "f30737118d05f021e5df0dd88132c472b6e3fa5184fa74d305985e24468fc790"
 
 
 def _load_pinned_helper(name: str, filename: str, expected: str) -> types.ModuleType:
@@ -189,7 +189,8 @@ def maintenance_plist(account: str) -> bytes:
         "ProgramArguments": ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", f"HOME=/Users/{account}", "DEVELOPER_DIR=/Library/Developer/CommandLineTools", "/usr/bin/python3", "-I", str(ROOT_BROKER), "local-maintenance"],
         "RunAtLoad": True, "StartInterval": 60, "ProcessType": "Background", "WorkingDirectory": "/",
         "Umask": 0o077, "ExitTimeOut": 150, "ThrottleInterval": 60,
-        "HardResourceLimits": {"Core": 0}, "SoftResourceLimits": {"Core": 0},
+        "StandardErrorPath": "/Library/Partitura/NativeBuild/maintenance.stderr.log",
+        "HardResourceLimits": {"Core": 0, "FileSize": 1048576}, "SoftResourceLimits": {"Core": 0, "FileSize": 1048576},
     }, sort_keys=True)
 
 

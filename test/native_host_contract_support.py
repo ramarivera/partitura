@@ -232,6 +232,7 @@ elif name == "stat":
         "%u": str(metadata.st_uid),
         "%g": str(metadata.st_gid),
         "%Lp": format(metadata.st_mode & 0o777, "o"),
+        "%l:%Su:%Lp": str(metadata.st_nlink) + ":" + {self.settings["account"]!r} + ":" + format(metadata.st_mode & 0o777, "o"),
     }}
     print(values[args[1]])
 elif name == "sshd":

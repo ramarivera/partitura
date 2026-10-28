@@ -430,6 +430,8 @@ def main(argv=()):
     if argv:
         if list(argv) not in (['local-maintenance'], ['local-relock']) or 'SSH_ORIGINAL_COMMAND' in os.environ or 'SSH_CONNECTION' in os.environ:
             raise ValueError('unsupported local invocation')
+        if argv[0] == 'local-maintenance':
+            api.prepare_maintenance_stderr()
         config = api.load_config()
         return api.local_maintenance(config) if argv[0] == 'local-maintenance' else api.keychain_relock_entry(config)
     request = api.parse_command(os.environ.get('SSH_ORIGINAL_COMMAND', ''))

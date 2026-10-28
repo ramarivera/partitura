@@ -642,6 +642,16 @@ through `SSH_ORIGINAL_COMMAND` and whenever SSH environment markers are present.
 The installer installs `/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist`,
 root-owned mode 0644, invoking it as the dedicated build account at boot and
 every sixty seconds with a fixed interpreter/script and empty environment.
+Its stderr is `/Library/Partitura/NativeBuild/maintenance.stderr.log`, a build-account-owned
+0600 file in the root-owned install directory. The installer refuses links,
+foreign owners and unsafe modes, and preserves existing diagnostics. Each pass
+resets the same inode once it reaches 512 KiB; launchd applies a 1 MiB file-size
+limit within a pass. Diagnostics contain exception classes and safe broker or
+OS messages, never command argv, credentials or filesystem paths.
+Every `tart stop` uses an explicit graceful timeout shorter than its subprocess
+budget, reserving ten seconds for forced stop and exit when available and using
+`--timeout 0` when no graceful wait fits, as specified by
+[Tart 2.41.1 Stop.swift](https://github.com/cirruslabs/tart/blob/2.41.1/Sources/tart/Commands/Stop.swift).
 The dedicated account alone receives ClientAliveInterval 15 and
 ClientAliveCountMax 3 in its existing Match User block.
 The code inventories private receipt/owned-clone directories once per boot or

@@ -18,6 +18,50 @@ class MaintenanceRecoveryTests(RegistryFixture, unittest.TestCase):
         self.assertFalse((self.root / 'trace').exists())
         self.keychain.lock.assert_not_called()
 
+    def test_post_capacity_runner_stage_alone_requires_owner_proof(self):
+        directory = self.root / self.job
+        directory.mkdir()
+        self.marker(stage='unlock')
+        with patch.object(broker, 'process_start', return_value='Mon Oct 26 11:00:00 2026'):
+            self.assertEqual(self.maintenance(), 0)
+        self.assertEqual((self.root / 'maintenance-reason').read_text(), 'runner-owner-alive\n')
+        self.assertTrue(directory.exists())
+        self.assertFalse((self.root / 'trace').exists())
+
+    def test_maintenance_rechecks_operator_block_after_acquiring_lock(self):
+        real_lock = broker.run_lock
+        @contextlib.contextmanager
+        def raced_lock(*args):
+            with real_lock(*args) as acquired:
+                broker.durable_write(self.root / 'maintenance-blocked', 'inventory-invalid\n')
+                yield acquired
+        with patch.object(broker, 'run_lock', side_effect=raced_lock), patch.object(broker, 'inventory_obligations', side_effect=AssertionError('ignored new operator block')):
+            self.assertEqual(self.maintenance(), 0)
+        self.assertTrue((self.root / 'maintenance-blocked').exists())
+
+    def test_maintenance_rechecks_inventory_after_acquiring_lock(self):
+        broker.record_maintenance(self.root, 'fixture-boot')
+        broker.durable_write(self.root / 'history-gc.json', json.dumps(dict(nextAt=time.time() + 86400)))
+        broker.durable_write(self.root / 'maintenance-reason', 'inventory-unavailable\n')
+        real_lock = broker.run_lock
+        @contextlib.contextmanager
+        def raced_lock(*args):
+            with real_lock(*args) as acquired:
+                broker.durable_write(self.root / 'inventory-required', 'inventory-pending\n')
+                yield acquired
+        with patch.object(broker, 'run_lock', side_effect=raced_lock), patch.object(broker, 'inventory_obligations', return_value=set()) as inventory:
+            self.assertEqual(self.maintenance(), 0)
+        inventory.assert_called_once()
+        self.assertFalse((self.root / 'inventory-required').exists())
+
+    def test_stale_maintenance_reason_clears_without_obligations_or_inventory(self):
+        broker.record_maintenance(self.root, 'fixture-boot')
+        broker.durable_write(self.root / 'history-gc.json', json.dumps(dict(nextAt=time.time() + 86400)))
+        broker.durable_write(self.root / 'maintenance-reason', 'inventory-unavailable\n')
+        self.assertEqual(self.maintenance(), 0)
+        self.assertFalse((self.root / 'maintenance-reason').exists())
+        self.assertEqual(self.wire('health')[1]['status'], 'ready')
+
     def test_disk_full_refusal_directory_is_inert_after_reboot(self):
         with patch.object(broker, 'record', side_effect=OSError(28, 'No space left')), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(broker.refuse(self.config, self.request, 'submission-expired'), 1)

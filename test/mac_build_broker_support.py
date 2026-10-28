@@ -43,6 +43,15 @@ if args[0]=='run' and scenario in ('boot-failure', 'host-key-failure'):
 if args[0]=='run':
     if any(not (root/'vms'/args[1]/name).stat().st_mode & 0o200 for name in ['config.json','disk.img','nvram.bin']): sys.exit(1)
     time.sleep(120)
+# Model a guest that ignores graceful shutdown. With Tart's default 30-second
+# wait, owned()'s 30-second deadline kills stop before its forced-stop phase.
+# An explicit shorter grace reaches that phase and makes deletion possible.
+if scenario=='force-stop-required':
+    if args[0]=='stop':
+        grace=int(args[args.index('--timeout')+1]) if '--timeout' in args else 30
+        if grace>=30: sys.exit(1)
+        (root/'forced-stop').write_text(str(grace))
+    if args[0]=='delete' and not (root/'forced-stop').exists(): sys.exit(1)
 if args[0]=='delete' and scenario in ('cleanup-failure', 'build-cleanup-failure'): sys.exit(1)
 if args[0]=='delete':
     target=root/'vms'/args[1]

@@ -1,15 +1,10 @@
-import { mkdir, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { NativeOperationError } from "../../src/services/native-build-errors.js";
-import { lockNativeState } from "../../src/services/native-build-file-io.js";
+import { readFile } from "node:fs/promises";
+import { createServer } from "node:net";
 
-/** The open descriptor holds flock, so process death releases ownership even
- * when the empty lock file survives. Never unlink a shared lock inode. */
-export const leaseT3TestPorts = async (
-  root = join(tmpdir(), `partitura-t3-test-ports-${process.getuid?.()}`),
-) => {
-  await mkdir(root, { recursive: true, mode: 0o700 });
+/** A held Linux abstract socket owns the port block across TMPDIRs and
+ * worktrees. Kernel ownership disappears on process death, with no lease file
+ * or probe-then-bind window between cooperating launcher tests. */
+export const leaseT3TestPorts = async () => {
   const ephemeralStart = Number(
     (await readFile("/proc/sys/net/ipv4/ip_local_port_range", "utf8"))
       .trim()
@@ -17,17 +12,26 @@ export const leaseT3TestPorts = async (
   );
   const end = Math.min(20_000, ephemeralStart);
   for (let base = 10_000; base + 16 <= end; base += 16) {
-    const directory = join(root, String(base));
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    try {
-      return { base, release: await lockNativeState(directory) };
-    } catch (error) {
-      if (
-        !(error instanceof NativeOperationError) ||
-        error.reason !== "native-state-locked-or-unsafe"
-      )
-        throw error;
-    }
+    const server = createServer();
+    const acquired = await new Promise<boolean>((resolve, reject) => {
+      server.once("error", (error: NodeJS.ErrnoException) => {
+        if (error.code === "EADDRINUSE") resolve(false);
+        else reject(error);
+      });
+      server.listen(
+        `\0partitura-t3-test-ports-${process.getuid?.()}-${base}`,
+        () => resolve(true),
+      );
+    });
+    if (!acquired) continue;
+    server.unref();
+    return {
+      base,
+      release: () =>
+        new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        }),
+    };
   }
   throw new Error("No exclusively leased T3 test port block");
 };
