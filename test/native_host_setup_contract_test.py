@@ -115,6 +115,11 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         self.assertIn('    ClientAliveInterval 15\n', ssh)
         self.assertIn('    ClientAliveCountMax 3\n', ssh)
         self.assertNotIn('Match all', ssh)
+        # sshd -t rejects keywords that sshd_config(5) doesn't allow inside Match.
+        allowed = {'authorizedkeysfile', 'exposeauthinfo', 'passwordauthentication', 'kbdinteractiveauthentication', 'authenticationmethods', 'forcecommand', 'allowtcpforwarding', 'allowagentforwarding', 'x11forwarding', 'permittty', 'clientaliveinterval', 'clientalivecountmax', 'acceptenv', 'permituserrc', 'disableforwarding', 'pubkeyauthentication', 'maxsessions', 'loglevel'}
+        keywords = {line.split()[0].lower() for line in ssh.splitlines()[1:] if line.strip()}
+        self.assertLessEqual(keywords, allowed)
+        self.assertNotIn('permituserenvironment', keywords)
 
 
     def test_capacity_checks_actual_roots_without_summing_free_space(self):

@@ -169,6 +169,8 @@ def authorized_key_line(public_key: str) -> str:
 
 
 def sshd_dropin(account: str) -> str:
+    # sshd refuses non-Match keywords here (PermitUserEnvironment is global-only);
+    # its effective "no" default is verified separately through sshd -T.
     return "\n".join(
         [
             f"Match User {account}",
@@ -182,7 +184,6 @@ def sshd_dropin(account: str) -> str:
             "    AllowAgentForwarding no",
             "    X11Forwarding no",
             "    PermitTTY no",
-            "    PermitUserEnvironment no",
             "    ClientAliveInterval 15",
             "    ClientAliveCountMax 3",
             "",
