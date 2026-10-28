@@ -462,7 +462,9 @@ def local_maintenance(config):
             api.maintenance_error(error)
             # IO failures are retryable. No operator-only flag is manufactured.
             result = 'cleanup-required'
-            reason = 'inventory-unavailable'
+            reason = 'storage-access-denied' if api.storage_access_denied(config, error) else 'inventory-unavailable'
+            if reason == 'storage-access-denied':
+                api.record_storage_denial(config)
             complete = False
         if reason is None and result in ('cleanup-required', 'keychain-relock-pending'):
             reason = result

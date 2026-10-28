@@ -222,10 +222,17 @@ class RenderSettingsTests(unittest.TestCase):
         # including staging/resolve below, so real Mac installed state is never read.
         self.installed = None
         self.identity = None
+        self.source = tempfile.TemporaryDirectory(dir=os.environ['TMPDIR'])
+        self.addCleanup(self.source.cleanup)
+        self.repository = Path(self.source.name)
+        import shutil
+        shutil.copytree(ROOT / 'deploy/mac-build', self.repository / 'deploy/mac-build', ignore=shutil.ignore_patterns('__pycache__'))
+        for args in (['init'], ['config', 'user.email', 'fixture@example.invalid'], ['config', 'user.name', 'Fixture'], ['add', '.'], ['commit', '-m', 'pin host setup fixture']):
+            subprocess.run(['/usr/bin/git', '-C', str(self.repository), *args], check=True, capture_output=True)
         original = importlib.util.spec_from_file_location
         def isolated_spec(name, path, *args, **kwargs):
             spec = original(name, path, *args, **kwargs)
-            if Path(path) == ROOT / 'deploy/mac-build/host_setup.py':
+            if Path(path).name == 'host_setup.py':
                 execute = spec.loader.exec_module
                 def load(hs):
                     execute(hs)
@@ -264,7 +271,7 @@ class RenderSettingsTests(unittest.TestCase):
                 'nodeVersion': '24.22.1', 'pythonVersion': '3.13.17', 'sourceName': 'macos-base', 'sourceSha256': 'c' * 64,
             }))
             out = base / 'out'
-            argv = ['settings', '--clone', str(ROOT), '--receipt', str(receipt), '--root-dir', '/private/var/root/p',
+            argv = ['settings', '--clone', str(self.repository), '--receipt', str(receipt), '--root-dir', '/private/var/root/p',
                     '--tart-app', str(base / 'tart.app'), '--tart-sha256', hashlib.sha256(b'tart').hexdigest(),
                     '--mise-binary', '/x/mise', '--source-path', '/x/vms/macos-base', '--host', 'test-mac',
                     '--account', 'partitura-build', '--guest-user', 'partitura',
@@ -297,8 +304,8 @@ class RenderSettingsTests(unittest.TestCase):
             hs_spec = importlib.util.spec_from_file_location('render_stage', ROOT / 'deploy/mac-build/host_setup.py')
             hs = importlib.util.module_from_spec(hs_spec)
             hs_spec.loader.exec_module(hs)
-            names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
-            blobs = tuple(hs.broker_from_commit(ROOT, 'HEAD', hs.git_environment()) if name == 'broker.py' else subprocess.run(['/usr/bin/git', '-C', str(ROOT), 'show', 'HEAD:deploy/mac-build/' + name], check=True, capture_output=True).stdout for name in names)
+            names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py', 'maintenance_ssh.py', 'remote_login.py')
+            blobs = tuple(hs.broker_from_commit(self.repository, 'HEAD', hs.git_environment()) if name == 'broker.py' else subprocess.run(['/usr/bin/git', '-C', str(self.repository), 'show', 'HEAD:deploy/mac-build/' + name], check=True, capture_output=True).stdout for name in names)
             stage = base / 'stage'
             def ditto(argv, **kwargs):
                 import shutil

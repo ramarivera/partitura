@@ -17,13 +17,13 @@ def admit(account, apply=False, run=subprocess.run):
     policy = run(['/usr/sbin/sshd', '-T', '-C', f'user={account},host=localhost,addr=127.0.0.1'], capture_output=True, text=True, check=True).stdout
     fields = {key.lower(): value for key, value in (line.split(' ', 1) for line in policy.splitlines() if ' ' in line)}
     required = {
-        'authorizedkeysfile': '/Library/Partitura/NativeBuild/authorized_keys',
         'forcecommand': '/usr/bin/python3 /Library/Partitura/NativeBuild/broker.py',
         'passwordauthentication': 'no', 'kbdinteractiveauthentication': 'no',
         'authenticationmethods': 'publickey', 'allowtcpforwarding': 'no',
         'allowagentforwarding': 'no', 'x11forwarding': 'no', 'permittty': 'no',
     }
-    if any(fields.get(key) != value for key, value in required.items()):
+    authorized = '/Library/Partitura/NativeBuild/authorized_keys'
+    if fields.get('authorizedkeysfile') not in (authorized, authorized + ' /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys') or any(fields.get(key) != value for key, value in required.items()):
         raise ValueError('install and verify the restricted native SSH policy first')
     # An absent service ACL means macOS already admits all local accounts.
     group = run(['/usr/bin/dscl', '.', '-read', '/Groups/com.apple.access_ssh'], capture_output=True, text=True)

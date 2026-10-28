@@ -75,6 +75,7 @@ export type BrokerEnvelope = {
   reasons?: string[];
   reconciledJobs?: string[];
   maintenanceJobId?: string;
+  storageAccessHint?: string;
   artifactBytes?: number;
   artifactSha256?: string;
   artifactExpired?: boolean;
@@ -98,6 +99,7 @@ const envelopeKeys: Record<string, readonly string[]> = {
     "keychainPolicy",
     "runner",
     "maintenanceJobId",
+    "storageAccessHint",
   ],
   known: [
     "job",
@@ -194,6 +196,14 @@ export function decodeBrokerEnvelope(
   )
     invalid();
   if (value.kind === "health") {
+    if (
+      value.storageAccessHint !== undefined &&
+      (value.storageAccessHint !==
+        "Verify Remote Login > Allow full disk access for remote users is enabled on this host." ||
+        !Array.isArray(value.reasons) ||
+        !value.reasons.includes("storage-access-denied"))
+    )
+      invalid();
     if (
       (value.maintenanceJobId !== undefined &&
         !validId(value.maintenanceJobId)) ||

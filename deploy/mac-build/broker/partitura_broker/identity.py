@@ -55,7 +55,7 @@ def sealed(path):
     return path
 
 
-def load_config():
+def load_config(allow_storage_denial=False):
     with api.sealed(api.CONFIG).open('r') as source:
         text = source.read(65537)
     if len(text) > 65536:
@@ -91,7 +91,14 @@ def load_config():
         raise ValueError('invalid guest home')
     for key in ('root', 'tartHome'):
         path = Path(config[key])
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except OSError as error:
+            if api.storage_access_denied(config, error):
+                api.record_storage_denial(config)
+                if allow_storage_denial:
+                    continue  # Health reports the denial without trusting/admitting storage.
+            raise
         if not path.is_absolute() or path.resolve() != path or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError('unsafe private runtime directory')
     return config

@@ -455,3 +455,41 @@ and filesystem paths are excluded from these diagnostics.
 An unsafe or unusable inherited log redirects to `/dev/null` without touching
 the unsafe inode or blocking cleanup. Maintenance records the diagnostics failure
 in `maintenance-reason`; write and flush failures never interrupt recovery.
+
+Maintenance reaches external Tart storage through a loopback SSH session, using
+macOS Remote Login's existing "Allow full disk access for remote users" grant.
+The LaunchDaemon starts `/usr/bin/ssh` as the unprivileged build account, with
+an installer-generated ed25519 identity at
+`/Library/Partitura/NativeBuild/maintenance-ssh/id_ed25519`, account-owned mode
+0400 in a root-owned directory. The private key is never in a staged manifest,
+command argument, environment value or log. Its root-owned authorized entry has
+`restrict`, a loopback-only `from` list and the existing forced broker command.
+The global ForceCommand stays unchanged. `ExposeAuthInfo yes` lets that broker
+compare sshd's verified public key against the root-owned maintenance public key.
+Only that identity on loopback can use the fixed maintenance/check verbs; it
+cannot use build, artifact or gateway control verbs. Gateway keys keep their
+existing verbs and cannot select maintenance, even from loopback. Missing or
+unsafe authenticated-key proof fails closed on loopback after installation.
+
+The client ignores user SSH config and agents, forbids forwarding and connection
+sharing, and requires strict host authentication against a root-owned known_hosts
+file derived from the host's own protected `/etc/ssh/ssh_host_ed25519_key.pub`.
+There is no TOFU or ssh-keyscan. The installer checks Remote Login ACL admission
+with the existing restricted-account helper and adds only the build account when
+needed. It tests volume enumeration inside sshd before activating the daemon and
+runs a real maintenance pass after releasing the installation lock. Failed
+pre-activation checks restore files, generated identity/pins, ACL membership and
+daemon state. A post-commit maintenance failure reports failure with the installed
+configuration retained for diagnosis. No TCC database is read and no new FDA path
+grant is required. The existing Remote Login prerequisite includes its full-disk
+access checkbox; an ineffective grant produces `storage-access-denied` and a
+fixed checkbox hint in health and private diagnostics.
+
+SSH disconnect HUP/TERM signals do not interrupt the bounded maintenance pass.
+Existing atomic writes and durable recovery fences still protect SIGKILL/reboot
+failures. The remote broker checks/truncates the same private log inode before a
+pass because its SSH stderr is a pipe; launchd's SSH client still has the 1 MiB
+output limit. Build/reconcile SSH sessions, boot inventory triggered by the daemon,
+and the installer self-tests all use the same sshd boundary. Operator-only bootstrap,
+base preparation/qualification and the root install guard remain explicit host
+setup operations, run in the already approved operator SSH context, not new daemons.

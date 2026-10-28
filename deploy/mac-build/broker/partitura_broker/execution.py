@@ -439,8 +439,17 @@ def main(argv=()):
         if not diagnostics_ready and api.read_state(reason) is None:
             api.durable_write(reason, 'diagnostics-unavailable\n')
         return result
-    request = api.parse_command(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
-    config = api.load_config()
+    command = os.environ.get('SSH_ORIGINAL_COMMAND', '')
+    maintenance = api.maintenance_identity()
+    if command in api.MAINTENANCE_VERBS:
+        if not maintenance:
+            raise ValueError('unsupported local invocation')
+        api.ignore_shutdown_signals()
+        return api.loopback_maintenance(api.load_config(), check=command == api.MAINTENANCE_VERBS[1])
+    if maintenance:
+        raise ValueError('unsupported local invocation')  # This key cannot run builds or gateway verbs.
+    request = api.parse_command(command)
+    config = api.load_config(allow_storage_denial=True) if request[0] == 'health' else api.load_config()
     if request[0] in ('health', 'run-v2', 'reconcile') or config.get('profile') == 'registry-only':
         if 'hostId' not in config:
             print(json.dumps({'protocolVersion': api.PROTOCOL_VERSION, 'kind': 'error', 'code': 'identity-not-installed'}))

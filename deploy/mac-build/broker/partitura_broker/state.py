@@ -238,6 +238,8 @@ def initialize_epoch(config):
 
 
 def emit(config, kind, **fields):
+    if kind == 'health' and 'storage-access-denied' in fields.get('reasons', []):
+        fields['storageAccessHint'] = api.STORAGE_ACCESS_HINT
     envelope = dict(protocolVersion=api.PROTOCOL_VERSION, hostId=config['hostId'], kind=kind, **fields)
     line = json.dumps(envelope, separators=(',', ':'), allow_nan=False) + '\n'
     if len(line.encode()) > api.MAX_STATE:
@@ -452,8 +454,8 @@ def health(config):
             else:
                 api.verify_vm_capacity()
                 fields.update(status='ready', accepting=True, capacity=1)
-        except OSError:
-            fields['reasons'] = ['host-disk-space-unavailable']
+        except OSError as error:
+            fields['reasons'] = ['storage-access-denied' if api.storage_access_denied(config, error) else 'host-disk-space-unavailable']
         except (ValueError, subprocess.SubprocessError):
             fields['reasons'] = ['host-capacity-unavailable']
     reason = api.read_state(root / 'maintenance-reason')

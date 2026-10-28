@@ -45,7 +45,7 @@ HISTORY_PASS_SECONDS = 10
 MAX_STATE = 4096
 TERMINAL = ('succeeded', 'failed', 'cancelled')
 FENCES = ('active-vm', 'cleanup-required', 'unlock-attempt', 'keychain-relock-pending')
-MAINTENANCE_REASONS = ('inventory-unavailable', 'inventory-invalid', 'inventory-incomplete', 'runner-owner-missing', 'runner-owner-unavailable', 'runner-owner-alive', 'runner-owner-ambiguous', 'keychain-relock-pending', 'cleanup-required', 'diagnostics-unavailable')
+MAINTENANCE_REASONS = ('storage-access-denied', 'inventory-unavailable', 'inventory-invalid', 'inventory-incomplete', 'runner-owner-missing', 'runner-owner-unavailable', 'runner-owner-alive', 'runner-owner-ambiguous', 'keychain-relock-pending', 'cleanup-required', 'diagnostics-unavailable')
 
 
 from .identity import parse_command, sealed, load_config, validate_keychain_paths, KeychainError, validate_keychain_policy, policy_evidence, KeychainSettings, LoginKeychain
@@ -55,3 +55,5 @@ from .recovery import tombstone, verify_owned_clone, macos_build, daemon_relock_
 from .execution import run_v2, cancel_job, RunnerMarker, run_job, main, cli
 
 from .diagnostics import maintenance_error, prepare_maintenance_stderr
+
+from .maintenance import maintenance_identity, storage_access_denied, record_storage_denial, check_maintenance_storage, loopback_maintenance, MAINTENANCE_VERBS, STORAGE_ACCESS_HINT

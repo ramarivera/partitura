@@ -51,7 +51,7 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         config.pop('authorized_key')
         config['authorized_keys'] = [VALID_KEY, second]
         normalized = MODULE.validate_settings(config)
-        lines = MODULE.expected_host_files(normalized, (b'1',) * 6)[MODULE.ROOT_AUTHORIZED_KEYS][0].decode().splitlines()
+        lines = MODULE.expected_host_files(normalized, (b'1',) * 8)[MODULE.ROOT_AUTHORIZED_KEYS][0].decode().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0].split(' ssh-ed25519 ')[0], lines[1].split(' ssh-ed25519 ')[0])
         for keys, error in (([], 'one or two'), ([VALID_KEY] * 3, 'one or two'), ([VALID_KEY, VALID_KEY.rsplit(' ', 1)[0] + ' another-comment'], 'duplicate')):
@@ -107,7 +107,8 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         for key in ('SoftResourceLimits', 'HardResourceLimits'):
             self.assertEqual(plist[key]['FileSize'], 1048576)
         self.assertTrue(plist['RunAtLoad'])
-        self.assertEqual(plist['ProgramArguments'][-3:], ['-I', str(MODULE.ROOT_BROKER), 'local-maintenance'])
+        self.assertEqual(plist['ProgramArguments'], MODULE._maintenance.ssh_command('builder'))
+        self.assertEqual(plist['ProgramArguments'][0], '/usr/bin/ssh')
         self.assertIn('-i', plist['ProgramArguments'])
         ssh = MODULE.sshd_dropin('builder')
         self.assertTrue(ssh.startswith('Match User builder\n'))
@@ -213,7 +214,7 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         config["base"]["sha256"] = "a" * 64
         config["base"]["source_sha256"] = "b" * 64
         config["base"]["mise_sha256"] = "c" * 64
-        files = MODULE.expected_host_files(config, (b"broker", b"runner", b"qualifier", b"launcher", b"installer", b"writer"))
+        files = MODULE.expected_host_files(config, (b"broker", b"runner", b"qualifier", b"launcher", b"installer", b"writer", b"maintenance", b"remote-login"))
         self.assertEqual(files[MODULE.ROOT_CONFIG][1], 0o444)
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
@@ -312,6 +313,8 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
                 *(MODULE.BROKER_SOURCE + name for name in MODULE.BROKER_FILES),
                 "deploy/mac-build/host_setup_validation.py",
                 "deploy/mac-build/broker_archive.py",
+                "deploy/mac-build/maintenance_ssh.py",
+                "deploy/mac-build/remote_login.py",
                 MODULE.GUEST_RUNNER_PATH,
                 MODULE.NATIVE_HOST_PATH,
                 MODULE.INSTALL_HOST_PATH,
@@ -355,6 +358,8 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
                         (repository / MODULE.NATIVE_HOST_PATH).read_bytes(),
                         (repository / MODULE.INSTALL_HOST_PATH).read_bytes(),
                         (repository / MODULE.WRITER_PATH).read_bytes(),
+                        (repository / "deploy/mac-build/maintenance_ssh.py").read_bytes(),
+                        (repository / "deploy/mac-build/remote_login.py").read_bytes(),
                     ),
                 )
                 helper = repository / "deploy/mac-build/host_setup_validation.py"
@@ -377,7 +382,8 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
         calls = []
         output = "\n".join(
             [
-                f"authorizedkeysfile {MODULE.ROOT_AUTHORIZED_KEYS}",
+                f"authorizedkeysfile {MODULE.ROOT_AUTHORIZED_KEYS} /Library/Partitura/NativeBuild/maintenance-ssh/authorized_keys",
+                "exposeauthinfo yes",
                 "passwordauthentication no",
                 "kbdinteractiveauthentication no",
                 "authenticationmethods publickey",

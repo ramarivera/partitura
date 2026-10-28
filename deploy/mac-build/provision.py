@@ -247,7 +247,7 @@ def render_settings(args):
     if args.keychain_policy is not None:
         old['keychain_policy'] = None if args.keychain_policy == 'preserve' else json.loads(args.keychain_policy)
     policy = dict(old, **{key: value for key, value in dict(profile=args.profile, minimum_free_bytes=args.minimum_free_bytes, daemon_relock_qualified=args.daemon_relock_qualified, daemon_relock_macos_build=args.daemon_relock_macos_build).items() if value is not None})
-    names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py')
+    names = ('broker.py', 'guest-run.sh', 'qualify-base.sh', 'native_host.py', 'install-host.sh', 'credential-writer.py', 'maintenance_ssh.py', 'remote_login.py')
     blobs = {name: show(name) for name in names if name != 'broker.py'}
     blobs['broker.py'] = hs.broker_from_commit(clone, commit, hs.git_environment())
     digest = {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()}

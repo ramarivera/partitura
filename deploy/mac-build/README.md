@@ -285,15 +285,17 @@ runtime roots. Conflicts stop; key rotation never mints another identity. A new
 profile can be supplied with `--profile`, but changing it requires a separate
 approved drain/cutover. This slice's rollout keeps both Macs in `legacy`.
 
-Upgrades that add the maintenance plist require
+Upgrades that add the maintenance SSH helpers or maintenance plist require
 `--predecessor-manifest-sha256 REVIEWED_SHA256`. Independently review and record
 the installed root-owned `managed-files.json` and its exact payloads first.
-Only the complete previous target set without the plist, or the older exact set
-without both plist and credential writer, is accepted. Unknown targets, changed
+Only the complete previous target set without the two SSH helpers, its predecessor
+without the plist, or the older exact set without both plist and credential writer,
+is accepted. Unknown targets, changed
 payloads and unexpected new files stop the upgrade. Subsequent same-target
 updates use the validated root-owned manifest normally. The generated, staged
-and installed manifest covers the same seven managed targets, including Tart.
-The immutable identity journal is separate installation state.
+and installed manifest covers the same nine managed targets, including Tart and the two SSH helpers.
+The immutable identity journal and host-local maintenance SSH identity are separate
+installation state. No private SSH key appears in settings or managed manifests.
 
 Root apply takes the existing runner lock nonblocking as the dedicated account,
 refuses outstanding safety fences/owned clones, and classifies private job state
@@ -640,8 +642,52 @@ deletion, readback or state writes retain the safety fence.
 The fixed local invocation is `broker.py local-maintenance`. It is rejected
 through `SSH_ORIGINAL_COMMAND` and whenever SSH environment markers are present.
 The installer installs `/Library/LaunchDaemons/net.partitura.native-build-maintenance.plist`,
-root-owned mode 0644, invoking it as the dedicated build account at boot and
-every sixty seconds with a fixed interpreter/script and empty environment.
+root-owned mode 0644. At boot and every sixty seconds it starts `/usr/bin/ssh`
+as the dedicated build account, targeting that host's sshd on `127.0.0.1:22`.
+The fixed verb `partitura-local-maintenance` runs through the existing broker
+ForceCommand. It is admitted only for the installer-generated maintenance key,
+verified with sshd's `ExposeAuthInfo` record, and only on loopback. That key cannot
+run build/status/artifact verbs; gateway keys cannot select maintenance or its
+read-only `partitura-maintenance-check` preflight verb.
+
+Remote Login must already be enabled with **Allow full disk access for remote
+users** as part of the host's existing Remote Login prerequisite. This reuses
+sshd-keygen-wrapper's system grant for removable/external storage when the daemon
+user has no GUI session. It adds no launcher binary, per-path FDA grant, login
+session or System Settings step. The installer never reads TCC.db. It checks the
+restricted account's Remote Login ACL with `remote_login.py`, adding only that
+account if the selected-user ACL needs it, under the existing password-authorized
+installation. It does not enable Remote Login or change its privacy policy.
+
+Root installation creates the host-local key once at
+`/Library/Partitura/NativeBuild/maintenance-ssh/id_ed25519`, owned by the build
+account mode 0400. The parent directory and the public key, loopback-only restricted
+authorized_keys file and known_hosts file are root-owned. Reruns verify and reuse
+the key and do not append duplicate authorized entries. The SSH client uses
+BatchMode, IdentitiesOnly, no agent/config/multiplexing/forwarding, and strict
+host-key checking. known_hosts is pinned from the root-owned local
+`/etc/ssh/ssh_host_ed25519_key.pub`; it never trusts a network discovery result.
+
+Before daemon activation the transaction runs a read-only loopback storage check
+under the new dispatcher, while the installation lock is still held. After the
+guard commits/releases that lock, the wrapper runs one real loopback maintenance
+pass and requires the storage enumeration marker plus exit 0. This avoids a false
+pass caused by a busy runner lock. A pre-activation failure rolls back the new
+identity/pins, account ACL addition, managed files and daemon state; a post-commit
+failure returns nonzero and leaves the installed state for diagnosis. A denied
+Tart-volume operation records `storage-access-denied` and points to
+**Remote Login > Allow full disk access for remote users** in health and stderr.
+An unrelated EIO remains `inventory-unavailable`. No successful test is inferred
+from a TCC database row. Runtime TCC inheritance through an sshd session launched
+by the daemon must still be qualified on the actual Mac before rollout.
+
+On SSH disconnect, the remote maintenance handler ignores HUP/TERM/INT until its
+bounded fenced pass finishes, preserving its exit result when the client remains.
+Atomic fsync/rename writes and durable fences cover SIGKILL/reboot. Local-only
+`local-maintenance` and `local-relock` invocations retain their previous rejection
+of SSH environment/argv. There is one maintenance LaunchDaemon; no independent boot
+recovery job bypasses this route. Operator bootstrap/base qualification and the
+root installation guard remain operator SSH setup paths, outside daemon execution.
 Its stderr is `/Library/Partitura/NativeBuild/maintenance.stderr.log`, a build-account-owned
 0600 file in the root-owned install directory. The installer refuses links,
 foreign owners and unsafe modes, and preserves existing diagnostics. Each pass

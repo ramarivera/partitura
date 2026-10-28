@@ -141,10 +141,10 @@ class NativeHostFixture:
             broker_blob, runner_blob, qualifier_blob = b"new broker", b"new runner", b"new qualifier"
             with patch.object(MODULE, "ROOT_TART_APP", installed_app), patch.object(
                 MODULE, "ROOT_BROKER", native_root / "broker.py"
-            ), patch.object(MODULE, "ROOT_WRITER", native_root / "credential-writer.py"), patch.object(MODULE, "ROOT_CONFIG", native_root / "config.json"), patch.object(
+            ), patch.object(MODULE, "ROOT_MAINTENANCE", native_root / "maintenance_ssh.py"), patch.object(MODULE, "ROOT_REMOTE_LOGIN", native_root / "remote_login.py"), patch.object(MODULE, "ROOT_WRITER", native_root / "credential-writer.py"), patch.object(MODULE, "ROOT_CONFIG", native_root / "config.json"), patch.object(
                 MODULE, "ROOT_AUTHORIZED_KEYS", native_root / "authorized_keys"
             ), patch.object(MODULE, "ROOT_SSHD_DROPIN", dropin), patch.object(MODULE, "ROOT_PLIST", host / "Library/LaunchDaemons/net.partitura.native-build-maintenance.plist"):
-                files = MODULE.expected_host_files(config, (broker_blob, runner_blob, qualifier_blob, b"launcher", b"installer", b"writer"))
+                files = MODULE.expected_host_files(config, (broker_blob, runner_blob, qualifier_blob, b"launcher", b"installer", b"writer", b"maintenance", b"remote-login"))
                 expected_manifest = MODULE.expected_managed_manifest(files, config)
 
             for target, (payload, mode) in files.items():
@@ -249,7 +249,8 @@ elif name == "sshd":
             sys.exit(1)
     elif "-T" in args:
         print("\\n".join([
-            "authorizedkeysfile {native_root / "authorized_keys"}",
+            "authorizedkeysfile {native_root / "authorized_keys"} {native_root / "maintenance-ssh/authorized_keys"}",
+            "exposeauthinfo yes",
             "passwordauthentication no",
             "kbdinteractiveauthentication no",
             "authenticationmethods publickey",
@@ -282,15 +283,19 @@ elif name == "launchctl":
         if {failure!r} == 'bootstrap' and Path({str(fail_once)!r}).exists():
             Path({str(fail_once)!r}).unlink()
             sys.exit(1)
+elif name == "python3":
+    if "check" in args and {failure!r} == "loopback" and Path({str(fail_once)!r}).exists():
+        Path({str(fail_once)!r}).unlink()
+        sys.exit(1)
 elif name == "sudo":
     raise SystemExit('securityd denies keychain access in sudo context')
-elif name not in ("codesign", "chown", "plutil"):
+elif name not in ("codesign", "chown", "plutil", "python3"):
     raise SystemExit(f"unexpected fixture command: {{name}} {{args}}")
 '''
             shim = shims / "fixture-command"
             shim.write_text(shim_source)
             shim.chmod(0o755)
-            for command in ("install", "ditto", "shasum", "stat", "sshd", "codesign", "chown", "plutil", "launchctl", "sudo"):
+            for command in ("install", "ditto", "shasum", "stat", "sshd", "codesign", "chown", "plutil", "launchctl", "sudo", "python3"):
                 (shims / command).symlink_to(shim)
 
             for old_path, new_path in (
@@ -306,8 +311,10 @@ elif name not in ("codesign", "chown", "plutil"):
                 ("/usr/bin/plutil", str(shims / "plutil")),
                 ("/bin/launchctl", str(shims / "launchctl")),
                 ("/usr/bin/sudo", str(shims / "sudo")),
+                ("/usr/bin/python3", str(shims / "python3")),
             ):
                 installer = installer.replace(old_path, new_path)
+            installer = installer.replace('forcecommand ' + str(shims / 'python3'), 'forcecommand /usr/bin/python3')
 
             def run_installer():
                 # Drive the actual root wrapper's exit-75 branch, including its
@@ -336,6 +343,9 @@ elif name not in ("codesign", "chown", "plutil"):
                     nonlocal result
                     if args[0] == '/usr/bin/ditto':
                         shutil.copytree(args[-2], args[-1])
+                        return subprocess.CompletedProcess(args, 0)
+                    if args[0] == '/usr/bin/python3':
+                        self.assertEqual(args[-3:], ['test', '--account', config['account']])
                         return subprocess.CompletedProcess(args, 0)
                     self.assertEqual(args[0], '/bin/bash')
                     # Run the actual transaction against the fixture payloads;

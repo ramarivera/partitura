@@ -12,6 +12,7 @@ it.live("broker maintenance diagnostics decode and keep recovery blocked", () =>
     Effect.gen(function* () {
       const fixture = yield* registryFixture(path("broker-health"));
       for (const reason of [
+        "storage-access-denied",
         "inventory-unavailable",
         "inventory-invalid",
         "inventory-incomplete",
@@ -35,6 +36,12 @@ it.live("broker maintenance diagnostics decode and keep recovery blocked", () =>
             accepting: false,
             capacity: 0,
             reasons: [reason],
+            ...(reason === "storage-access-denied"
+              ? {
+                  storageAccessHint:
+                    "Verify Remote Login > Allow full disk access for remote users is enabled on this host.",
+                }
+              : {}),
             jobRootFreeBytes: null,
             tartRootFreeBytes: null,
             hostFloorBytes: 53687091200,
@@ -43,6 +50,8 @@ it.live("broker maintenance diagnostics decode and keep recovery blocked", () =>
         );
         expect(health.reasons).toEqual([reason]);
         expect(cleanNativeHealth(health)).toBe(false);
+        if (reason === "storage-access-denied")
+          expect(health.storageAccessHint).toContain("Remote Login");
       }
     }),
   ),
