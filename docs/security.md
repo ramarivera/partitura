@@ -468,7 +468,8 @@ command argument, environment value or log. Its root-owned authorized entry has
 The global ForceCommand stays unchanged. `ExposeAuthInfo yes` lets that broker
 compare sshd's verified public key against the root-owned maintenance public key.
 The proof path must match sshd's literal `/tmp/sshauth.` name with its 15-character
-suffix. Effective sshd policy pins `PermitUserEnvironment no` and rejects every
+suffix. The effective sshd policy must report `PermitUserEnvironment no` (a global-only
+keyword, so the Match drop-in never sets it) and installation rejects every
 AcceptEnv pattern that could admit an SSH_* variable, including repeated lines.
 Only that identity on loopback can use the fixed maintenance/check verbs; it
 cannot use build, artifact or gateway control verbs. Gateway keys keep their
