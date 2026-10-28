@@ -193,7 +193,9 @@ against the hashes pinned in the script, plus Tart's signing team. It also check
   grant or build-account GUI login is needed.
 
 After base preparation, staging and final readback measure available-to-account
-bytes on both actual runtime roots with `statvfs`. Each root must satisfy the
+bytes on both actual runtime roots with the shared Python capacity helper.
+It uses `max(statvfs f_bavail bytes, CF important-usage bytes)` on macOS, counting
+space the OS can reclaim automatically. Each root must satisfy the
 sealed floor. APFS free-space values are never added together. The external
 120 GiB provisioning requirement/reserve is separate from this runtime floor.
 
@@ -605,7 +607,7 @@ be recovered under the lock from this SSH context. A completed inventory stays
 complete when the daemon leaves a pending keychain relock.
 
 On a clean host, artifact pruning precedes disk measurement using available-to-
-account `statvfs` bytes on the actual job and Tart roots. Each root needs the
+account available capacity on the actual job and Tart roots. Each root needs the
 sealed `minimumFreeBytes` floor, defaulting to 50 GiB; the job root additionally
 needs bundle plus secret input headroom before receiving. Free bytes from shared
 APFS storage are never added together. The broker records receiving state and a
@@ -990,3 +992,28 @@ Code merge does not authorize cutover. Follow the separately approved
 [unexecuted deployment overlay](registry.compose.example.yaml).
 See [the engine and offline import contract](registry-engine.md) for Effect scope
 ownership, recovery, credential restoration and resumable imports.
+
+### Reclaimable space in the runtime floor
+
+The broker, installer runtime check and internal-disk provisioning floor share
+`broker/partitura_broker/capacity.py`. CoreFoundation's
+`kCFURLVolumeAvailableCapacityForImportantUsageKey` includes reclaimable capacity
+for explicitly requested work; opportunistic capacity is for speculative work.
+The helper uses the larger of that value and account `statvfs` bytes. Unsupported
+CF, missing/failed queries, non-integer/negative values, overflow and values above
+volume capacity fall back to statvfs. A failed statvfs still refuses admission.
+No snapshot deletion, preallocation or capacity reservation is performed.
+
+[Apple describes important versus opportunistic usage](https://developer.apple.com/videos/play/tech-talks/204/)
+and [automatic snapshot reclamation for file copies and software installs](https://support.apple.com/en-us/102154).
+Tart's [2.41.1 clone path copies the VM disk](https://github.com/cirruslabs/tart/blob/2.41.1/Sources/tart/VMDirectory.swift).
+A requested build's clone and subsequent disk writes fit important usage, rather
+than speculative cache prefetch. Capacity remains an estimate, not guaranteed
+space: concurrent use, non-purgeable snapshots or write failure can still fail a
+build, retaining the existing cleanup fences and post-transfer check.
+
+Health's existing `jobRootFreeBytes` and `tartRootFreeBytes` now report this
+effective capacity; their numeric wire shape is unchanged. Installer/preflight
+JSON reports `statvfsBytes`, `importantUsageBytes` or null on fallback, and
+`availableBytes` per queried root. No volumes' values are added, even for shared
+APFS pools. The external 120 GiB provisioning/reserve requirement is unchanged.

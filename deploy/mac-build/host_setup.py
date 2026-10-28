@@ -62,9 +62,10 @@ BROKER_POLICY_KEYS = {"host_id", "protocol", "profile", "minimum_free_bytes", "d
 
 # Pinned host_setup.py bytes pin its helpers transitively: each helper is hashed
 # before it runs, so a drifted working tree can't execute unpinned code.
+CAPACITY_SHA256 = "8917a05cc6a57ada3d9427dbfa4c50e7fa2c106054f734303af52881a530e734"
 HOST_SETUP_VALIDATION_SHA256 = "a1a7d417d746549a4afc4e22f38e1d0370bcb0ca0da04239ebdd64b5bb5c2efa"
 MAINTENANCE_SSH_SHA256 = "8ef7c42ed494fd008e99da853be4a82ca4e69c7b98cb12ba6c527d5e596c8874"
-BROKER_ARCHIVE_SHA256 = "2b4725bb9e6c9e872e58828a787afd2490bfde51dc349428540b671293ca12c0"
+BROKER_ARCHIVE_SHA256 = "747dbb6a612e5bb4c304784753e6e1bcb55f90f02d2e424d4551fbae0a3244af"
 
 
 def _load_pinned_helper(name: str, filename: str, expected: str) -> types.ModuleType:
@@ -255,18 +256,11 @@ def provision_constant(blob: bytes, name: str) -> str:
 
 
 def verify_runtime_capacity(config: dict, run=subprocess.run) -> None:
-    script = r'''
-import os, sys
-floor = int(sys.argv[1])
-free = []
-for path in sys.argv[2:]:
-    info = os.statvfs(path)
-    free.append(info.f_bavail * info.f_frsize)
-if min(free) < floor:
-    raise SystemExit('runtime job/Tart root below sealed free-space floor')
-print('runtime capacity verified: jobRootFreeBytes=%d tartRootFreeBytes=%d minimumFreeBytes=%d' % (*free, floor))
-'''
-    result = run([*account_python(config['account']), '-c', script, str(config['broker']['minimum_free_bytes']), config['runtime']['root'], config['runtime']['tart_home']], check=True, capture_output=True, text=True, timeout=15, cwd='/')
+    helper = Path(__file__).parent / 'broker/partitura_broker/capacity.py'
+    script = safe_read(helper)
+    if sha256_bytes(script) != CAPACITY_SHA256:
+        raise NativeHostError('capacity.py differs from the pinned helper')
+    result = run([*account_python(config['account']), '-c', script.decode(), str(config['broker']['minimum_free_bytes']), config['runtime']['root'], config['runtime']['tart_home']], check=True, capture_output=True, text=True, timeout=15, cwd='/')
     print(result.stdout, end='')
 
 
@@ -327,9 +321,9 @@ def checked_source_blobs(config: dict) -> tuple[bytes, ...]:
     ).stdout
     if sha256_bytes(setup) != sha256_file(Path(__file__)):
         raise NativeHostError("running host setup module differs from the pinned Partitura commit")
-    for relative in ("deploy/mac-build/host_setup_validation.py", "deploy/mac-build/broker_archive.py", "deploy/mac-build/maintenance_ssh.py"):
+    for relative in ("deploy/mac-build/host_setup_validation.py", "deploy/mac-build/broker_archive.py", "deploy/mac-build/maintenance_ssh.py", "deploy/mac-build/broker/partitura_broker/capacity.py"):
         result = subprocess.run(["/usr/bin/git", "-C", str(repository), "show", f"{commit}:{relative}"], check=True, capture_output=True, env=git_environment())
-        if sha256_bytes(result.stdout) != sha256_file(Path(__file__).with_name(Path(relative).name)):
+        if sha256_bytes(result.stdout) != sha256_file(Path(__file__).parent / Path(relative).relative_to("deploy/mac-build")):
             raise NativeHostError("running host setup module differs from the pinned Partitura commit")
     broker = broker_from_commit(repository, commit, git_environment())
     if sha256_bytes(broker) != source["broker_sha256"]:

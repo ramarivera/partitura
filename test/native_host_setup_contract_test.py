@@ -124,13 +124,33 @@ class PartituraNativeHostTest(NativeHostFixture, unittest.TestCase):
             calls.append(argv)
             script = argv[argv.index('-c') + 1]
             with patch('sys.argv', ['capacity', '50', '/actual/jobs', '/actual/tart']), patch('os.statvfs', side_effect=lambda path: SimpleNamespace(f_bavail=40 if path.endswith('jobs') else 100, f_frsize=1)):
-                with self.assertRaisesRegex(SystemExit, 'below sealed'):
-                    exec(script, {})
+                with self.assertRaises(SystemExit) as caught:
+                    exec(script, {'__name__': '__main__'})
+                self.assertEqual(caught.exception.code, 1)
             return subprocess.CompletedProcess(argv, 0, stdout="")
         with patch.object(MODULE, 'account_python', return_value=['python']):
             MODULE.verify_runtime_capacity(config, run)
         self.assertEqual(calls[0][-3:], ['50', '/actual/jobs', '/actual/tart'])
 
+
+    def test_runtime_capacity_executes_the_same_pinned_purgeable_helper(self):
+        config = dict(account='builder', broker=dict(minimum_free_bytes=50), runtime=dict(root='/jobs', tart_home='/tart'))
+        def run(argv, **kwargs):
+            scope = {'__name__': 'capacity_test'}
+            exec(argv[argv.index('-c') + 1], scope)
+            with patch('sys.argv', ['capacity', '50', '/jobs', '/tart']), patch('os.statvfs', return_value=SimpleNamespace(f_bavail=30, f_frsize=1, f_blocks=200)):
+                scope['important_usage_capacity'] = lambda path: 70
+                self.assertEqual(scope['main'](), 0)
+                scope['important_usage_capacity'] = lambda path: None
+                self.assertEqual(scope['main'](), 1)
+            return subprocess.CompletedProcess(argv, 0, stdout='')
+        with patch.object(MODULE, 'account_python', return_value=['python']):
+            MODULE.verify_runtime_capacity(config, run)
+        with patch.object(MODULE, 'CAPACITY_SHA256', '0' * 64), self.assertRaisesRegex(MODULE.NativeHostError, 'pinned helper'):
+            MODULE.verify_runtime_capacity(config, run)
+        provision = (ROOT / 'deploy/mac-build/provision-host.sh').read_text()
+        self.assertIn('"$MB/broker/partitura_broker/capacity.py" "$((MIN_INTERNAL_KB * 1024))" /System/Volumes/Data', provision)
+        self.assertNotIn('df -k /System/Volumes/Data', provision)
 
     def test_validation_accepts_a_second_generic_host_and_rejects_invalid_keys(self):
         config = json.loads(json.dumps(self.settings))

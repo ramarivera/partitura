@@ -337,8 +337,7 @@ def disk_space(config, incoming=0):
     roots = [Path(config[key]) for key in ('root', 'tartHome')]
     free = []
     for path in roots:
-        info = os.statvfs(path)
-        free.append(info.f_bavail * info.f_frsize)
+        free.append(api.volume_capacity(path)['availableBytes'])
     # APFS sibling volumes may share a pool. Never add their reported free bytes.
     if roots[0].stat().st_dev == roots[1].stat().st_dev:
         sufficient = min(free) >= floor + incoming
