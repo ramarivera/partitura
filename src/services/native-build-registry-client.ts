@@ -361,10 +361,69 @@ export const createRegistryNativeBuildClient = Effect.fn(
       active.set(job.jobId, fiber);
       return job;
     }),
-    status: Effect.fn("RegistryNativeBuildClient.status")(
+    owned: Effect.fn("RegistryNativeBuildClient.owned")(
       (organization: string, session: string, id: string, builder?: string) =>
         nativeTry(() => state.owned(organization, session, id, builder)),
     ),
+    status: Effect.fn("RegistryNativeBuildClient.status")(function* (
+      organization: string,
+      session: string,
+      id: string,
+      builder?: string,
+    ) {
+      const job = yield* nativeTry(() =>
+        state.owned(organization, session, id, builder),
+      );
+      if (
+        active.has(id) &&
+        (job.state === "submitting" || job.state === "running") &&
+        !unresolvedRecovery(job)
+      ) {
+        // run-v2 owns a long-lived SSH call. Probe its original authenticated
+        // generation so callers can observe running and request cancellation.
+        const receipt = yield* transport
+          .envelope(
+            yield* generationOf(job.generationId),
+            `status ${id}`,
+            job,
+            { timeout: 15_000 },
+          )
+          .pipe(
+            Effect.catchTag("@Gateway/NativeTransportError", (error) =>
+              error.reason === "unavailable"
+                ? Effect.succeed(undefined)
+                : Effect.fail(error),
+            ),
+          );
+        if (
+          receipt &&
+          receipt.kind !== "known" &&
+          receipt.kind !== "unknown-job"
+        )
+          return yield* Effect.fail(
+            NativeTransportError.new("protocol-mismatch"),
+          );
+        if (receipt?.kind === "known" && receipt.state === "running")
+          yield* state.transaction((draft) => {
+            const current = draft.jobs.find((entry) => entry.jobId === id);
+            if (
+              current?.generationId === job.generationId &&
+              current.attempt === job.attempt &&
+              active.has(id) &&
+              (current.state === "submitting" || current.state === "running") &&
+              !unresolvedRecovery(current)
+            ) {
+              current.state = "running";
+              current.updatedAt = now();
+            }
+          });
+        // Terminal receipts and fenced cleanup remain owned by the submission
+        // fiber. A delayed probe must never overwrite their outcome.
+      }
+      return yield* nativeTry(() =>
+        state.owned(organization, session, id, builder),
+      );
+    }),
     artifact: Effect.fn("RegistryNativeBuildClient.artifact")(function* (
       organization: string,
       session: string,

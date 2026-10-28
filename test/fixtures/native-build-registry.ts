@@ -45,8 +45,11 @@ const emit=(kind,fields={})=>console.log(JSON.stringify({protocolVersion:2,hostI
 if(plan.unavailable) process.exit(255);
 if(parts[0]==="health") {emit("health",{brokerRevision:"b".repeat(64),capabilities:["health","status","reconcile","run-v2"],profile:"registry-only",epoch,status:plan.healthBusy?"busy":"ready",accepting:!plan.healthBusy,capacity:plan.healthBusy?0:1,reasons:plan.healthBusy?["runner-active"]:[],jobRootFreeBytes:1e12,tartRootFreeBytes:1e12,hostFloorBytes:53687091200});}
 else if(parts[0]==="run-v2") {
- if(plan.runBarrier) {writeFileSync(join(root,"run-entered"),"yes");while(!existsSync(plan.runBarrier)) await Bun.sleep(5);}
  const identity={job:parts[1],commit:parts[2],action:parts[4],attempt:parts[8]};
+ if(plan.runBarrier) {
+  if(plan.runningReceipt) writeFileSync(join(root,parts[1]+".json"),JSON.stringify({...identity,state:"running"}));
+  writeFileSync(join(root,"run-entered"),"yes");while(!existsSync(plan.runBarrier)) await Bun.sleep(5);
+ }
  if(plan.busyRefusal || plan.refusal) {emit("refused",{...identity,accepted:false,code:plan.refusal??"host-busy"});process.exit(1);}
  const input=Buffer.from(await new Response(Bun.stdin.stream()).arrayBuffer());
  if(input.length!==Number(parts[5])+Number(parts[6])) throw new Error("fixture-input-length");
@@ -56,7 +59,13 @@ else if(parts[0]==="run-v2") {
  writeFileSync(join(root,parts[1]+".json"),JSON.stringify(receipt));
  if(plan.lostRun) process.exit(255);
  emit("known",receipt);
-} else if(parts[0]==="cancel") emit("cancellation-requested",{job:parts[1]});
+} else if(parts[0]==="cancel") {
+ if(plan.runningReceipt && existsSync(join(root,parts[1]+".json"))) {
+  const path=join(root,parts[1]+".json"), saved=JSON.parse(readFileSync(path,"utf8"));
+  if(saved.state==="running") writeFileSync(path,JSON.stringify({...saved,state:"cancelled"}));
+ }
+ emit("cancellation-requested",{job:parts[1]});
+}
 else if(parts[0]==="reconcile") {
  if(plan.busy) emit("busy",{job:parts[1],runner:{job:parts[1],attempt:"c".repeat(32),stage:"receiving",heartbeat:plan.heartbeat??Date.now()/1000}});
  else if(plan.cleanup) {emit(plan.cleanup,{job:parts[1]});process.exit(1);}

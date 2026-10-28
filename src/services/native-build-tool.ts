@@ -119,7 +119,9 @@ export const callRegistryNativeTool = Effect.fn(
           request.arguments,
           { onExcessProperty: "error" },
         );
-        const owned = yield* jobs.status(
+        const lookup =
+          request.toolName === "native_build_status" ? jobs.status : jobs.owned;
+        const owned = yield* lookup(
           current.value.organizationId,
           run.sessionId,
           input.job,
@@ -142,7 +144,7 @@ export const callRegistryNativeTool = Effect.fn(
             );
             return result({
               ...project(
-                yield* jobs.status(
+                yield* jobs.owned(
                   current.value.organizationId,
                   run.sessionId,
                   input.job,

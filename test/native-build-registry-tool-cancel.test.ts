@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { expect, it } from "@effect/vitest";
 import { Effect, Option } from "effect";
+import { NativeTransportError } from "../src/services/native-build-transport.js";
 import { SessionAuthority } from "../src/services/session-authority.js";
 import {
   InstallationRepo,
@@ -90,7 +91,12 @@ for (const state of ["running", "succeeded"] as const)
                 ).toContain("cancel");
               }),
             {
-              nativeJobs: live.jobs,
+              nativeJobs: {
+                ...live.jobs,
+                status: Effect.fn("Test.unavailableStatus")(() =>
+                  Effect.fail(NativeTransportError.new("unavailable")),
+                ),
+              },
               withLinearGateway: true,
               configOverride: (config) => ({
                 ...config,
