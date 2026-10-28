@@ -399,6 +399,33 @@ describe("Recovery and concurrency regressions", () => {
     ),
   );
 
+  it.effect("clears the previous failure reason when a retry succeeds", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const runs = yield* RunRepo;
+        yield* seedInterrupted(testSessionId);
+        yield* runs.update(testSessionId, {
+          terminalReason: Option.some("git clone failed: Repository not found"),
+          incrementAttempt: true,
+        });
+        yield* authority.processSession(testSessionId);
+        expect(Option.getOrThrow(yield* runs.get(testSessionId)).attempt).toBe(
+          2,
+        );
+        if (fixture.workerEventListener === undefined)
+          throw new Error("listener missing");
+        fixture.workerEventListener({ type: "agent_end" });
+        yield* Effect.repeat(runs.get(testSessionId), {
+          until: (run) => Option.isSome(run) && run.value.state === "succeeded",
+        });
+        const completed = Option.getOrThrow(yield* runs.get(testSessionId));
+        expect(completed.terminalReason).toEqual(Option.none());
+        expect(completed.nextAttemptAt).toEqual(Option.none());
+      }),
+    ),
+  );
+
   it.effect("drops a crashed worker and retries it with backoff", () =>
     withAuthority(() =>
       Effect.gen(function* () {
