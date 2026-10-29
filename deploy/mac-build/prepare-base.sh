@@ -345,6 +345,9 @@ qualification_output=$("$tart" exec "$base_name" /usr/bin/sudo -n -u "$guest_use
   "HOME=/Users/$guest_user" "PATH=/usr/bin:/bin:/usr/sbin:/sbin" \
   /bin/bash /Library/Partitura/NativeBuild/qualify.sh "$runner_sha" "$qualifier_sha" "$guest_user")
 case "$qualification_output" in PARTITURA_NATIVE_BASE_QUALIFIED*) ;; *) fail 'generic guest qualification did not return its receipt marker' ;; esac
+# Tart stops the VMM without a guest shutdown. Persist the installed tools and
+# their metadata before cutting power, then hash only the stopped disk below.
+"$tart" exec "$base_name" /usr/bin/sudo -n /bin/sync
 "$tart" stop "$base_name"
 running=0
 wait "$tart_run_pid" 2>/dev/null || true
