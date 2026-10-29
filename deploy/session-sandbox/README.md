@@ -265,7 +265,14 @@ use those immutable runtimes while repository-specific versions install into
 the writable `/mise` volume. XDG caches and Bun caches also use `/mise/cache`,
 and XDG data uses `/mise/user-data`. Package managers honoring these defaults
 keep their stores on the session disk. Repository settings can override them,
-including an explicit pnpm `storeDir` beneath HOME; those paths still use SSHFS.
+including an explicit pnpm `storeDir` beneath HOME. Firecracker also binds
+`$HOME/.local/share/pnpm/store` to the VM's session disk, so that conventional
+HOME-based override stays local without rewriting the repository configuration.
+The bind mount shares the VM's recovery and cleanup lifecycle with
+`node_modules`; it never imports another session's store. Every directory in
+the target's ancestry must be owned by root or the session uid, with symlinks
+refused before any mount. Other explicit repository paths still use their
+selected filesystem.
 Transient files use guest-local `/tmp`, which supports Unix sockets required
 by tools such as tsx. Workspace SSHFS doesn't support those sockets.
 Configuration, credentials, HOME and explicit agent state paths remain under

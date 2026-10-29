@@ -53,6 +53,8 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
         self.workspace_patch.start()
         self.dependencies_patch = patch.object(guest, "WORKSPACE_DEPENDENCIES", self.workspace / "private-cache" / "modules")
         self.dependencies_patch.start()
+        self.pnpm_patch = patch.object(guest, "WORKSPACE_PNPM_STORE", self.workspace / "private-cache" / "pnpm")
+        self.pnpm_patch.start()
         self.docker_path = self.workspace / "docker.sock"
         self.docker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.docker_socket.bind(str(self.docker_path))
@@ -68,6 +70,7 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
         await self.server.wait_closed()
         self.workspace_patch.stop()
         self.dependencies_patch.stop()
+        self.pnpm_patch.stop()
         self.docker_patch.stop()
         self.docker_socket.close()
         self.temp.cleanup()
@@ -139,18 +142,52 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(os.fstat(descriptors[0]).st_uid, self.uid)
             self.assertEqual(os.fstat(descriptors[0]).st_mode & 0o777, 0o700)
             return type("Process", (), {"wait": AsyncMock(return_value=0)})()
-        with patch.object(guest.asyncio, "create_subprocess_exec", side_effect=mount) as launch, patch.object(guest.os.path, "ismount", side_effect=[False, True]), patch.object(guest.os.path, "samefile", return_value=True):
+        with patch.object(guest.asyncio, "create_subprocess_exec", side_effect=mount) as launch, patch.object(guest.os.path, "ismount", side_effect=[False, True, False, True]), patch.object(guest.os.path, "samefile", return_value=True):
             await guest.mount_workspace_dependencies(self.uid)
-        launch.assert_called_once()
+        self.assertEqual(launch.call_count, 2)
+
+    async def test_repository_home_pnpm_store_is_mounted_on_the_session_disk(self):
+        targets = []
+        mounted = set()
+
+        async def mount(*argv, **options):
+            source, target = [Path(os.readlink(f"/proc/self/fd/{fd}")) for fd in options["pass_fds"]]
+            targets.append(target.relative_to(self.workspace).as_posix())
+            self.assertNotEqual(source, target)
+            mounted.add(target)
+            return type("Process", (), {"wait": AsyncMock(return_value=0)})()
+
+        with patch.object(guest.asyncio, "create_subprocess_exec", side_effect=mount), patch.object(guest.os.path, "ismount", side_effect=lambda path: Path(path) in mounted), patch.object(guest.os.path, "samefile", return_value=True):
+            await guest.mount_workspace_dependencies(self.uid)
+        self.assertIn(".omp-home/.local/share/pnpm/store", targets)
 
     async def test_dependency_mount_reuses_existing_owned_mount_and_data(self):
         cache = guest.WORKSPACE_DEPENDENCIES
         cache.mkdir(parents=True)
         (cache / "recovery-marker").write_text("persisted")
+        guest.WORKSPACE_PNPM_STORE.mkdir()
+        (guest.WORKSPACE_PNPM_STORE / "package-marker").write_text("cached package")
         with patch.object(guest.asyncio, "create_subprocess_exec") as launch, patch.object(guest.os.path, "ismount", return_value=True), patch.object(guest.os.path, "samefile", return_value=True):
             await guest.mount_workspace_dependencies(self.uid)
         launch.assert_not_called()
         self.assertEqual((cache / "recovery-marker").read_text(), "persisted")
+        self.assertEqual((guest.WORKSPACE_PNPM_STORE / "package-marker").read_text(), "cached package")
+
+    async def test_home_store_refuses_symlinks_at_every_ancestor_before_mount(self):
+        parts = (".omp-home", ".local", "share", "pnpm", "store")
+        for index in range(len(parts)):
+            with self.subTest(ancestor=parts[index]):
+                workspace = self.workspace / f"case-{index}"
+                workspace.mkdir()
+                outside = self.workspace / f"outside-{index}"
+                outside.mkdir()
+                target = workspace.joinpath(*parts[:index + 1])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(outside, target_is_directory=True)
+                with patch.object(guest, "WORKSPACE", workspace), patch.object(guest.asyncio, "create_subprocess_exec") as launch, self.assertRaises(OSError):
+                    await guest.mount_workspace_dependencies(self.uid)
+                launch.assert_not_called()
+                self.assertEqual(list(outside.iterdir()), [])
 
     async def test_dependency_mount_refuses_symlinks_and_files_before_mount(self):
         for name in ("node_modules", "private-cache/modules"):
@@ -184,7 +221,7 @@ class GuestTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.geteuid() == 0, "ownership refusal requires disposable root container")
     async def test_dependency_mount_refuses_foreign_directory_owners(self):
-        for target in (guest.WORKSPACE_DEPENDENCIES, self.workspace / "node_modules"):
+        for target in (guest.WORKSPACE_DEPENDENCIES, guest.WORKSPACE_PNPM_STORE, self.workspace / "node_modules", self.workspace / ".omp-home"):
             target.mkdir(parents=True, exist_ok=True)
             os.chown(target, self.uid + 1, self.uid + 1)
             try:
