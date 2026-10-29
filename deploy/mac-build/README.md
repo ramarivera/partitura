@@ -177,7 +177,28 @@ bash deploy/mac-build/provision-host.sh \
   --create-volume disk9            # or --tart-home on an existing owned volume
 ```
 
-Without `--apply` it runs only the read-only preflight. That downloads Tart and
+For unattended password entry, `provision-passwords.py` accepts exactly two JSON
+string fields on stdin: `administratorPassword` and `buildAccountPassword`.
+Pipe that JSON directly from an already authorized secret reader, or redirect a
+private password file. Passwords never become command arguments or environment
+variables. The wrapper runs the same provisioner in a private terminal, supplies
+only its known no-echo prompts, refuses retries and redacts supplied passwords
+from output. It preserves all preflight, storage and authorization checks.
+
+```bash
+python3 deploy/mac-build/provision-passwords.py -- --apply \
+  --source-vm /Volumes/Fast/pnb/vms/macos-base --source-sha256 SOURCE_TREE_SHA256 \
+  --authorized-key "$(cat partitura-native-build.pub)" --create-volume disk9 \
+  < /path/to/private/passwords.json
+```
+
+This automates password entry. A fresh Mac's protected storage access still has
+to pass the checks below; this wrapper does not grant macOS privacy permissions
+or establish that the full password-only provisioning requirement is satisfied.
+
+`provision-host.sh` without `--apply` runs only the read-only preflight.
+`provision-passwords.py` requires `--apply`; use `provision-host.sh` for preflight.
+That downloads Tart and
 Mise into `~/dev/agentic-scratchpads/partitura/host-inputs` and checks them
 against the hashes pinned in the script, plus Tart's signing team. It also checks:
 
