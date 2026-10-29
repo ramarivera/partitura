@@ -2,10 +2,12 @@
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[1] / 'deploy/mac-build/provision-passwords.py'
 spec = importlib.util.spec_from_file_location('provision_passwords', SOURCE)
@@ -83,6 +85,21 @@ os.read(fd,2048)
         self.assertNotIn(b'private-admin-', output.getvalue())
         self.assertNotIn(b'private-build-fixture', output.getvalue())
         self.assertEqual(output.getvalue().count(b'[redacted]'), 2)
+
+    def test_actual_terminal_redaction_matches_whole_output_at_retained_boundary(self):
+        # The first 4096-byte read emits at byte2048, placing each password
+        # across that boundary. Vary reads too, including one byte at a time.
+        for read_size in (1, 2048, 4096, 8192):
+            for password_size in (5, 1024):
+                secret = b'z' * password_size
+                data = b'x' * 2045 + secret + b'y' * 4096 + b'other-secret'
+                program = 'import os; os.write(1,' + repr(data) + ')'
+                output = io.BytesIO()
+                secrets = dict(administratorPassword=bytearray(secret), buildAccountPassword=bytearray(b'other-secret'))
+                read = os.read
+                with self.subTest(read_size=read_size, password_size=password_size), patch.object(module.os, 'read', side_effect=lambda fd, size: read(fd, min(size, read_size))):
+                    self.assertEqual(module.run_provision([sys.executable, '-I', '-c', program], secrets, output, timeout=10), 0)
+                self.assertEqual(output.getvalue(), b'x' * 2045 + b'[redacted]' + b'y' * 4096 + b'[redacted]')
 
     def test_password_substring_of_split_prompt_does_not_destroy_prompt_detection(self):
         program = '''
