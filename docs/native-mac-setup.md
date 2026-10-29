@@ -136,17 +136,23 @@ Host provisioning doesn't register a builder or authorize a gateway cutover.
    and [credential provisioning](../deploy/mac-build/registry-secrets.md) guides.
    A fresh host defaults to the legacy profile; it must match the gateway mode.
    Don't switch an existing installation's profile or identity implicitly.
-3. Check the installed broker's `health` through the gateway's configured,
-   pinned SSH transport. In registry mode, the authenticated
+3. For a **registry-only** host, check the installed broker's `health` through
+   the gateway's configured, pinned SSH transport. The authenticated
    [native builders page](../deploy/mac-build/registry-controls.md) can request a
    health check using cached credentials. Require `ready`, `accepting: true`
    and no blocking reasons before submitting new work.
+   For a **legacy** host, use successful installer readback and the approved
+   legacy build/status/artifact/cancel path below. Its registry `health`
+   intentionally reports `blocked`, `accepting: false` and `legacy-profile`;
+   it cannot pass the registry readiness gate. That expected profile reason
+   doesn't excuse storage, recovery or authentication failures.
 4. Submit an approved repository build **through Partitura**, using a commit
    containing [`.partitura/native-build.sh`](../deploy/mac-build/README.md#repository-contract).
    Verify the real expected output, artifact transfer and integrity, terminal
-   status, disposable-VM cleanup and fresh host health. An echo task or installer
-   success doesn't prove an application compiles. The first broker-session build
-   also proves keychain unlock; daemon relock qualification remains separate.
+   status and disposable-VM cleanup. For registry-only hosts, also require fresh
+   ready health after cleanup. An echo task or installer success doesn't prove
+   an application compiles. The first broker-session build also proves keychain
+   unlock; daemon relock qualification remains separate.
 
 Unsigned compilation doesn't require installation, launch, distribution signing
 or upload. Those are separate project actions and permissions.
