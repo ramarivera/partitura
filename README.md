@@ -29,6 +29,8 @@ build. See [AGENTS.md](AGENTS.md) for the architecture and contributor workflow.
 - [Agent drivers](docs/agent-drivers.md) covers OMP and T3 Code configuration.
 - [Worker profile](docs/worker-profile.md) covers tools, providers, and credentials.
 - [Security](docs/security.md) covers tenant admission, worker isolation, and state.
+- [macOS build host setup](docs/native-mac-setup.md) covers the one-time macOS
+  permission step, automated provisioning and real-build acceptance.
 
 ## Rename compatibility
 

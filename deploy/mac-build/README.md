@@ -166,6 +166,10 @@ of a particular repository. It installs the pinned portable Mise binary into the
 guest and prepares the common tool cache there.
 ### One-shot provisioning
 
+For a fresh host, start with the [macOS setup guide](../../docs/native-mac-setup.md).
+The supported flow uses a one-time manual Remote Login privacy permission, then
+automates host provisioning and subsequent builds.
+
 [provision-host.sh](provision-host.sh) provisions a new Mac in one run: one sudo
 prompt, and one new build-account password pasted twice. Run it as an
 administrator from a clean checkout of the commit you want installed:
@@ -192,9 +196,9 @@ python3 deploy/mac-build/provision-passwords.py -- --apply \
   < /path/to/private/passwords.json
 ```
 
-This automates password entry. A fresh Mac's protected storage access still has
-to pass the checks below; this wrapper does not grant macOS privacy permissions
-or establish that the full password-only provisioning requirement is satisfied.
+This automates password entry after the one-time manual macOS permission step.
+A fresh Mac's protected storage access still has to pass the checks below; this
+wrapper does not grant macOS privacy permissions.
 
 `provision-host.sh` without `--apply` runs only the read-only preflight.
 `provision-passwords.py` requires `--apply`; use `provision-host.sh` for preflight.
