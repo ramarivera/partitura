@@ -192,6 +192,26 @@ class NativeHostSetupTests(unittest.TestCase):
             self.assertNotEqual(seal().returncode, 0)
             self.assertTrue(control.is_symlink())
 
+    def test_base_preparation_flushes_guest_before_stop_and_refuses_failed_flush(self):
+        source = (ROOT / 'deploy/mac-build/prepare-base.sh').read_text()
+        start = source.index('case "$qualification_output" in')
+        end = source.index('"$tart" stop "$base_name"', start) + len('"$tart" stop "$base_name"')
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+            fake = Path(directory) / 'tart'
+            log = Path(directory) / 'calls'
+            fake.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALL_LOG"\nif [[ "$*" = *"/bin/sync" ]]; then exit "$FLUSH_STATUS"; fi\n')
+            fake.chmod(0o700)
+            for status in (0, 23):
+                log.unlink(missing_ok=True)
+                result = subprocess.run(['bash', '-c', 'set -euo pipefail; fail() { exit 1; }; ' + source[start:end]],
+                                        env={**os.environ, 'tart': str(fake), 'base_name': 'prepared',
+                                             'qualification_output': 'PARTITURA_NATIVE_BASE_QUALIFIED fixture',
+                                             'CALL_LOG': str(log), 'FLUSH_STATUS': str(status)}, capture_output=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+                calls = log.read_text().splitlines()
+                self.assertEqual(calls[0], 'exec prepared /usr/bin/sudo -n /bin/sync')
+                self.assertEqual(calls[1:], ['stop prepared'] if status == 0 else [])
+
     def test_host_setup_pins_its_helper_modules(self):
         for constant, name in (('HOST_SETUP_VALIDATION_SHA256', 'host_setup_validation.py'), ('BROKER_ARCHIVE_SHA256', 'broker_archive.py'), ('MAINTENANCE_SSH_SHA256', 'maintenance_ssh.py')):
             self.assertEqual(getattr(host_setup, constant), hashlib.sha256((ROOT / 'deploy/mac-build' / name).read_bytes()).hexdigest())
