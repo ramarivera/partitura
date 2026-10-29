@@ -395,9 +395,10 @@ timeout 120 /bin/sh -ec '
         self.assertEqual((code, stdout, stderr), (23, b"stdin-marker", b"stderr-marker\n"))
         await self.live_workspace(session, workspace)
         if runtime == "firecracker":
-            await self.python(session, self.uid, "import os; from pathlib import Path; root=Path('/workspace/node_modules'); assert root.stat().st_dev != Path('/workspace').stat().st_dev; assert root.stat().st_uid == os.getuid(); (root/'.partitura-local-dependency').write_text('session-disk')")
-            self.assertFalse((workspace / "node_modules/.partitura-local-dependency").exists(), "dependencies leaked onto the SFTP source workspace")
-            self.assertEqual((await self.python(peer, self.peer_uid, "from pathlib import Path; print(Path('/workspace/node_modules/.partitura-local-dependency').exists())")).strip(), "False")
+            for directory in ("node_modules", ".omp-home/.local/share/pnpm/store"):
+                await self.python(session, self.uid, f"import os; from pathlib import Path; root=Path('/workspace') / {directory!r}; assert root.stat().st_dev == Path('/').stat().st_dev; assert root.stat().st_dev != Path('/workspace').stat().st_dev; assert root.stat().st_uid == os.getuid(); (root/'.partitura-local-dependency').write_text('session-disk')")
+                self.assertFalse((workspace / directory / ".partitura-local-dependency").exists(), "dependencies leaked onto the SFTP source workspace")
+                self.assertEqual((await self.python(peer, self.peer_uid, f"from pathlib import Path; print((Path('/workspace') / {directory!r} / '.partitura-local-dependency').exists())")).strip(), "False")
         await self.isolation(session, peer, workspace, peer_workspace, runtime)
         await self.execute(session, self.uid, ["curl", "--fail", "--silent", "--show-error", "--max-time", "30", "https://registry.npmjs.org/-/ping"], env)
         code, _, stderr = await self.wire.execute(self.exec_request(session, self.uid, ["curl", "--fail", "--silent", "--show-error", "--max-time", "10", "https://partitura-acceptance-denied.invalid/"], env))
@@ -430,7 +431,8 @@ timeout 120 /bin/sh -ec '
         self.assertEqual(recovery["runtime"], runtime)
         self.assertEqual((await self.python(session, self.uid, "from pathlib import Path; print(Path('/mise/recovery-marker').read_text())")).strip(), "persisted")
         if runtime == "firecracker":
-            self.assertEqual((await self.python(session, self.uid, "from pathlib import Path; print(Path('/workspace/node_modules/.partitura-local-dependency').read_text())")).strip(), "session-disk")
+            for directory in ("node_modules", ".omp-home/.local/share/pnpm/store"):
+                self.assertEqual((await self.python(session, self.uid, f"from pathlib import Path; root=Path('/workspace') / {directory!r}; assert root.stat().st_dev == Path('/').stat().st_dev; print((root / '.partitura-local-dependency').read_text())")).strip(), "session-disk")
         self.assertEqual((await self.python(session, self.uid, "from pathlib import Path; print(Path('/workspace/worker-live').read_text())")).strip(), "host-update-seen")
         before = (workspace / "recovery-heartbeat").read_text()
         await asyncio.sleep(0.3)

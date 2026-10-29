@@ -269,7 +269,9 @@ including an explicit pnpm `storeDir` beneath HOME. Firecracker also binds
 `$HOME/.local/share/pnpm/store` to the VM's session disk, so that conventional
 HOME-based override stays local without rewriting the repository configuration.
 The bind mount shares the VM's recovery and cleanup lifecycle with
-`node_modules`; it never imports another session's store. Every directory in
+`node_modules`; it never imports another session's store. Content from
+an existing SSHFS store stays behind the mount; the first install populates the
+local store and recovery reuses it. Every directory in
 the target's ancestry must be owned by root or the session uid, with symlinks
 refused before any mount. Other explicit repository paths still use their
 selected filesystem.
