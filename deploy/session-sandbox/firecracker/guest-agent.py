@@ -18,6 +18,7 @@ MAX_REQUEST = 1024 * 1024
 MAX_FRAME = 4 * 1024 * 1024
 WORKSPACE = Path("/workspace")
 WORKSPACE_DEPENDENCIES = Path("/var/lib/partitura/workspace-node-modules")
+WORKSPACE_PNPM_STORE = Path("/var/lib/partitura/workspace-pnpm-store")
 DOCKER_SOCKET = Path("/run/docker.sock")
 ENV_KEYS = frozenset("""PATH HOME LANG LANGUAGE LC_ALL LC_CTYPE TERM COLORTERM TMPDIR
 XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME BUN_INSTALL_CACHE_DIR
@@ -149,39 +150,72 @@ async def bridge(reader, writer, peer_reader, peer_writer):
         await peer_writer.wait_closed()
 
 
-async def mount_workspace_dependencies(uid: int) -> None:
-    """Keep dependency files on this VM's existing disk, with live source over SFTP."""
-    cache, target = WORKSPACE_DEPENDENCIES, WORKSPACE / "node_modules"
-    cache.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    if cache.parent.resolve() != cache.parent:
-        raise ValueError("dependency cache parent is not canonical")
-    cache.mkdir(mode=0o700, exist_ok=True)
-    target.mkdir(mode=0o700, exist_ok=True)
-    descriptors = []
+def workspace_directory(parts: tuple[str, ...], uid: int) -> int:
+    """Pin every ancestor before creating a nested directory in the shared tree."""
+    descriptor = os.open(WORKSPACE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        for directory in (cache, target):
-            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            descriptors.append(descriptor)
-            if os.fstat(descriptor).st_uid not in (0, uid):
-                raise ValueError("dependency directory has a foreign owner")
-        os.fchown(descriptors[0], uid, uid)
-        os.fchmod(descriptors[0], 0o700)
-        if os.path.ismount(target):
-            if not os.path.samefile(cache, target):
-                raise ValueError("dependency mount has a different source")
-            return
-        # Descriptor targets prevent repository symlink/rename races from
-        # redirecting the root mount. The disk follows the VM's existing lifecycle.
-        process = await asyncio.create_subprocess_exec(
-            "mount", "--bind", *(f"/proc/self/fd/{fd}" for fd in descriptors),
-            pass_fds=tuple(descriptors), stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        if await process.wait() != 0 or not os.path.ismount(target) or not os.path.samefile(cache, target):
-            raise ValueError("session dependency mount failed")
-    finally:
-        for descriptor in descriptors:
+        for part in parts:
+            created = False
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            try:
+                if os.fstat(child).st_uid not in (0, uid):
+                    raise ValueError("dependency directory has a foreign owner")
+                if created:
+                    os.fchown(child, uid, uid)
+            except BaseException:
+                os.close(child)
+                raise
             os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+async def mount_workspace_dependencies(uid: int) -> None:
+    """Keep modules and HOME-based pnpm stores on the VM's existing session disk."""
+    mounts = (
+        (WORKSPACE_DEPENDENCIES, ("node_modules",)),
+        (WORKSPACE_PNPM_STORE, (".omp-home", ".local", "share", "pnpm", "store")),
+    )
+    opened = []
+    try:
+        # Validate all targets before mounting. No worker-controlled ancestor
+        # may redirect guest-root directory creation or the bind mount.
+        for cache, parts in mounts:
+            cache.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            if cache.parent.resolve() != cache.parent:
+                raise ValueError("dependency cache parent is not canonical")
+            cache.mkdir(mode=0o700, exist_ok=True)
+            source_fd = os.open(cache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            opened.append((cache, WORKSPACE.joinpath(*parts), [source_fd]))
+            if os.fstat(source_fd).st_uid not in (0, uid):
+                raise ValueError("dependency directory has a foreign owner")
+            os.fchown(source_fd, uid, uid)
+            os.fchmod(source_fd, 0o700)
+            opened[-1][2].append(workspace_directory(parts, uid))
+        for cache, target, descriptors in opened:
+            if os.path.ismount(target):
+                if not os.path.samefile(cache, target):
+                    raise ValueError("dependency mount has a different source")
+                continue
+            process = await asyncio.create_subprocess_exec(
+                "mount", "--bind", *(f"/proc/self/fd/{fd}" for fd in descriptors),
+                pass_fds=tuple(descriptors), stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await process.wait() != 0 or not os.path.ismount(target) or not os.path.samefile(cache, target):
+                raise ValueError("session dependency mount failed")
+    finally:
+        for _, _, descriptors in opened:
+            for descriptor in descriptors:
+                os.close(descriptor)
 
 
 class Agent:
