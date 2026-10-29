@@ -17,6 +17,22 @@ import time
 ADMIN_PROMPT = b'PARTITURA_ADMIN_PASSWORD: '
 BUILD_PROMPTS = (b'Dedicated account password: ', b'Repeat dedicated account password: ')
 MAX_INPUT = 16384
+FAILURE_REASONS = {
+    'timeout': 'provisioning timed out',
+    'password-rejected': 'password was rejected; automatic retry refused',
+    'echo-enabled': 'password prompt has terminal echo enabled',
+}
+
+
+class ProvisionFailure(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(FAILURE_REASONS[code])
+
+
+def failure_message(error):
+    reason = FAILURE_REASONS.get(error.code) if isinstance(error, ProvisionFailure) else None
+    return 'Password-driven provisioning stopped' + (f': {reason}.' if reason else '.') + ' No password is printed or retried.'
 
 
 def passwords(stream):
@@ -71,7 +87,7 @@ def run_provision(command, secrets, output, timeout=7200):
     try:
         while True:
             if time.monotonic() >= deadline:
-                raise ValueError('provisioning timed out')
+                raise ProvisionFailure('timeout')
             if not select.select([master], [], [], 0.2)[0]:
                 if child.poll() is not None:
                     break
@@ -89,9 +105,9 @@ def run_provision(command, secrets, output, timeout=7200):
                 if prompt not in pending:
                     continue
                 if prompt in answered:
-                    raise ValueError('password was rejected; automatic retry refused')
+                    raise ProvisionFailure('password-rejected')
                 if termios.tcgetattr(master)[3] & (termios.ECHO | termios.ECHONL):
-                    raise ValueError('password prompt has terminal echo enabled')
+                    raise ProvisionFailure('echo-enabled')
                 os.write(master, password + b'\n')
                 answered.add(prompt)
                 pending[:] = pending.replace(prompt, b'[private password supplied]')
@@ -146,6 +162,6 @@ def main():
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (OSError, ValueError, subprocess.SubprocessError):
-        print('Password-driven provisioning stopped; no password is printed or retried.', file=sys.stderr)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(failure_message(error), file=sys.stderr)
         sys.exit(1)

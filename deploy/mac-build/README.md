@@ -196,7 +196,8 @@ This automates password entry. A fresh Mac's protected storage access still has
 to pass the checks below; this wrapper does not grant macOS privacy permissions
 or establish that the full password-only provisioning requirement is satisfied.
 
-Without `--apply` the ordinary provisioner runs only the read-only preflight.
+`provision-host.sh` without `--apply` runs only the read-only preflight.
+`provision-passwords.py` requires `--apply`; use `provision-host.sh` for preflight.
 That downloads Tart and
 Mise into `~/dev/agentic-scratchpads/partitura/host-inputs` and checks them
 against the hashes pinned in the script, plus Tart's signing team. It also checks:

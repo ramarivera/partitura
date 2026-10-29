@@ -39,13 +39,15 @@ class PasswordProvisionTests(unittest.TestCase):
 
     def test_real_terminal_feeds_each_password_without_args_environment_or_output_leak(self):
         program = '''
-import os,sys,termios
+import hashlib,os,subprocess,sys,termios
 fd=os.open('/dev/tty',os.O_RDWR)
 mode=termios.tcgetattr(fd);mode[3]&=~(termios.ECHO|termios.ECHONL);termios.tcsetattr(fd,termios.TCSANOW,mode)
-assert not any('private-' in value for value in os.environ.values())
-for prompt,expected in [(os.environ['SUDO_PROMPT'].encode(),b'private-admin-fixture'),(b'Dedicated account password: ',b'private-build-fixture'),(b'Repeat dedicated account password: ',b'private-build-fixture')]:
+marker=bytes((112,114,105,118,97,116,101,45))
+assert not any(marker.decode() in value for value in os.environ.values())
+assert marker not in subprocess.check_output(['/bin/ps','-o','args=','-p',str(os.getpid())])
+for prompt,expected in [(os.environ['SUDO_PROMPT'].encode(),'475b7fcdf650cd96d0e81a08cfa035f0732722404ae0d40c40c7a230d208df5b'),(b'Dedicated account password: ','8accf1d102dbde7142be20213676fcc182327ad84519d3a5f13d365cd8360f32'),(b'Repeat dedicated account password: ','8accf1d102dbde7142be20213676fcc182327ad84519d3a5f13d365cd8360f32')]:
  os.write(fd,prompt[:7]);os.write(fd,prompt[7:])
- assert os.read(fd,2048).rstrip(b'\\n')==expected
+ assert hashlib.sha256(os.read(fd,2048).rstrip(b'\\n')).hexdigest()==expected
 os.write(fd,b'accepted\\n')
 '''
         secrets = self.secret_values()
@@ -57,7 +59,7 @@ os.write(fd,b'accepted\\n')
         self.assertTrue(all(not any(value) for value in secrets.values()))
 
     def test_echo_enabled_or_repeated_prompt_never_receives_password(self):
-        for repeat in (False, True):
+        for repeat, reason in ((False, 'echo enabled'), (True, 'automatic retry refused')):
             program = '''
 import os,termios
 fd=os.open('/dev/tty',os.O_RDWR)
@@ -70,13 +72,19 @@ os.read(fd,2048)
 '''.replace('REPEAT', repr(repeat))
             secrets = self.secret_values()
             output = io.BytesIO()
-            with self.subTest(repeat=repeat), self.assertRaisesRegex(ValueError, 'echo enabled|automatic retry refused'):
+            with self.subTest(repeat=repeat), self.assertRaisesRegex(ValueError, reason):
                 module.run_provision([sys.executable, '-I', '-c', program], secrets, output, timeout=10)
             self.assertNotIn(b'private-admin-fixture', output.getvalue())
             self.assertTrue(all(not any(value) for value in secrets.values()))
 
     def test_child_failure_status_is_preserved(self):
         self.assertEqual(module.run_provision([sys.executable, '-I', '-c', 'raise SystemExit(23)'], self.secret_values(), io.BytesIO(), timeout=10), 23)
+
+    def test_failure_diagnostics_expose_only_allowlisted_reasons(self):
+        for code, reason in module.FAILURE_REASONS.items():
+            self.assertIn(reason, module.failure_message(module.ProvisionFailure(code)))
+        for error in (ValueError('private-fixture'), OSError('private-fixture')):
+            self.assertEqual(module.failure_message(error), 'Password-driven provisioning stopped. No password is printed or retried.')
 
     def test_output_redacts_secrets_split_across_read_boundaries(self):
         program = "import os,time; os.write(1,b'x'*4090+b'private-admin-'); time.sleep(0.05); os.write(1,b'fixture'+b'y'*4090+b'private-build-fixture')"
